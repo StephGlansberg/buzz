@@ -9,7 +9,7 @@
     "provenance": "meta+receipt"
   },
   "buzz": {
-    "relayUrl": "ws://localhost:3000",
+    "relayUrl": "wss://architects-mac-mini.tail757661.ts.net",
     "architectPubkey": "73ac8798fd9cedcc5d24645d7ed49332d94a28f2c937f4c1b638f92bf6e8e91f",
     "conciliumChannelId": "4ac1cee0-2238-483f-b25b-f99ec17eec46"
   },

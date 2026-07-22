@@ -19,6 +19,35 @@ test("six-worker manifest matches the synthetic identity-map contract", () => {
   assert.match(result.warnings[0], /avatar metadata is absent/);
 });
 
+test("worker relay authority accepts canonical secure production WSS and fails closed elsewhere", () => {
+  assert.equal(manifest.buzz.relayUrl, "wss://architects-mac-mini.tail757661.ts.net");
+  for (const relayUrl of [
+    "wss://relay.example.com/path",
+    "wss://relay.example.com",
+    "wss://relay.example.com?tenant=aeon",
+    "wss://user@relay.example.com",
+    "ws://relay.example.com",
+    "https://relay.example.com",
+    "wss:relay.example.com",
+    "wss:/relay.example.com",
+    "wss://relay.example.com:443",
+    "not-a-url",
+  ]) {
+    const result = validateManifest(
+      { ...manifest, buzz: { ...manifest.buzz, relayUrl } },
+      identityMap,
+    );
+    assert.equal(result.ok, false, relayUrl);
+    assert.match(result.errors.join("\n"), /Buzz relay/);
+  }
+
+  const development = validateManifest(
+    { ...manifest, buzz: { ...manifest.buzz, relayUrl: "ws://localhost:3000" } },
+    identityMap,
+  );
+  assert.equal(development.ok, true, development.errors.join("\n"));
+});
+
 test("every rendered worker is disabled and binds an existing fixed session", () => {
   for (const worker of manifest.workers) {
     const rendered = renderWorker(manifest, identityMap, worker.aspect, "/owned/gateway.token");

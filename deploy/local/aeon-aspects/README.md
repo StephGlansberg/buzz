@@ -15,6 +15,23 @@ proactive count-based session rotation are off, thread/DM context is bounded to
 absolute cap. `bypassPermissions` is an explicit canary posture; it does not
 prove that a future interactive approval workflow is preserved.
 
+The checked-in AEON manifest uses the single canonical tailnet authority
+`wss://architects-mac-mini.tail757661.ts.net`. Production workers, Desktop,
+mobile, relay NIP-11 metadata, media URLs, and the durable community host map
+must all use that same authority. The validator permits insecure WebSocket only
+for the exact local development URL `ws://localhost:3000`; every non-local
+deployment must use a root `wss://` URL with no credentials, path, query, or
+fragment. Tailscale Funnel is not required and must remain off.
+
+Mobile identity transfer uses Buzz's existing NIP-AB QR and SAS flow. Because
+the production relay requires membership, the unpaired phone cannot use the
+main relay for that handshake. Run the existing `buzz-pair-relay` Compose
+profile on loopback and route only `/pair` to it through Tailscale Serve; set
+`BUZZ_PAIRING_RELAY_URL` to the canonical `wss://` `/pair` URL advertised by
+NIP-11. The encrypted pairing payload still carries the canonical HTTPS main
+relay URL used by mobile for chat, media, and subsequent authenticated WebSocket
+sessions.
+
 `--trusted-inbound-envelope` copies one signature-verified triggering event
 into the ACP request as `_meta.buzz.inboundEvent` (`schemaVersion: 1`). The
 envelope carries the signed event ID, author, kind, exact channel ID, and exact

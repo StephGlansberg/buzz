@@ -1,5 +1,7 @@
 import fs from "node:fs";
 
+const AEON_PRODUCTION_RELAY_URL = "wss://architects-mac-mini.tail757661.ts.net";
+
 export function loadJson(path) {
   return JSON.parse(fs.readFileSync(path, "utf8"));
 }
@@ -9,7 +11,36 @@ export function validateManifest(manifest, identityMap) {
   const warnings = [];
   if (manifest.enabled !== false) errors.push("package must be disabled by default");
   if (manifest.workers?.length !== 6) errors.push("exactly six Aspect workers are required");
-  if (manifest.buzz?.relayUrl !== "ws://localhost:3000") errors.push("Buzz relay must use localhost");
+  try {
+    const configuredRelayUrl = manifest.buzz?.relayUrl;
+    const relayUrl = new URL(configuredRelayUrl);
+    const isLoopbackDevelopment =
+      relayUrl.protocol === "ws:" &&
+      relayUrl.hostname === "localhost" &&
+      relayUrl.port === "3000";
+    const isSecureProduction =
+      relayUrl.protocol === "wss:" &&
+      configuredRelayUrl.startsWith("wss://") &&
+      configuredRelayUrl === AEON_PRODUCTION_RELAY_URL;
+    const hasCanonicalRoot =
+      relayUrl.username === "" &&
+      relayUrl.password === "" &&
+      relayUrl.pathname === "/" &&
+      relayUrl.search === "" &&
+      relayUrl.hash === "";
+    const isCanonicalSpelling =
+      configuredRelayUrl === relayUrl.origin ||
+      configuredRelayUrl === `${relayUrl.origin}/`;
+    if (
+      (!isLoopbackDevelopment && !isSecureProduction) ||
+      !hasCanonicalRoot ||
+      !isCanonicalSpelling
+    ) {
+      errors.push("Buzz relay must use ws://localhost:3000 for development or a canonical root wss:// URL");
+    }
+  } catch {
+    errors.push("Buzz relay URL is invalid");
+  }
   if (manifest.posture?.memory !== false) errors.push("Buzz memory injection must be disabled");
   if (manifest.posture?.basePrompt !== false) errors.push("Buzz base prompt must be disabled");
   if (manifest.posture?.respondTo !== "owner-only") errors.push("respondTo must be owner-only");

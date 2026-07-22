@@ -7,7 +7,7 @@
   <array>
     <string>/Volumes/AEON/Projects/buzz/target/release/buzz-acp</string>
     <string>--relay-url</string>
-    <string>ws://localhost:3000</string>
+    <string>wss://architects-mac-mini.tail757661.ts.net</string>
     <string>--private-key-file</string>
     <string>/Volumes/AEON/Projects/buzz-data/keys/nexus.sk</string>
     <string>--expected-public-key</string>
