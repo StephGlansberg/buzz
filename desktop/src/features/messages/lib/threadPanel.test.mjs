@@ -110,6 +110,37 @@ test("buildMainTimelineEntries flattenReplies renders reply-tagged events inline
   );
 });
 
+test("buildMainTimelineEntries flattenReplies excludes retained replies whose root left the active window", () => {
+  const activeRoot = message({ id: "active-root", createdAt: 3 });
+  const activeReply = message({
+    id: "active-reply",
+    createdAt: 4,
+    parentId: "active-root",
+    rootId: "active-root",
+    depth: 1,
+  });
+  const staleReply = message({
+    id: "stale-reply",
+    createdAt: 2,
+    parentId: "stale-root",
+    rootId: "stale-root",
+    depth: 1,
+  });
+
+  const entries = buildMainTimelineEntries(
+    [staleReply, activeRoot, activeReply],
+    new Set(),
+    new Map(),
+    undefined,
+    { flattenReplies: true },
+  );
+
+  assert.deepEqual(
+    entries.map((entry) => entry.message.id),
+    ["active-root", "active-reply"],
+  );
+});
+
 test("buildMainTimelineEntries keeps huddle thread replies out of the parent timeline summary", () => {
   const huddleRoot = message({
     id: "huddle-root",

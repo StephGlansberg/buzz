@@ -445,17 +445,24 @@ export function buildMainTimelineEntries(
   options?: BuildMainTimelineEntriesOptions,
 ): MainTimelineEntry[] {
   const flattenReplies = options?.flattenReplies === true;
+  const activeRootIds = flattenReplies
+    ? new Set(
+        messages
+          .filter((message) => message.parentId == null)
+          .map((message) => message.id),
+      )
+    : null;
   const { descendantStatsByMessageId } = buildThreadPanelIndex(
     messages,
     unreadReplyIds,
   );
 
   return messages
-    .filter(
-      (message) =>
-        flattenReplies ||
-        message.parentId == null ||
-        isBroadcastReply(message.tags ?? []),
+    .filter((message) =>
+      flattenReplies
+        ? message.parentId == null ||
+          activeRootIds?.has(message.rootId ?? message.parentId)
+        : message.parentId == null || isBroadcastReply(message.tags ?? []),
     )
     .map((message) => {
       // Flattened private/DM replies keep NIP-10 tags but render as depth-0

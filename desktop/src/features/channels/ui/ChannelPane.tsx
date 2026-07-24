@@ -58,7 +58,7 @@ import type { ChannelPaneProps } from "@/features/channels/ui/ChannelPane.types"
 import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelection";
 import { usePrepareDmSendChannel } from "@/features/channels/ui/usePrepareDmSendChannel";
 import { Button } from "@/shared/ui/button";
-import { buildChannelMainTimelineEntries } from "@/features/messages/lib/channelMainTimeline";
+import { useChannelMainTimelineEntries } from "@/features/messages/lib/channelMainTimeline";
 import { useRenderScopedReactionHydration } from "@/features/messages/lib/useRenderScopedReactionHydration";
 import type { TimelineMessage } from "@/features/messages/types";
 import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/onboarding/welcome";
@@ -66,7 +66,6 @@ import { KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
-
 export const ChannelPane = React.memo(function ChannelPane({
   activeChannel,
   agentPubkeys,
@@ -463,16 +462,13 @@ export const ChannelPane = React.memo(function ChannelPane({
 
     return messages.filter((message) => !isWelcomeSetupSystemMessage(message));
   }, [activeChannel, messages]);
-  const { entries: mainTimelineEntries, flattenReplies } = React.useMemo(
-    () =>
-      buildChannelMainTimelineEntries(
-        activeChannel,
-        visibleMessages,
-        threadSummaries,
-        profiles,
-      ),
-    [activeChannel, profiles, threadSummaries, visibleMessages],
-  );
+  const { entries: mainTimelineEntries, flattenReplies } =
+    useChannelMainTimelineEntries(
+      activeChannel,
+      visibleMessages,
+      threadSummaries,
+      profiles,
+    );
   useRenderScopedReactionHydration({
     activeChannel,
     mainTimelineEntries,

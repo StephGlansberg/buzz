@@ -50,10 +50,6 @@ const rules = [
 // Do not add to this list; split the file instead. Remove each entry as its
 // file is broken up. Tracked as a follow-up.
 const overrides = new Map([
-  // Private/DM timeline flatten for AEON Aspect offices: extracted helpers keep
-  // growth tiny, but biome's import/export blank leaves this 1 line over the
-  // ceiling. Queued to split with the rest of ChannelPane.
-  ["src/features/channels/ui/ChannelPane.tsx", 1005],
   // Native Builderlab auth/community commands add a small registration surface
   // to the existing Tauri composition root. The implementation lives in
   // builderlab.rs; this narrowly ratchets the command wiring while lib.rs is

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import type { Channel } from "@/shared/api/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
@@ -28,4 +29,23 @@ export function buildChannelMainTimelineEntries(
       },
     ),
   };
+}
+
+/** Memoized private/DM timeline projection for channel panes. */
+export function useChannelMainTimelineEntries(
+  channel: Pick<Channel, "channelType" | "visibility"> | null | undefined,
+  messages: TimelineMessage[],
+  threadSummaries: ReadonlyMap<string, ChannelWindowThreadSummary> | undefined,
+  profiles?: UserProfileLookup,
+): { entries: MainTimelineEntry[]; flattenReplies: boolean } {
+  return useMemo(
+    () =>
+      buildChannelMainTimelineEntries(
+        channel,
+        messages,
+        threadSummaries,
+        profiles,
+      ),
+    [channel, messages, profiles, threadSummaries],
+  );
 }
