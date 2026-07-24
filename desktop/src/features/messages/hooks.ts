@@ -276,7 +276,14 @@ export function useChannelMessagesQuery(channel: Channel | null) {
         emptyChannelWindowStore();
       const next = replaceNewestChannelWindow(current, page);
       queryClient.setQueryData(windowKey, next);
-      const reconciled = reconcileChannelWindowMessages(next, previousMessages);
+      const reconciled = reconcileChannelWindowMessages(
+        next,
+        previousMessages,
+        {
+          retainNonBroadcastThreadReplies:
+            !shouldFlattenChannelTimeline(channel),
+        },
+      );
       return withFlattenedTimelineReplies(channel, next, reconciled);
     },
     staleTime: 5 * 60 * 1_000,
