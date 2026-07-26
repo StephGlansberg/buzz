@@ -100,9 +100,10 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   assert.equal(worker.environment.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(worker.environment.ANTHROPIC_API_KEY, undefined);
   assert.equal(worker.environment.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(worker.environment.RUST_LOG, undefined);
   assert.equal(
     worker.environment.PATH.split(":")[0],
-    "/Users/architect/Library/Application Support/AEON/aeon-v6/bin",
+    "/Users/architect/.nvm/versions/node/v24.1.0/bin",
   );
   assert.equal(
     worker.environment.PATH.includes("/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin"),
@@ -203,7 +204,9 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
     artifact.plist,
     /<key>WorkingDirectory<\/key><string>\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6<\/string>/,
   );
+  assert.match(artifact.plist, /\/Users\/architect\/\.nvm\/versions\/node\/v24\.1\.0\/bin/);
   assert.match(artifact.plist, /<string>--session-cwd<\/string>\s+<string>\/Volumes\/AEON\/Projects\/aeon-v6<\/string>/);
+  assert.doesNotMatch(artifact.plist, /RUST_LOG/);
   assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/Projects\/buzz-data\/keys\/claude_code\.sk/);
 });
 
