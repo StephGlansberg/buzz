@@ -22,6 +22,10 @@ The Claude worker starts the maintained
 `@agentclientprotocol/claude-agent-acp@0.62.0` adapter at source checkpoint
 `53a0c36ce3b0b76929d11d8b9565e319da745608`. That adapter uses the official
 Claude Agent SDK and the pinned installed Claude Code `2.1.220` executable.
+Its executable, adapter installation, subscription config, and logs live below
+`/Users/architect/Library/Application Support/AEON/aeon-v6`, matching the
+launchd-safe Data-volume layout used by the working Codex worker. Selected
+workspace paths may remain below `/Volumes/AEON/Projects`.
 Buzz requests ACP `bypassPermissions` through its `bypass-permissions` mode;
 the adapter remains the owner of tool execution and permission enforcement.
 Authentication reuses the standard Claude user login without setting
@@ -81,9 +85,9 @@ node deploy/local/aeon-external-cli/validate.mjs \
 Install the pinned Claude adapter into its exact manifest path:
 
 ```sh
-npm install --global \
-  --prefix /Volumes/AEON/runtime/buzz/external-cli/claude_cli/claude-agent-acp/0.62.0 \
-  --ignore-scripts --no-audit --no-fund \
+npm install \
+  --prefix '/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0' \
+  --save-exact --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/claude-agent-acp@0.62.0
 node deploy/local/aeon-external-cli/validate.mjs \
   /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
@@ -102,11 +106,15 @@ install -m 0444 \
   deploy/local/aeon-external-cli/config/codex_cli.toml \
   /Volumes/AEON/runtime/buzz/external-cli/codex_cli/config/codex_cli.toml
 install -d -m 0755 \
-  /Volumes/AEON/runtime/buzz/external-cli/claude_cli/config \
-  /Volumes/AEON/runtime/buzz/external-cli/claude_cli/logs
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/bin' \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz' \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/logs'
+install -m 0500 \
+  target/release/buzz-acp \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp-claude-cli'
 install -m 0444 \
   deploy/local/aeon-external-cli/config/claude_cli.toml \
-  /Volumes/AEON/runtime/buzz/external-cli/claude_cli/config/claude_cli.toml
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/claude-cli.toml'
 ```
 
 Activation is intentionally absent: the generated plist has
