@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -15,7 +16,15 @@ const REQUIRED_CLAUDE_ACP_ENTRYPOINT_SHA256 = "260aac90bf75f197b93640087c1de6644
 const REQUIRED_CLAUDE_ACP_CLOSURE_SHA256 = "ba5650a750d25811f36f4e6e91ad079d700743ddfb4f52abb90d46c9e9d86002";
 const REQUIRED_CLAUDE_CODE_SHA256 = "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
 const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
-const REQUIRED_CLAUDE_BUZZ_ACP_SHA256 = "fd044bd1d4c66ef129c3fd7e8fdf4e0983f5184a9c60e60cb265db8a75440533";
+const REQUIRED_SHARED_BUZZ_ACP_BINARY = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`;
+const REQUIRED_SHARED_BUZZ_ACP_SHA256 = "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
+const REQUIRED_CLAUDE_NODE = {
+  version: "v24.15.0",
+  sha256: "3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32",
+  mode: "0500",
+  sourceBinary: "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin/node",
+  binary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/node`,
+};
 const REQUIRED_CLAUDE_AUTH = {
   mode: "existing-claude-subscription",
   authMethod: "claude.ai",
@@ -113,6 +122,38 @@ export function validateClaudeSubscriptionAuth(status, contract) {
   return { ok: errors.length === 0, errors };
 }
 
+export function validatePinnedNodeRuntime(node, environment) {
+  let stat;
+  try {
+    stat = fs.lstatSync(node?.binary);
+  } catch {
+    return { ok: false, errors: ["pinned Node runtime is missing"] };
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    return { ok: false, errors: ["pinned Node runtime must be a regular non-symlink file"] };
+  }
+  if ((stat.mode & 0o777).toString(8).padStart(4, "0") !== node.mode) {
+    return { ok: false, errors: [`pinned Node runtime mode must be ${node.mode}`] };
+  }
+  try {
+    fs.accessSync(node.binary, fs.constants.X_OK);
+  } catch {
+    return { ok: false, errors: ["pinned Node runtime must be executable"] };
+  }
+  const sha256 = createHash("sha256").update(fs.readFileSync(node.binary)).digest("hex");
+  if (sha256 !== node.sha256) {
+    return { ok: false, errors: ["pinned Node runtime SHA-256 does not match the manifest pin"] };
+  }
+  const version = spawnSync(node.binary, ["--version"], {
+    encoding: "utf8",
+    env: environment,
+  });
+  if (version.status !== 0 || version.stdout.trim() !== node.version) {
+    return { ok: false, errors: [`pinned Node runtime version does not match ${node.version}`] };
+  }
+  return { ok: true, errors: [] };
+}
+
 function memberPubkey(identityMap, memberId) {
   return identityMap.members?.[memberId]?.pubkey_hex;
 }
@@ -196,6 +237,12 @@ export function validateManifest(manifest, identityMap) {
   if (!HEX_64.test(adapter?.entrypointSha256 ?? "")) {
     errors.push(`${principal} ACP entrypoint SHA-256 must be pinned`);
   }
+  if (runtime?.buzzAcpBinary !== REQUIRED_SHARED_BUZZ_ACP_BINARY) {
+    errors.push("shared buzz-acp must use the canonical Data-volume path");
+  }
+  if (runtime?.buzzAcpSha256 !== REQUIRED_SHARED_BUZZ_ACP_SHA256) {
+    errors.push("shared buzz-acp checkpoint drift");
+  }
   if (selector === "claude_cli") {
     if (adapter?.integrity !== REQUIRED_CLAUDE_ACP_INTEGRITY) {
       errors.push("Claude ACP package integrity drift");
@@ -214,7 +261,12 @@ export function validateManifest(manifest, identityMap) {
     buzzAcpBinary: runtime?.buzzAcpBinary,
     configPath: runtime?.configPath,
     ...(selector === "claude_cli"
-      ? { logDir: runtime?.logDir, signerPath: runtime?.signerPath, adapterRoot: adapter?.root }
+      ? {
+          logDir: runtime?.logDir,
+          signerPath: runtime?.signerPath,
+          supervisorWorkingDirectory: runtime?.supervisorWorkingDirectory,
+          adapterRoot: adapter?.root,
+        }
       : {}),
     adapterBinary: adapter?.binary,
   })) {
@@ -229,26 +281,26 @@ export function validateManifest(manifest, identityMap) {
   if (selector === "claude_cli") {
     const claudeCode = runtime?.claudeCode;
     const expectedPaths = {
-      buzzAcpBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`,
       configPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/claude-cli.toml`,
       logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
       signerPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/secrets/claude-code.sk`,
+      supervisorWorkingDirectory: REQUIRED_CLAUDE_RUNTIME_ROOT,
       adapterRoot: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}`,
       adapterBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}/node_modules/.bin/claude-agent-acp`,
     };
     const actualPaths = {
-      buzzAcpBinary: runtime?.buzzAcpBinary,
       configPath: runtime?.configPath,
       logDir: runtime?.logDir,
       signerPath: runtime?.signerPath,
+      supervisorWorkingDirectory: runtime?.supervisorWorkingDirectory,
       adapterRoot: adapter?.root,
       adapterBinary: adapter?.binary,
     };
     for (const [label, expected] of Object.entries(expectedPaths)) {
       if (actualPaths[label] !== expected) errors.push(`Claude ${label} must use the launchd-safe Data-volume path`);
     }
-    if (runtime?.buzzAcpSha256 !== REQUIRED_CLAUDE_BUZZ_ACP_SHA256) {
-      errors.push("Claude shared buzz-acp checkpoint drift");
+    if (JSON.stringify(runtime?.node) !== JSON.stringify(REQUIRED_CLAUDE_NODE)) {
+      errors.push("Claude Node runtime checkpoint drift");
     }
     if (claudeCode?.version !== REQUIRED_CLAUDE_CODE_VERSION) {
       errors.push(`Claude Code must be pinned to ${REQUIRED_CLAUDE_CODE_VERSION}`);
@@ -270,6 +322,9 @@ export function validateManifest(manifest, identityMap) {
   if (!(runtime?.path ?? []).every(isAbsoluteSafePath)) errors.push("every PATH entry must be absolute and safe");
   if (!runtime?.path?.includes(path.dirname(adapter?.binary ?? ""))) {
     errors.push("PATH must include the pinned ACP adapter bin directory");
+  }
+  if (selector === "claude_cli" && runtime?.path?.[0] !== path.dirname(runtime?.node?.binary ?? "")) {
+    errors.push("Claude PATH must resolve the pinned Data-volume Node runtime first");
   }
 
   const workspaces = manifest.workspaces;
@@ -330,7 +385,8 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     memberPubkey(identityMap, manifest.buzz.owner),
     "--agent-command",
     adapter.binary,
-    ...(selector === "claude_cli" ? [] : ["--agent-publisher-credentials"]),
+    ...(selector === "claude_cli" ? ["--session-cwd", workspace] : []),
+    "--agent-publisher-credentials",
     "--agents",
     "1",
     "--subscribe",
@@ -368,7 +424,8 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     enabled: false,
     label: manifest.worker.label,
     workspaceName,
-    workingDirectory: workspace,
+    workingDirectory: selector === "claude_cli" ? manifest.runtime.supervisorWorkingDirectory : workspace,
+    sessionCwd: workspace,
     command: selector === "claude_cli" ? ENV_BINARY : manifest.runtime.buzzAcpBinary,
     args:
       selector === "claude_cli"
@@ -414,6 +471,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) 
       path.dirname(manifest.runtime.configPath),
       logRoot,
       ...(selector === "claude_cli" ? [path.dirname(worker.signerFile)] : []),
+      ...(selector === "claude_cli" ? [worker.workingDirectory, worker.sessionCwd] : []),
     ],
     runAtLoad: false,
     keepAlive: false,

@@ -25,10 +25,18 @@
   },
   "runtime": {
     "buzzAcpBinary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp",
-    "buzzAcpSha256": "fd044bd1d4c66ef129c3fd7e8fdf4e0983f5184a9c60e60cb265db8a75440533",
+    "buzzAcpSha256": "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53",
     "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/claude-cli.toml",
     "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk",
+    "supervisorWorkingDirectory": "/Users/architect/Library/Application Support/AEON/aeon-v6",
+    "node": {
+      "version": "v24.15.0",
+      "sha256": "3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32",
+      "mode": "0500",
+      "sourceBinary": "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin/node",
+      "binary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/node"
+    },
     "claudeAcp": {
       "package": "@agentclientprotocol/claude-agent-acp",
       "version": "0.62.0",
@@ -51,9 +59,8 @@
       }
     },
     "path": [
-      "/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0/node_modules/.bin",
       "/Users/architect/Library/Application Support/AEON/aeon-v6/bin",
-      "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin",
+      "/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0/node_modules/.bin",
       "/usr/bin",
       "/bin",
       "/usr/sbin",

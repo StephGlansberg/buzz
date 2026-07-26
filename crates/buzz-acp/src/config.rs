@@ -310,6 +310,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_EXPECTED_PUBLIC_KEY", requires = "private_key_file")]
     pub expected_public_key: Option<String>,
 
+    /// Absolute workspace path sent as `cwd` in every ACP `session/new`.
+    /// Defaults to the harness process working directory.
+    #[arg(long, env = "BUZZ_ACP_SESSION_CWD")]
+    pub session_cwd: Option<PathBuf>,
+
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
     pub agent_owner: Option<String>,
@@ -571,6 +576,7 @@ pub struct ChannelFilter {
 pub struct Config {
     pub keys: Keys,
     pub relay_url: String,
+    pub session_cwd: PathBuf,
     pub agent_command: String,
     pub agent_publisher_credentials: bool,
     pub agent_args: Vec<String>,
@@ -853,6 +859,37 @@ impl Config {
         private_key.replace_range(.., &"0".repeat(private_key.len()));
         private_key.clear();
 
+        let session_cwd = if let Some(path) = args.session_cwd {
+            if !path.is_absolute() {
+                return Err(ConfigError::ConfigFile(
+                    "--session-cwd must be an absolute path".into(),
+                ));
+            }
+            if path.to_str().is_none() {
+                return Err(ConfigError::ConfigFile(
+                    "--session-cwd must be valid UTF-8 for the ACP protocol".into(),
+                ));
+            }
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                ConfigError::ConfigFile(format!(
+                    "--session-cwd must be an existing directory: {error}"
+                ))
+            })?;
+            if !metadata.is_dir() {
+                return Err(ConfigError::ConfigFile(
+                    "--session-cwd must be an existing directory".into(),
+                ));
+            }
+            path
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        };
+        if session_cwd.to_str().is_none() {
+            return Err(ConfigError::ConfigFile(
+                "--session-cwd must be valid UTF-8 for the ACP protocol".into(),
+            ));
+        }
+
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
         } else if let Some(ref path) = args.system_prompt_file {
@@ -1068,6 +1105,7 @@ impl Config {
         let config = Config {
             keys,
             relay_url: args.relay_url,
+            session_cwd,
             agent_command,
             agent_publisher_credentials,
             agent_args,
@@ -1132,9 +1170,10 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} session_cwd={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
+            self.session_cwd.display(),
             self.agent_command,
             self.agent_args.join(" "),
             self.mcp_command,
@@ -1459,6 +1498,7 @@ mod tests {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
+            session_cwd: PathBuf::from("."),
             agent_command: "goose".into(),
             agent_publisher_credentials: false,
             agent_args: vec!["acp".into()],
@@ -2830,6 +2870,104 @@ channels = "ALL"
         const {
             assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
         }
+    }
+
+    #[test]
+    fn session_cwd_defaults_to_current_directory() {
+        let args =
+            CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY]).unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.session_cwd,
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        );
+    }
+
+    #[test]
+    fn session_cwd_accepts_an_absolute_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("buzz-acp-session-cwd-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-cwd",
+            dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.session_cwd, dir);
+        std::fs::remove_dir_all(&config.session_cwd).unwrap();
+    }
+
+    #[test]
+    fn session_cwd_rejects_relative_missing_and_non_directory_paths() {
+        let relative = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-cwd",
+            "relative",
+        ])
+        .unwrap();
+        assert!(matches!(
+            Config::from_args(relative),
+            Err(ConfigError::ConfigFile(message)) if message.contains("absolute path")
+        ));
+
+        let dir = std::env::temp_dir().join(format!("buzz-acp-session-cwd-{}", Uuid::new_v4()));
+        let missing = dir.join("missing");
+        let missing_args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-cwd",
+            missing.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            Config::from_args(missing_args),
+            Err(ConfigError::ConfigFile(message)) if message.contains("existing directory")
+        ));
+
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let file_args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--session-cwd",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            Config::from_args(file_args),
+            Err(ConfigError::ConfigFile(message)) if message.contains("existing directory")
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_cwd_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir =
+            std::env::temp_dir().join(OsString::from_vec(b"buzz-acp-session-cwd-\xff".to_vec()));
+        let args = CliArgs::try_parse_from([
+            OsString::from("buzz-acp"),
+            OsString::from("--private-key"),
+            OsString::from(TEST_PRIVATE_KEY),
+            OsString::from("--session-cwd"),
+            dir.clone().into_os_string(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            Config::from_args(args),
+            Err(ConfigError::ConfigFile(message)) if message.contains("valid UTF-8")
+        ));
     }
 
     #[cfg(unix)]

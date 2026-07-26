@@ -26,11 +26,27 @@ Its adapter installation, runtime signer, subscription config, and logs live bel
 `/Users/architect/Library/Application Support/AEON/aeon-v6`, matching the
 launchd-safe Data-volume layout used by the working Codex worker. Selected
 workspace paths may remain below `/Volumes/AEON/Projects`.
-The Claude service reuses that working worker's exact trusted
-`bin/buzz-acp`; it does not install or maintain a second harness executable.
-That harness forwards managed publisher credentials by default, so the Claude
-renderer passes neither the unsupported positive flag nor the disabling
-`--no-agent-publisher-credentials` flag.
+Both services reuse the canonical shared
+`/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp`;
+neither worker installs or maintains a private harness executable. Both
+manifests pin the release at SHA-256
+`107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53`.
+The pinned harness supports
+`--session-cwd` and requires the explicit `--agent-publisher-credentials`
+grant, so the renderer cannot silently depend on legacy default forwarding.
+The LaunchAgent PATH resolves
+`/Users/architect/Library/Application Support/AEON/aeon-v6/bin/node` first.
+That runtime is an exact regular-file copy of the canonical service Node
+`v24.15.0`, pinned at SHA-256
+`3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32`.
+Runtime validation rejects symlinks, non-regular files, non-executable or
+non-`0500` modes, hash drift, and version drift.
+The Claude supervisor itself starts from the Data-volume runtime root, so
+launchd and Node never resolve the process cwd through `/Volumes`. The selected
+manifest workspace is passed separately as `--session-cwd`; `buzz-acp`
+validates that explicit path is absolute and is an existing directory, then
+uses it for ACP `session/new`. Workers that omit `--session-cwd` retain the
+current process working directory.
 Buzz requests ACP `bypassPermissions` through its `bypass-permissions` mode;
 the adapter remains the owner of tool execution and permission enforcement.
 Authentication reuses the standard Claude user login without setting
@@ -82,9 +98,6 @@ npm install --global \
   --prefix /Volumes/AEON/runtime/buzz/external-cli/codex_cli/codex-acp/1.1.7 \
   --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/codex-acp@1.1.7
-node deploy/local/aeon-external-cli/validate.mjs \
-  /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
-  --runtime
 ```
 
 Install the pinned Claude adapter into its exact manifest path:
@@ -94,16 +107,14 @@ npm install \
   --prefix '/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0' \
   --save-exact --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/claude-agent-acp@0.62.0
-node deploy/local/aeon-external-cli/validate.mjs \
-  /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
-  --worker claude_cli \
-  --runtime
 ```
 
-Build and install `buzz-acp` at the manifest's exact binary path before the
-runtime check. Install the checked-in subscription config at its exact path:
+Build and install the one shared `buzz-acp` release at the path pinned by both
+manifests before either runtime check. Install the checked-in subscription
+config at its exact path:
 
 ```sh
+cargo build --release -p buzz-acp
 install -d -m 0755 \
   /Volumes/AEON/runtime/buzz/external-cli/codex_cli/config \
   /Volumes/AEON/runtime/buzz/external-cli/codex_cli/logs
@@ -111,8 +122,15 @@ install -m 0444 \
   deploy/local/aeon-external-cli/config/codex_cli.toml \
   /Volumes/AEON/runtime/buzz/external-cli/codex_cli/config/codex_cli.toml
 install -d -m 0755 \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/bin' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/logs'
+install -m 0500 \
+  /Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin/node \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/bin/node'
+install -m 0500 \
+  target/release/buzz-acp \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp'
 install -d -m 0700 \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets'
 install -m 0444 \
@@ -121,6 +139,13 @@ install -m 0444 \
 install -m 0600 \
   /Volumes/AEON/Projects/buzz-data/keys/claude_code.sk \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk'
+node deploy/local/aeon-external-cli/validate.mjs \
+  /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
+  --runtime
+node deploy/local/aeon-external-cli/validate.mjs \
+  /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
+  --worker claude_cli \
+  --runtime
 ```
 
 The signer copy command emits no key material. Canonical identity-map
