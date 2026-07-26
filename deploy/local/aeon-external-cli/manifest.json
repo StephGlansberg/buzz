@@ -1,0 +1,79 @@
+{
+  "schema": "aeon_buzz_external_cli_worker_v1",
+  "enabled": false,
+  "identityMap": "/Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json",
+  "worker": {
+    "principal": "codex_cli",
+    "displayName": "Codex CLI",
+    "label": "org.aeon.buzz-acp.codex-cli",
+    "agents": 1
+  },
+  "buzz": {
+    "relayUrl": "ws://localhost:3000",
+    "owner": "architect",
+    "allowedInbound": ["architect", "nexus", "mechanon"],
+    "sharedRooms": ["ops", "concilium"],
+    "officeRooms": [
+      "aspect_nexus",
+      "aspect_mechanon",
+      "aspect_fontis",
+      "aspect_sapientis",
+      "aspect_viatica",
+      "aspect_voxis"
+    ]
+  },
+  "runtime": {
+    "buzzAcpBinary": "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/bin/buzz-acp",
+    "configPath": "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/config/codex_cli.toml",
+    "codexAcp": {
+      "package": "@agentclientprotocol/codex-acp",
+      "version": "1.1.7",
+      "integrity": "sha512-bhFLbGtOMEw6+PAp33vNERb6dXlULOfV3mWbRdps4v7sY7PHha/C2T1dnlG0yVcvBu9W+NYPzL0CAupnVoFTiQ==",
+      "entrypointSha256": "0deb6b820dfed8804cd76b16a50210fe12202e5e339b5edaa23f6987f1742e0a",
+      "binary": "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/codex-acp/1.1.7/bin/codex-acp"
+    },
+    "codexHome": "/Users/architect/.codex",
+    "initialAgentMode": "agent-full-access",
+    "path": [
+      "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/codex-acp/1.1.7/bin",
+      "/Volumes/AEON/Projects/buzz/target/release",
+      "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin"
+    ]
+  },
+  "workspaces": {
+    "default": "aeon-v6",
+    "allowed": {
+      "aeon-v6": "/Volumes/AEON/Projects/aeon-v6",
+      "buzz": "/Volumes/AEON/Projects/buzz",
+      "codex": "/Volumes/AEON/Projects/codex"
+    }
+  },
+  "posture": {
+    "subscribe": "config",
+    "respondTo": "allowlist",
+    "allowedRespondTo": ["allowlist"],
+    "dedup": "queue",
+    "multipleEventHandling": "queue",
+    "presence": true,
+    "typing": true,
+    "memory": true,
+    "basePrompt": true,
+    "relayObserver": true,
+    "permissionMode": "default",
+    "heartbeatIntervalSecs": 0,
+    "turnLivenessSecs": 10,
+    "idleTimeoutSecs": 900,
+    "maxTurnDurationSecs": 7200,
+    "contextMessageLimit": 24,
+    "maxTurnsPerSession": 0
+  },
+  "supervisor": {
+    "runAtLoad": false,
+    "keepAlive": false,
+    "throttleSeconds": 10
+  }
+}

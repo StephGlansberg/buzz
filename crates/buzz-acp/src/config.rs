@@ -4,6 +4,7 @@
 //! Config file (TOML) for complex subscription rules.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -45,6 +46,54 @@ pub enum ConfigError {
 
     #[error("config file error: {0}")]
     ConfigFile(String),
+}
+
+fn read_owned_secret_file(path: &std::path::Path) -> Result<String, ConfigError> {
+    if !path.is_absolute() {
+        return Err(ConfigError::ConfigFile(
+            "--private-key-file must be an absolute path".into(),
+        ));
+    }
+
+    #[cfg(unix)]
+    let mut file = {
+        use nix::fcntl::{open, OFlag};
+        use nix::sys::stat::Mode;
+
+        let fd = open(path, OFlag::O_RDONLY | OFlag::O_NOFOLLOW, Mode::empty())
+            .map_err(|error| ConfigError::Io(error.into()))?;
+        std::fs::File::from(fd)
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
+
+    // Validate the same handle that supplies the secret so the path cannot be
+    // swapped between metadata inspection and the read.
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ConfigError::ConfigFile(
+            "--private-key-file must be a regular, non-symlink file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(ConfigError::ConfigFile(
+                "--private-key-file permissions must be 0600".into(),
+            ));
+        }
+        if metadata.uid() != nix::unistd::getuid().as_raw() {
+            return Err(ConfigError::ConfigFile(
+                "--private-key-file must be owned by the current user".into(),
+            ));
+        }
+    }
+
+    let mut secret = String::new();
+    file.read_to_string(&mut secret)?;
+    Ok(secret.trim().to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -240,8 +289,26 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_RELAY_URL", default_value = "ws://localhost:3000")]
     pub relay_url: String,
 
-    #[arg(long, env = "BUZZ_PRIVATE_KEY")]
-    pub private_key: String,
+    #[arg(
+        long,
+        env = "BUZZ_PRIVATE_KEY",
+        conflicts_with = "private_key_file",
+        required_unless_present = "private_key_file"
+    )]
+    pub private_key: Option<String>,
+
+    /// Read the Nostr private key from an operator-owned regular file.
+    #[arg(
+        long,
+        env = "BUZZ_PRIVATE_KEY_FILE",
+        conflicts_with = "private_key",
+        required_unless_present = "private_key"
+    )]
+    pub private_key_file: Option<PathBuf>,
+
+    /// Expected public key derived from `--private-key-file`.
+    #[arg(long, env = "BUZZ_EXPECTED_PUBLIC_KEY", requires = "private_key_file")]
+    pub expected_public_key: Option<String>,
 
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
@@ -249,6 +316,24 @@ pub struct CliArgs {
 
     #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
     pub agent_command: String,
+
+    /// Forward this harness identity to the managed agent for direct Buzz CLI use.
+    /// Disabled by default because it grants the child signing authority.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_AGENT_PUBLISHER_CREDENTIALS",
+        default_value_t = false,
+        conflicts_with = "no_agent_publisher_credentials"
+    )]
+    pub agent_publisher_credentials: bool,
+
+    /// Prevent the managed agent from inheriting this harness's Buzz signer.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_NO_AGENT_PUBLISHER_CREDENTIALS",
+        default_value_t = false
+    )]
+    pub no_agent_publisher_credentials: bool,
 
     #[arg(
         long,
@@ -487,6 +572,7 @@ pub struct Config {
     pub keys: Keys,
     pub relay_url: String,
     pub agent_command: String,
+    pub agent_publisher_credentials: bool,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
     pub idle_timeout_secs: u64,
@@ -738,13 +824,34 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
-        let keys = Keys::parse(&args.private_key)?;
+        // Preserve only credentials that a child would already have inherited
+        // from the harness environment. Arg/file signers require explicit opt-in.
+        let inherited_publisher_credentials = std::env::var_os("BUZZ_PRIVATE_KEY").is_some()
+            || std::env::var_os("BUZZ_ACP_PRIVATE_KEY").is_some();
+        let agent_publisher_credentials = args.agent_publisher_credentials
+            || (inherited_publisher_credentials && !args.no_agent_publisher_credentials);
+        let mut private_key = if let Some(value) = args.private_key.take() {
+            value
+        } else if let Some(path) = args.private_key_file.as_ref() {
+            read_owned_secret_file(path)?
+        } else {
+            return Err(ConfigError::ConfigFile(
+                "one of --private-key or --private-key-file is required".into(),
+            ));
+        };
+        let keys = Keys::parse(&private_key)?;
+        if let Some(expected) = args.expected_public_key.as_deref() {
+            if keys.public_key().to_hex() != expected.trim().to_ascii_lowercase() {
+                return Err(ConfigError::ConfigFile(
+                    "private-key file does not derive the expected public key".into(),
+                ));
+            }
+        }
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
         // crate we can only clear the String — the allocator may retain copies.
-        args.private_key
-            .replace_range(.., &"0".repeat(args.private_key.len()));
-        args.private_key.clear();
+        private_key.replace_range(.., &"0".repeat(private_key.len()));
+        private_key.clear();
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -962,6 +1069,7 @@ impl Config {
             keys,
             relay_url: args.relay_url,
             agent_command,
+            agent_publisher_credentials,
             agent_args,
             mcp_command: args.mcp_command,
             idle_timeout_secs,
@@ -1048,6 +1156,22 @@ impl Config {
             respond_to_detail,
             allowed_respond_to_detail,
         )
+    }
+
+    /// Build the managed agent runtime environment. Buzz publisher credentials
+    /// are present only for deployments that explicitly grant the child signer
+    /// authority; the spawn path removes inherited values in every other case.
+    pub fn agent_spawn_env(&self) -> Vec<(String, String)> {
+        let mut env = self.persona_env_vars.clone();
+        env.retain(|(key, _)| !matches!(key.as_str(), "BUZZ_RELAY_URL" | "BUZZ_PRIVATE_KEY"));
+        if self.agent_publisher_credentials {
+            env.push(("BUZZ_RELAY_URL".into(), self.relay_url.clone()));
+            env.push((
+                "BUZZ_PRIVATE_KEY".into(),
+                self.keys.secret_key().to_secret_hex(),
+            ));
+        }
+        env
     }
 }
 
@@ -1336,6 +1460,7 @@ mod tests {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
+            agent_publisher_credentials: false,
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -2705,5 +2830,120 @@ channels = "ALL"
         const {
             assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_file_is_owned_mode_checked_and_binds_expected_pubkey() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!("buzz-acp-key-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("codex-cli.sk");
+        let keys = Keys::generate();
+        std::fs::write(&path, keys.secret_key().to_secret_hex()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key-file",
+            path.to_str().unwrap(),
+            "--expected-public-key",
+            &keys.public_key().to_hex(),
+        ])
+        .unwrap();
+        let config = Config::from_args(args).expect("valid owned signer file");
+        assert_eq!(config.keys.public_key(), keys.public_key());
+        assert!(!config.agent_publisher_credentials);
+
+        let wrong_mode = dir.join("wrong-mode.sk");
+        std::fs::write(&wrong_mode, keys.secret_key().to_secret_hex()).unwrap();
+        std::fs::set_permissions(&wrong_mode, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            read_owned_secret_file(&wrong_mode),
+            Err(ConfigError::ConfigFile(message)) if message.contains("0600")
+        ));
+
+        let link = dir.join("signer-link.sk");
+        symlink(&path, &link).unwrap();
+        assert!(read_owned_secret_file(&link).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_agent_env_uses_validated_harness_buzz_identity() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--relay-url",
+            "ws://127.0.0.1:3000",
+            "--agent-publisher-credentials",
+        ])
+        .unwrap();
+        let mut config = Config::from_args(args).unwrap();
+        config.persona_env_vars.extend([
+            ("BUZZ_RELAY_URL".into(), "ws://wrong.invalid".into()),
+            ("BUZZ_PRIVATE_KEY".into(), "wrong-secret".into()),
+            ("SAFE_PERSONA_SETTING".into(), "kept".into()),
+        ]);
+
+        let env = config.agent_spawn_env();
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key == "BUZZ_RELAY_URL")
+                .count(),
+            1
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == "BUZZ_RELAY_URL")
+                .map(|(_, value)| value.as_str()),
+            Some("ws://127.0.0.1:3000")
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(key, _)| key == "BUZZ_PRIVATE_KEY")
+                .count(),
+            1
+        );
+        assert!(env.contains(&("SAFE_PERSONA_SETTING".into(), "kept".into())));
+    }
+
+    #[test]
+    fn managed_agent_env_omits_buzz_identity_without_explicit_grant() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--relay-url",
+            "ws://127.0.0.1:3000",
+            "--no-agent-publisher-credentials",
+        ])
+        .unwrap();
+        let mut config = Config::from_args(args).unwrap();
+        config.persona_env_vars.extend([
+            ("BUZZ_RELAY_URL".into(), "ws://wrong.invalid".into()),
+            ("BUZZ_PRIVATE_KEY".into(), "wrong-secret".into()),
+        ]);
+
+        let env = config.agent_spawn_env();
+        assert!(!env
+            .iter()
+            .any(|(key, _)| matches!(key.as_str(), "BUZZ_RELAY_URL" | "BUZZ_PRIVATE_KEY")));
+    }
+
+    #[test]
+    fn direct_signer_does_not_grant_publisher_credentials_by_default() {
+        let args =
+            CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY]).unwrap();
+        let config = Config::from_args(args).unwrap();
+
+        assert!(!config.agent_publisher_credentials);
+        assert!(!config
+            .agent_spawn_env()
+            .iter()
+            .any(|(key, _)| key == "BUZZ_PRIVATE_KEY"));
     }
 }
