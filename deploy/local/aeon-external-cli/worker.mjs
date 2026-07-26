@@ -12,8 +12,9 @@ const REQUIRED_CLAUDE_ACP_INTEGRITY =
   "sha512-8QRNmyk5Cfy4XVREeg5KCPoCDtmYS0xALY9WqI640PfopLMpeUzMByXbzLkBLbD819zB67DBhLG5ta98uOEPKg==";
 const REQUIRED_CLAUDE_ACP_GIT_HEAD = "53a0c36ce3b0b76929d11d8b9565e319da745608";
 const REQUIRED_CLAUDE_ACP_ENTRYPOINT_SHA256 = "260aac90bf75f197b93640087c1de66441761d43c2784efa035fdcee60b5dacd";
-const REQUIRED_CLAUDE_ACP_CLOSURE_SHA256 = "7d8acbb9991aafe0560aaf03bcb7e7bb25ffe188c80bef67a5d7140700a6803f";
+const REQUIRED_CLAUDE_ACP_CLOSURE_SHA256 = "ba5650a750d25811f36f4e6e91ad079d700743ddfb4f52abb90d46c9e9d86002";
 const REQUIRED_CLAUDE_CODE_SHA256 = "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
+const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
 const REQUIRED_CLAUDE_AUTH = {
   mode: "existing-claude-subscription",
   authMethod: "claude.ai",
@@ -211,6 +212,7 @@ export function validateManifest(manifest, identityMap) {
   for (const [label, value] of Object.entries({
     buzzAcpBinary: runtime?.buzzAcpBinary,
     configPath: runtime?.configPath,
+    ...(selector === "claude_cli" ? { logDir: runtime?.logDir, adapterRoot: adapter?.root } : {}),
     adapterBinary: adapter?.binary,
   })) {
     if (!isAbsoluteSafePath(value)) errors.push(`${label} must be an absolute safe path`);
@@ -223,6 +225,23 @@ export function validateManifest(manifest, identityMap) {
   }
   if (selector === "claude_cli") {
     const claudeCode = runtime?.claudeCode;
+    const expectedPaths = {
+      buzzAcpBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp-claude-cli`,
+      configPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/claude-cli.toml`,
+      logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
+      adapterRoot: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}`,
+      adapterBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}/node_modules/.bin/claude-agent-acp`,
+    };
+    const actualPaths = {
+      buzzAcpBinary: runtime?.buzzAcpBinary,
+      configPath: runtime?.configPath,
+      logDir: runtime?.logDir,
+      adapterRoot: adapter?.root,
+      adapterBinary: adapter?.binary,
+    };
+    for (const [label, expected] of Object.entries(expectedPaths)) {
+      if (actualPaths[label] !== expected) errors.push(`Claude ${label} must use the launchd-safe Data-volume path`);
+    }
     if (claudeCode?.version !== REQUIRED_CLAUDE_CODE_VERSION) {
       errors.push(`Claude Code must be pinned to ${REQUIRED_CLAUDE_CODE_VERSION}`);
     }
@@ -377,7 +396,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) 
     .map(([key, value]) => `    <key>${xml(key)}</key><string>${xml(value)}</string>`)
     .join("\n");
   const selector = workerSelector(manifest);
-  const logRoot = `/Volumes/AEON/runtime/buzz/external-cli/${selector}/logs`;
+  const logRoot = manifest.runtime.logDir ?? `/Volumes/AEON/runtime/buzz/external-cli/${selector}/logs`;
   const logName = selector.replace("_", "-");
 
   return {

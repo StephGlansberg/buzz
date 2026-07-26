@@ -113,7 +113,7 @@ if (runtimeCheck) {
     if (packageJson.name !== adapter.package || packageJson.version !== adapter.version) {
       throw new Error("claude-agent-acp package metadata does not match the manifest pin");
     }
-    if (hashPackageClosure(packageRoot) !== adapter.closureSha256) {
+    if (hashPackageClosure(adapter.root) !== adapter.closureSha256) {
       throw new Error("claude-agent-acp installed package closure does not match the manifest pin");
     }
     const adapterVersion = spawnSync(adapter.binary, ["--version"], {

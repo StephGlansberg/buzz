@@ -70,6 +70,10 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
     "ANTHROPIC_AUTH_TOKEN",
     claudeManifest.runtime.buzzAcpBinary,
   ]);
+  assert.equal(
+    worker.args[worker.args.indexOf("--agent-command") + 1],
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0/node_modules/.bin/claude-agent-acp",
+  );
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], claudeManifest.runtime.claudeAcp.binary);
@@ -142,9 +146,14 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_AUTH_TOKEN<\/string>/);
   assert.doesNotMatch(artifact.plist, /<key>ANTHROPIC_API_KEY|<key>ANTHROPIC_AUTH_TOKEN|CLAUDE_CONFIG_DIR|nsec1|sk-ant-/);
   assert.deepEqual(artifact.requiredDirectories, [
-    "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/config",
-    "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/logs",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
   ]);
+  assert.match(
+    artifact.plist,
+    /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/bin\/buzz-acp-claude-cli/,
+  );
+  assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/runtime\/buzz\/external-cli\/claude_cli/);
 });
 
 test("Claude authority contract rejects missing identity and mode drift", () => {
@@ -180,6 +189,10 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
     validateManifest(configRelocation, identityMap).errors.join("\n"),
     /config directory override must be absent/,
   );
+
+  const volumeRuntime = structuredClone(claudeManifest);
+  volumeRuntime.runtime.buzzAcpBinary = "/Volumes/AEON/runtime/buzz-acp";
+  assert.match(validateManifest(volumeRuntime, identityMap).errors.join("\n"), /launchd-safe Data-volume path/);
 });
 
 test("Claude package closure digest detects adapter and dependency changes", () => {
