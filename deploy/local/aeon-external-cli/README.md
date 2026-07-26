@@ -1,10 +1,10 @@
 # AEON external CLI workers
 
 This package renders separate disabled-by-default `buzz-acp` workers for the
-external `codex_cli` and `claude_code` principals. The Claude deploy selector,
-launchd label, and runtime namespace remain `claude_cli`; its signed Buzz
-identity and Concilium seat remain the established `claude_code`. The workers
-are separate from each other and from the six internal Aspect workers. Buzz
+external `codex_cli`, `claude_code`, and `cursor_cli` principals. The Claude
+deploy selector, launchd label, and runtime namespace remain `claude_cli`; its
+signed Buzz identity and Concilium seat remain the established `claude_code`.
+The workers are separate from each other and from the six internal Aspect workers. Buzz
 owns transport, presence, typing, queueing, thread context, signed replies,
 observer events, `!cancel`, `!rotate`, and the managed Buzz CLI publisher. Each
 ACP adapter owns coding tools in the selected workspace.
@@ -63,6 +63,30 @@ from `claude auth status`. The adapter must not be launched with
 `--hide-claude-auth`, because that mode rejects Claude subscription
 authentication.
 
+The Cursor worker reuses the same renderer and starts the official
+`/Users/architect/.local/bin/cursor-agent` at exact version
+`2026.07.23-e383d2b` with native ACP arguments `--trust acp`. It uses the same
+rooms, bounded workspace selector, managed signer isolation, Data-volume
+supervisor cwd, explicit `--session-cwd`, Nexus and Mechanon inbound authority,
+and `bypass-permissions` posture as the Claude worker. The manifest pins the
+resolved launcher SHA-256 and a deterministic closure SHA-256 over the complete
+installed Cursor version, excluding only its transient `.running` PID markers.
+Runtime validation requires the existing authenticated Pro subscription and
+scrubs `CURSOR_API_KEY` and `CURSOR_API_ENDPOINT` at the process boundary.
+
+Cursor model selection has one explicit upstream limitation in this release.
+The ordinary CLI accepts `--model cursor-grok-4.5-high`, but native
+`cursor-agent acp` advertises only
+`grok-4.5[effort=high,fast=true]` and ignores the same global non-fast model
+selection. The disabled manifest therefore records
+`requested=cursor-grok-4.5-high`,
+`effective=grok-4.5[effort=high,fast=true]`, and
+`selectionStatus=blocked_by_cursor_acp_catalog`. The renderer truthfully passes
+the effective ACP model through `buzz-acp --model`; it does not claim that the
+requested non-fast semantics are active. Runtime validation fails for catalog
+drift and requires this blocked contract to be removed once Cursor ACP exposes
+the requested model.
+
 The manifest pins npm registry integrity and git-head provenance plus a
 deterministic SHA-256 over the complete installed
 `@agentclientprotocol/claude-agent-acp` package closure. Runtime validation
@@ -81,6 +105,7 @@ Validate and render without changing live state:
 ```sh
 node deploy/local/aeon-external-cli/validate.mjs
 node deploy/local/aeon-external-cli/validate.mjs --worker claude_cli
+node deploy/local/aeon-external-cli/validate.mjs --worker cursor_cli
 node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
@@ -90,6 +115,11 @@ node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   > /tmp/org.aeon.buzz-acp.claude-cli.plist
+node deploy/local/aeon-external-cli/render-launchagent.mjs \
+  --worker cursor_cli \
+  --workspace aeon-v6 \
+  --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
+  > /tmp/org.aeon.buzz-acp.cursor-cli.plist
 ```
 
 Install the pinned adapter into the exact manifest path:
@@ -137,12 +167,22 @@ install -m 0444 \
 install -m 0600 \
   /Volumes/AEON/Projects/buzz-data/keys/claude_code.sk \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk'
+install -m 0444 \
+  deploy/local/aeon-external-cli/config/cursor_cli.toml \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-cli.toml'
+install -m 0600 \
+  /Volumes/AEON/Projects/buzz-data/keys/cursor_cli.sk \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/cursor-cli.sk'
 node deploy/local/aeon-external-cli/validate.mjs \
   /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   --runtime
 node deploy/local/aeon-external-cli/validate.mjs \
   /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   --worker claude_cli \
+  --runtime
+node deploy/local/aeon-external-cli/validate.mjs \
+  /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
+  --worker cursor_cli \
   --runtime
 ```
 
@@ -164,4 +204,6 @@ node deploy/local/aeon-external-cli/render-launchagent.mjs --workspace buzz
 node deploy/local/aeon-external-cli/render-launchagent.mjs --workspace codex
 node deploy/local/aeon-external-cli/render-launchagent.mjs --worker claude_cli --workspace buzz
 node deploy/local/aeon-external-cli/render-launchagent.mjs --worker claude_cli --workspace codex
+node deploy/local/aeon-external-cli/render-launchagent.mjs --worker cursor_cli --workspace buzz
+node deploy/local/aeon-external-cli/render-launchagent.mjs --worker cursor_cli --workspace codex
 ```

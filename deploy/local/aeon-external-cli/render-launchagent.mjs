@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadJson, renderDisabledLaunchAgent, validateManifest } from "./worker.mjs";
+import {
+  loadJson,
+  renderDisabledLaunchAgent,
+  validateManifest,
+} from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 function option(name) {
@@ -10,10 +14,12 @@ function option(name) {
 }
 
 const workspace = option("--workspace");
-const identityPath = option("--identity-map") ?? join(here, "fixtures", "identity-map.json");
+const identityPath =
+  option("--identity-map") ?? join(here, "fixtures", "identity-map.json");
 const worker = option("--worker") ?? "codex_cli";
-const manifestName = worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
-if (!["codex_cli", "claude_cli"].includes(worker)) {
+const manifestName =
+  worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
+if (!["codex_cli", "claude_cli", "cursor_cli"].includes(worker)) {
   console.error(`unsupported external CLI worker: ${worker}`);
   process.exit(1);
 }
@@ -25,4 +31,6 @@ if (!validation.ok) {
   process.exit(1);
 }
 
-process.stdout.write(renderDisabledLaunchAgent(manifest, identityMap, workspace).plist);
+process.stdout.write(
+  renderDisabledLaunchAgent(manifest, identityMap, workspace).plist,
+);
