@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   correlateVerifiedReceipt,
+  hashPackageClosure,
   loadJson,
   renderDisabledLaunchAgent,
   renderWorker,
+  validateAmbientAnthropicCredentials,
+  validateClaudeSubscriptionAuth,
   validateManifest,
 } from "./worker.mjs";
 
@@ -56,6 +62,14 @@ test("renderer pins one full-access codex-acp subprocess", () => {
 
 test("renderer pins one Claude ACP subprocess and installed Claude Code", () => {
   const worker = renderWorker(claudeManifest, identityMap);
+  assert.equal(worker.command, "/usr/bin/env");
+  assert.deepEqual(worker.args.slice(0, 5), [
+    "-u",
+    "ANTHROPIC_API_KEY",
+    "-u",
+    "ANTHROPIC_AUTH_TOKEN",
+    claudeManifest.runtime.buzzAcpBinary,
+  ]);
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], claudeManifest.runtime.claudeAcp.binary);
@@ -64,6 +78,31 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   assert.equal(worker.environment.CLAUDE_CODE_EXECUTABLE, "/Users/architect/.local/share/claude/versions/2.1.220");
   assert.equal(worker.environment.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(worker.environment.ANTHROPIC_API_KEY, undefined);
+  assert.equal(worker.environment.ANTHROPIC_AUTH_TOKEN, undefined);
+});
+
+test("Claude rendered command scrubs ambient API credentials from its child", () => {
+  const worker = renderWorker(claudeManifest, identityMap);
+  const buzzBinaryIndex = worker.args.indexOf(claudeManifest.runtime.buzzAcpBinary);
+  const probe = spawnSync(
+    worker.command,
+    [
+      ...worker.args.slice(0, buzzBinaryIndex),
+      process.execPath,
+      "-e",
+      "process.stdout.write(JSON.stringify({key:process.env.ANTHROPIC_API_KEY,token:process.env.ANTHROPIC_AUTH_TOKEN}))",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ANTHROPIC_API_KEY: "ambient-key",
+        ANTHROPIC_AUTH_TOKEN: "ambient-token",
+      },
+    },
+  );
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.deepEqual(JSON.parse(probe.stdout), {});
 });
 
 test("renderer pins Architect, Nexus, and Mechanon inbound authority", () => {
@@ -99,7 +138,9 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   assert.equal(artifact.runAtLoad, false);
   assert.equal(artifact.keepAlive, false);
   assert.match(artifact.plist, /CLAUDE_CODE_EXECUTABLE/);
-  assert.doesNotMatch(artifact.plist, /ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CONFIG_DIR|nsec1/);
+  assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_API_KEY<\/string>/);
+  assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_AUTH_TOKEN<\/string>/);
+  assert.doesNotMatch(artifact.plist, /<key>ANTHROPIC_API_KEY|<key>ANTHROPIC_AUTH_TOKEN|CLAUDE_CONFIG_DIR|nsec1|sk-ant-/);
   assert.deepEqual(artifact.requiredDirectories, [
     "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/config",
     "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/logs",
@@ -129,12 +170,77 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
   adapterDrift.runtime.claudeAcp.integrity = "sha512-ZHJpZnQ=";
   assert.match(validateManifest(adapterDrift, identityMap).errors.join("\n"), /package integrity drift/);
 
+  const closureDrift = structuredClone(claudeManifest);
+  closureDrift.runtime.claudeAcp.closureSha256 = "0".repeat(64);
+  assert.match(validateManifest(closureDrift, identityMap).errors.join("\n"), /package closure checkpoint drift/);
+
   const configRelocation = structuredClone(claudeManifest);
   configRelocation.runtime.claudeCode.configDir = "/Users/architect/.claude";
   assert.match(
     validateManifest(configRelocation, identityMap).errors.join("\n"),
     /config directory override must be absent/,
   );
+});
+
+test("Claude package closure digest detects adapter and dependency changes", () => {
+  const root = mkdtempSync(join(tmpdir(), "claude-agent-acp-closure-"));
+  try {
+    mkdirSync(join(root, "dist"), { recursive: true });
+    writeFileSync(join(root, "dist", "index.js"), "entrypoint\n");
+    const sibling = join(root, "dist", "acp-agent.js");
+    writeFileSync(sibling, "original sibling\n");
+    mkdirSync(join(root, "node_modules", "dependency"), { recursive: true });
+    const dependency = join(root, "node_modules", "dependency", "index.js");
+    writeFileSync(dependency, "original dependency\n");
+
+    const initial = hashPackageClosure(root);
+    assert.equal(hashPackageClosure(root), initial);
+    writeFileSync(sibling, "modified sibling\n");
+    const siblingChanged = hashPackageClosure(root);
+    assert.notEqual(siblingChanged, initial);
+    writeFileSync(sibling, "original sibling\n");
+    writeFileSync(dependency, "modified dependency\n");
+    assert.notEqual(hashPackageClosure(root), initial);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude runtime auth requires the pinned subscription provider and type", () => {
+  const contract = claudeManifest.runtime.claudeCode.auth;
+  const valid = {
+    loggedIn: true,
+    authMethod: "claude.ai",
+    apiProvider: "firstParty",
+    subscriptionType: "pro",
+  };
+  assert.deepEqual(validateClaudeSubscriptionAuth(valid, contract), { ok: true, errors: [] });
+
+  const wrongMethod = validateClaudeSubscriptionAuth({ ...valid, authMethod: "apiKey" }, contract);
+  assert.equal(wrongMethod.ok, false);
+  assert.match(wrongMethod.errors.join("\n"), /auth method/);
+
+  const wrongProvider = validateClaudeSubscriptionAuth({ ...valid, apiProvider: "bedrock" }, contract);
+  assert.equal(wrongProvider.ok, false);
+  assert.match(wrongProvider.errors.join("\n"), /API provider/);
+
+  const wrongSubscription = validateClaudeSubscriptionAuth({ ...valid, subscriptionType: "free" }, contract);
+  assert.equal(wrongSubscription.ok, false);
+  assert.match(wrongSubscription.errors.join("\n"), /subscription type/);
+});
+
+test("Claude runtime rejects ambient API credentials without exposing values", () => {
+  assert.deepEqual(validateAmbientAnthropicCredentials({}), { ok: true, errors: [] });
+  const result = validateAmbientAnthropicCredentials({
+    ANTHROPIC_API_KEY: "secret-api-key",
+    ANTHROPIC_AUTH_TOKEN: "secret-auth-token",
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.errors, [
+    "ANTHROPIC_API_KEY must be absent for Claude subscription authentication",
+    "ANTHROPIC_AUTH_TOKEN must be absent for Claude subscription authentication",
+  ]);
+  assert.doesNotMatch(result.errors.join("\n"), /secret-/);
 });
 
 test("verified receipt joins request, session, run, and signed reply", () => {
