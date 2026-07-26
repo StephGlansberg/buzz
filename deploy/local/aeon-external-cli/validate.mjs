@@ -4,7 +4,14 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadJson, renderDisabledLaunchAgent, validateManifest } from "./worker.mjs";
+import {
+  hashPackageClosure,
+  loadJson,
+  renderDisabledLaunchAgent,
+  validateAmbientAnthropicCredentials,
+  validateClaudeSubscriptionAuth,
+  validateManifest,
+} from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 function option(name) {
@@ -106,6 +113,9 @@ if (runtimeCheck) {
     if (packageJson.name !== adapter.package || packageJson.version !== adapter.version) {
       throw new Error("claude-agent-acp package metadata does not match the manifest pin");
     }
+    if (hashPackageClosure(packageRoot) !== adapter.closureSha256) {
+      throw new Error("claude-agent-acp installed package closure does not match the manifest pin");
+    }
     const adapterVersion = spawnSync(adapter.binary, ["--version"], {
       encoding: "utf8",
       env: artifact.environment,
@@ -118,8 +128,14 @@ if (runtimeCheck) {
     if (claudeSha256 !== manifest.runtime.claudeCode.binarySha256) {
       throw new Error("Claude Code binary SHA-256 does not match the manifest pin");
     }
+    const ambientCredentials = validateAmbientAnthropicCredentials(process.env);
+    if (!ambientCredentials.ok) {
+      throw new Error(ambientCredentials.errors.join("\n"));
+    }
     const standardClaudeEnvironment = { ...process.env, ...artifact.environment };
     delete standardClaudeEnvironment.CLAUDE_CONFIG_DIR;
+    delete standardClaudeEnvironment.ANTHROPIC_API_KEY;
+    delete standardClaudeEnvironment.ANTHROPIC_AUTH_TOKEN;
     const claudeVersion = spawnSync(manifest.runtime.claudeCode.binary, ["--version"], {
       encoding: "utf8",
       env: standardClaudeEnvironment,
@@ -137,8 +153,12 @@ if (runtimeCheck) {
     } catch {
       throw new Error("Claude Code auth status did not return JSON");
     }
-    if (authStatus.status !== 0 || auth.loggedIn !== true) {
-      throw new Error("Claude Code existing login is unavailable");
+    if (authStatus.status !== 0) {
+      throw new Error("Claude Code auth status failed");
+    }
+    const authValidation = validateClaudeSubscriptionAuth(auth, manifest.runtime.claudeCode.auth);
+    if (!authValidation.ok) {
+      throw new Error(authValidation.errors.join("\n"));
     }
   }
 }

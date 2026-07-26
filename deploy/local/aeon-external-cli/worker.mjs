@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 const HEX_64 = /^[0-9a-f]{64}$/;
@@ -11,7 +12,16 @@ const REQUIRED_CLAUDE_ACP_INTEGRITY =
   "sha512-8QRNmyk5Cfy4XVREeg5KCPoCDtmYS0xALY9WqI640PfopLMpeUzMByXbzLkBLbD819zB67DBhLG5ta98uOEPKg==";
 const REQUIRED_CLAUDE_ACP_GIT_HEAD = "53a0c36ce3b0b76929d11d8b9565e319da745608";
 const REQUIRED_CLAUDE_ACP_ENTRYPOINT_SHA256 = "260aac90bf75f197b93640087c1de66441761d43c2784efa035fdcee60b5dacd";
+const REQUIRED_CLAUDE_ACP_CLOSURE_SHA256 = "7d8acbb9991aafe0560aaf03bcb7e7bb25ffe188c80bef67a5d7140700a6803f";
 const REQUIRED_CLAUDE_CODE_SHA256 = "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
+const REQUIRED_CLAUDE_AUTH = {
+  mode: "existing-claude-subscription",
+  authMethod: "claude.ai",
+  provider: "firstParty",
+  subscriptionTypes: ["pro"],
+};
+const ANTHROPIC_CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+const ENV_BINARY = "/usr/bin/env";
 const WORKER_CONTRACTS = {
   codex_cli: {
     principal: "codex_cli",
@@ -35,6 +45,70 @@ export function loadJson(filePath) {
 
 function isAbsoluteSafePath(value) {
   return typeof value === "string" && path.isAbsolute(value) && !/[\0\r\n,]/.test(value);
+}
+
+export function hashPackageClosure(root) {
+  if (!isAbsoluteSafePath(root)) throw new Error("package root must be an absolute safe path");
+  const hash = createHash("sha256");
+  const entries = [];
+
+  function visit(directory, relativeDirectory) {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const absolutePath = path.join(directory, name);
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
+      const stat = fs.lstatSync(absolutePath);
+      if (stat.isDirectory()) {
+        visit(absolutePath, relativePath);
+      } else if (stat.isFile()) {
+        entries.push({ kind: "file", absolutePath, relativePath, size: stat.size });
+      } else if (stat.isSymbolicLink()) {
+        entries.push({ kind: "symlink", relativePath, target: fs.readlinkSync(absolutePath) });
+      } else {
+        throw new Error(`unsupported package entry: ${relativePath}`);
+      }
+    }
+  }
+
+  visit(root, "");
+  entries.sort((left, right) => {
+    if (left.relativePath === right.relativePath) return 0;
+    return left.relativePath < right.relativePath ? -1 : 1;
+  });
+  for (const entry of entries) {
+    if (entry.kind === "symlink") {
+      hash.update(`l\0${entry.relativePath}\0${entry.target}\0`);
+    } else {
+      hash.update(`f\0${entry.relativePath}\0${entry.size}\0`);
+      hash.update(fs.readFileSync(entry.absolutePath));
+      hash.update("\0");
+    }
+  }
+  return hash.digest("hex");
+}
+
+export function validateAmbientAnthropicCredentials(environment) {
+  const present = ANTHROPIC_CREDENTIAL_ENV.filter(
+    (name) => typeof environment?.[name] === "string" && environment[name].length > 0,
+  );
+  return {
+    ok: present.length === 0,
+    errors: present.map((name) => `${name} must be absent for Claude subscription authentication`),
+  };
+}
+
+export function validateClaudeSubscriptionAuth(status, contract) {
+  const errors = [];
+  if (status?.loggedIn !== true) errors.push("Claude Code existing login is unavailable");
+  if (status?.authMethod !== contract?.authMethod) {
+    errors.push(`Claude Code auth method must be ${contract?.authMethod}`);
+  }
+  if (status?.apiProvider !== contract?.provider) {
+    errors.push(`Claude Code API provider must be ${contract?.provider}`);
+  }
+  if (!contract?.subscriptionTypes?.includes(status?.subscriptionType)) {
+    errors.push(`Claude Code subscription type must be one of: ${(contract?.subscriptionTypes ?? []).join(", ")}`);
+  }
+  return { ok: errors.length === 0, errors };
 }
 
 function memberPubkey(identityMap, memberId) {
@@ -130,6 +204,9 @@ export function validateManifest(manifest, identityMap) {
     if (adapter?.entrypointSha256 !== REQUIRED_CLAUDE_ACP_ENTRYPOINT_SHA256) {
       errors.push("Claude ACP entrypoint checkpoint drift");
     }
+    if (adapter?.closureSha256 !== REQUIRED_CLAUDE_ACP_CLOSURE_SHA256) {
+      errors.push("Claude ACP package closure checkpoint drift");
+    }
   }
   for (const [label, value] of Object.entries({
     buzzAcpBinary: runtime?.buzzAcpBinary,
@@ -159,8 +236,8 @@ export function validateManifest(manifest, identityMap) {
     if (claudeCode?.configDir !== undefined) {
       errors.push("Claude config directory override must be absent");
     }
-    if (claudeCode?.auth !== "existing-claude-login") {
-      errors.push("Claude auth must use the existing Claude login");
+    if (JSON.stringify(claudeCode?.auth) !== JSON.stringify(REQUIRED_CLAUDE_AUTH)) {
+      errors.push("Claude auth must use the pinned Claude subscription login");
     }
   }
   if (!(runtime?.path ?? []).every(isAbsoluteSafePath)) errors.push("every PATH entry must be absolute and safe");
@@ -214,56 +291,61 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
   const allowlist = manifest.buzz.allowedInbound
     .filter((memberId) => memberId !== manifest.buzz.owner)
     .map((memberId) => memberPubkey(identityMap, memberId));
+  const buzzArgs = [
+    "--relay-url",
+    manifest.buzz.relayUrl,
+    "--private-key-file",
+    principal.secret_ref,
+    "--expected-public-key",
+    principal.pubkey_hex,
+    "--agent-owner",
+    memberPubkey(identityMap, manifest.buzz.owner),
+    "--agent-command",
+    adapter.binary,
+    "--agent-publisher-credentials",
+    "--agents",
+    "1",
+    "--subscribe",
+    "config",
+    "--config",
+    manifest.runtime.configPath,
+    "--respond-to",
+    "allowlist",
+    "--respond-to-allowlist",
+    allowlist.join(","),
+    "--allowed-respond-to",
+    "allowlist",
+    "--dedup",
+    "queue",
+    "--multiple-event-handling",
+    "queue",
+    "--relay-observer",
+    "--permission-mode",
+    manifest.posture.permissionMode,
+    "--heartbeat-interval",
+    String(manifest.posture.heartbeatIntervalSecs),
+    "--turn-liveness-secs",
+    String(manifest.posture.turnLivenessSecs),
+    "--idle-timeout",
+    String(manifest.posture.idleTimeoutSecs),
+    "--max-turn-duration",
+    String(manifest.posture.maxTurnDurationSecs),
+    "--context-message-limit",
+    String(manifest.posture.contextMessageLimit),
+    "--max-turns-per-session",
+    String(manifest.posture.maxTurnsPerSession),
+  ];
+  const claudeScrubPrefix = ANTHROPIC_CREDENTIAL_ENV.flatMap((name) => ["-u", name]);
   return {
     enabled: false,
     label: manifest.worker.label,
     workspaceName,
     workingDirectory: workspace,
-    command: manifest.runtime.buzzAcpBinary,
-    args: [
-      "--relay-url",
-      manifest.buzz.relayUrl,
-      "--private-key-file",
-      principal.secret_ref,
-      "--expected-public-key",
-      principal.pubkey_hex,
-      "--agent-owner",
-      memberPubkey(identityMap, manifest.buzz.owner),
-      "--agent-command",
-      adapter.binary,
-      "--agent-publisher-credentials",
-      "--agents",
-      "1",
-      "--subscribe",
-      "config",
-      "--config",
-      manifest.runtime.configPath,
-      "--respond-to",
-      "allowlist",
-      "--respond-to-allowlist",
-      allowlist.join(","),
-      "--allowed-respond-to",
-      "allowlist",
-      "--dedup",
-      "queue",
-      "--multiple-event-handling",
-      "queue",
-      "--relay-observer",
-      "--permission-mode",
-      manifest.posture.permissionMode,
-      "--heartbeat-interval",
-      String(manifest.posture.heartbeatIntervalSecs),
-      "--turn-liveness-secs",
-      String(manifest.posture.turnLivenessSecs),
-      "--idle-timeout",
-      String(manifest.posture.idleTimeoutSecs),
-      "--max-turn-duration",
-      String(manifest.posture.maxTurnDurationSecs),
-      "--context-message-limit",
-      String(manifest.posture.contextMessageLimit),
-      "--max-turns-per-session",
-      String(manifest.posture.maxTurnsPerSession),
-    ],
+    command: selector === "claude_cli" ? ENV_BINARY : manifest.runtime.buzzAcpBinary,
+    args:
+      selector === "claude_cli"
+        ? [...claudeScrubPrefix, manifest.runtime.buzzAcpBinary, ...buzzArgs]
+        : buzzArgs,
     environment:
       selector === "codex_cli"
         ? {

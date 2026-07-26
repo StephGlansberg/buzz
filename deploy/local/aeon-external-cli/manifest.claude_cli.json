@@ -32,13 +32,19 @@
       "integrity": "sha512-8QRNmyk5Cfy4XVREeg5KCPoCDtmYS0xALY9WqI640PfopLMpeUzMByXbzLkBLbD819zB67DBhLG5ta98uOEPKg==",
       "gitHead": "53a0c36ce3b0b76929d11d8b9565e319da745608",
       "entrypointSha256": "260aac90bf75f197b93640087c1de66441761d43c2784efa035fdcee60b5dacd",
+      "closureSha256": "7d8acbb9991aafe0560aaf03bcb7e7bb25ffe188c80bef67a5d7140700a6803f",
       "binary": "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/claude-agent-acp/0.62.0/bin/claude-agent-acp"
     },
     "claudeCode": {
       "version": "2.1.220",
       "binary": "/Users/architect/.local/share/claude/versions/2.1.220",
       "binarySha256": "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081",
-      "auth": "existing-claude-login"
+      "auth": {
+        "mode": "existing-claude-subscription",
+        "authMethod": "claude.ai",
+        "provider": "firstParty",
+        "subscriptionTypes": ["pro"]
+      }
     },
     "path": [
       "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/claude-agent-acp/0.62.0/bin",

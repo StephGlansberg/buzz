@@ -27,9 +27,23 @@ the adapter remains the owner of tool execution and permission enforcement.
 Authentication reuses the standard Claude user login without setting
 `CLAUDE_CONFIG_DIR`; relocating that directory would make Claude Code look for
 credentials below the override instead of the standard `~/.claude.json`. No
-API key or token is added to source, argv, or the plist. The adapter must not be
-launched with `--hide-claude-auth`, because that mode rejects Claude
-subscription authentication.
+API key or token is added to source, argv, or the plist. Runtime validation
+rejects non-empty ambient `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`
+credentials, strips both at the rendered `buzz-acp` process boundary with
+`/usr/bin/env -u`, strips them again before invoking Claude Code during
+validation, and requires
+`authMethod=claude.ai`, `apiProvider=firstParty`, and `subscriptionType=pro`
+from `claude auth status`. The adapter must not be launched with
+`--hide-claude-auth`, because that mode rejects Claude subscription
+authentication.
+
+The manifest pins npm registry integrity and git-head provenance plus a
+deterministic SHA-256 over the complete installed
+`@agentclientprotocol/claude-agent-acp` package closure. Runtime validation
+hashes sorted relative paths, file sizes, file bytes, and symlink targets,
+including the adapter's nested `node_modules`. Changes to adapter siblings such
+as `dist/acp-agent.js` or transitive dependency code therefore fail validation
+rather than relying on the entrypoint hash alone.
 
 The harness reads each principal's signer from its own `0600` non-symlink file,
 then forwards the validated identity and relay URL only to that managed
