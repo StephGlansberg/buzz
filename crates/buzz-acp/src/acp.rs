@@ -202,6 +202,10 @@ pub struct AcpClient {
     goose_usage: UsageTracker,
 }
 
+fn harness_bound_agent_env(key: &str) -> bool {
+    matches!(key, "BUZZ_RELAY_URL" | "BUZZ_PRIVATE_KEY")
+}
+
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
 /// collisions.  When both sides have an object for the same key, the merge recurses so
 /// unrelated nested keys from `base` are preserved.
@@ -422,6 +426,17 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+        // Buzz signing authority is opt-in through `extra_env`; never inherit
+        // credentials from the harness process into an arbitrary ACP child.
+        for key in [
+            "BUZZ_RELAY_URL",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_ACP_PRIVATE_KEY",
+            "BUZZ_PRIVATE_KEY_FILE",
+            "BUZZ_EXPECTED_PUBLIC_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
@@ -452,7 +467,7 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var(key).is_err() {
+            if harness_bound_agent_env(key) || std::env::var(key).is_err() {
                 cmd.env(key, value);
             }
         }
@@ -3713,5 +3728,13 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+
+    #[test]
+    fn harness_buzz_credentials_override_parent_environment() {
+        assert!(harness_bound_agent_env("BUZZ_RELAY_URL"));
+        assert!(harness_bound_agent_env("BUZZ_PRIVATE_KEY"));
+        assert!(!harness_bound_agent_env("CODEX_CONFIG"));
+        assert!(!harness_bound_agent_env("INITIAL_AGENT_MODE"));
     }
 }

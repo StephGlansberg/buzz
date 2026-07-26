@@ -1759,7 +1759,7 @@ async fn tokio_main() -> Result<()> {
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
+                let env = config.agent_spawn_env();
                 let has_codex = config.has_generated_codex_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
@@ -3485,7 +3485,7 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = config.agent_spawn_env();
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3663,7 +3663,7 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = config.agent_spawn_env();
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
@@ -3730,7 +3730,7 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env: config.agent_spawn_env(),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
@@ -4948,6 +4948,7 @@ mod build_mcp_servers_tests {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
+            agent_publisher_credentials: false,
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -5114,6 +5115,7 @@ mod error_outcome_emission_tests {
             // harmlessly off the JoinSet — irrelevant to the synchronous
             // feed emission under test.
             agent_command: "true".into(),
+            agent_publisher_credentials: false,
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,

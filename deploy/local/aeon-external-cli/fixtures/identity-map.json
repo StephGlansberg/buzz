@@ -1,0 +1,75 @@
+{
+  "members": {
+    "architect": {
+      "display_name": "Architect",
+      "gateway_agent_id": null,
+      "aspect_slug": null,
+      "pubkey_hex": "73ac8798fd9cedcc5d24645d7ed49332d94a28f2c937f4c1b638f92bf6e8e91f",
+      "secret_ref": "/Volumes/AEON/Projects/buzz-data/keys/architect.sk"
+    },
+    "nexus": {
+      "display_name": "Nexus",
+      "gateway_agent_id": "main",
+      "aspect_slug": "nexus",
+      "pubkey_hex": "ca2bce90e858e12f399f7b4cd510b5fce74e4238352229ada47b8bdd1a7f3b97",
+      "secret_ref": "/Volumes/AEON/Projects/buzz-data/keys/nexus.sk"
+    },
+    "mechanon": {
+      "display_name": "Mechanon",
+      "gateway_agent_id": "mechanon",
+      "aspect_slug": "mechanon",
+      "pubkey_hex": "44437bd6007641845f154bdb7698b1627745b0a1b1d9bdfcf4826fe82a37ca9d",
+      "secret_ref": "/Volumes/AEON/Projects/buzz-data/keys/mechanon.sk"
+    },
+    "codex_cli": {
+      "display_name": "Codex CLI",
+      "gateway_agent_id": null,
+      "aspect_slug": null,
+      "concilium_seat": "codex_cli",
+      "pubkey_hex": "7924cc1dd5389c567ea4ad2b3013b71df28c7b856247365efcccbc7763bfdb7f",
+      "secret_ref": "/Volumes/AEON/Projects/buzz-data/keys/codex_cli.sk"
+    }
+  },
+  "channels": {
+    "ops": {
+      "name": "ops",
+      "channel_id": "3dd32f72-4272-4195-ad63-c31e6167ac55",
+      "members": ["architect", "nexus", "mechanon", "codex_cli"]
+    },
+    "concilium": {
+      "name": "concilium",
+      "channel_id": "4ac1cee0-2238-483f-b25b-f99ec17eec46",
+      "members": ["architect", "nexus", "mechanon", "codex_cli"]
+    },
+    "aspect_nexus": {
+      "name": "aspect-nexus",
+      "channel_id": "7e8c4840-d401-4701-afc9-7ae7174cfc4e",
+      "members": ["architect", "nexus", "codex_cli"]
+    },
+    "aspect_mechanon": {
+      "name": "aspect-mechanon",
+      "channel_id": "7d022bea-5e81-4d18-bd2e-176e9eda1971",
+      "members": ["architect", "mechanon", "codex_cli"]
+    },
+    "aspect_fontis": {
+      "name": "aspect-fontis",
+      "channel_id": "600cb602-ff2a-422b-bdb2-6353bb81100d",
+      "members": ["architect", "fontis", "codex_cli"]
+    },
+    "aspect_sapientis": {
+      "name": "aspect-sapientis",
+      "channel_id": "4e9f115c-cf8d-4abe-a085-c2b2c64ef2c2",
+      "members": ["architect", "sapientis", "codex_cli"]
+    },
+    "aspect_viatica": {
+      "name": "aspect-viatica",
+      "channel_id": "39560f3c-f638-41a1-945b-ed5400ec41fc",
+      "members": ["architect", "viatica", "codex_cli"]
+    },
+    "aspect_voxis": {
+      "name": "aspect-voxis",
+      "channel_id": "d00b15e9-0dbe-4f35-895e-b6d36faa299e",
+      "members": ["architect", "voxis", "codex_cli"]
+    }
+  }
+}
