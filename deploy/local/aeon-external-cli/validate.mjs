@@ -61,8 +61,12 @@ if (artifact.args.includes("--no-agent-publisher-credentials")) {
   console.error(`external ${manifest.worker.principal} must receive its own managed Buzz credentials`);
   process.exit(1);
 }
-if (!artifact.args.includes("--agent-publisher-credentials")) {
+if (selector !== "claude_cli" && !artifact.args.includes("--agent-publisher-credentials")) {
   console.error(`external ${manifest.worker.principal} must explicitly opt into managed Buzz credentials`);
+  process.exit(1);
+}
+if (selector === "claude_cli" && artifact.args.includes("--agent-publisher-credentials")) {
+  console.error("Claude shared buzz-acp uses default publisher forwarding and rejects the positive flag");
   process.exit(1);
 }
 
@@ -108,6 +112,21 @@ if (runtimeCheck) {
       throw new Error(`codex-acp version does not match ${adapter.version}`);
     }
   } else {
+    const buzzSha256 = createHash("sha256").update(fs.readFileSync(manifest.runtime.buzzAcpBinary)).digest("hex");
+    if (buzzSha256 !== manifest.runtime.buzzAcpSha256) {
+      throw new Error("shared buzz-acp SHA-256 does not match the manifest pin");
+    }
+    const buzzHelp = spawnSync(manifest.runtime.buzzAcpBinary, ["--help"], {
+      encoding: "utf8",
+      env: artifact.environment,
+    });
+    if (
+      buzzHelp.status !== 0 ||
+      !buzzHelp.stdout.includes("--no-agent-publisher-credentials") ||
+      !buzzHelp.stdout.includes("instead of forwarding")
+    ) {
+      throw new Error("shared buzz-acp does not advertise default managed publisher credential forwarding");
+    }
     const packageRoot = dirname(dirname(adapterEntrypoint));
     const packageJson = loadJson(join(packageRoot, "package.json"));
     if (packageJson.name !== adapter.package || packageJson.version !== adapter.version) {
