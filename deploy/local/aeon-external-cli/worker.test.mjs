@@ -58,7 +58,7 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], claudeManifest.runtime.claudeAcp.binary);
   assert.equal(worker.environment.CLAUDE_CODE_EXECUTABLE, "/Users/architect/.local/share/claude/versions/2.1.220");
-  assert.equal(worker.environment.CLAUDE_CONFIG_DIR, "/Users/architect/.claude");
+  assert.equal(worker.environment.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(worker.environment.ANTHROPIC_API_KEY, undefined);
 });
 
@@ -95,7 +95,7 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   assert.equal(artifact.runAtLoad, false);
   assert.equal(artifact.keepAlive, false);
   assert.match(artifact.plist, /CLAUDE_CODE_EXECUTABLE/);
-  assert.doesNotMatch(artifact.plist, /ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|nsec1/);
+  assert.doesNotMatch(artifact.plist, /ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CONFIG_DIR|nsec1/);
   assert.deepEqual(artifact.requiredDirectories, [
     "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/config",
     "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/logs",
@@ -117,6 +117,13 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
   const adapterDrift = structuredClone(claudeManifest);
   adapterDrift.runtime.claudeAcp.integrity = "sha512-ZHJpZnQ=";
   assert.match(validateManifest(adapterDrift, identityMap).errors.join("\n"), /package integrity drift/);
+
+  const configRelocation = structuredClone(claudeManifest);
+  configRelocation.runtime.claudeCode.configDir = "/Users/architect/.claude";
+  assert.match(
+    validateManifest(configRelocation, identityMap).errors.join("\n"),
+    /config directory override must be absent/,
+  );
 });
 
 test("verified receipt joins request, session, run, and signed reply", () => {

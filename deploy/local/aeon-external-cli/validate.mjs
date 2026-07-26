@@ -112,22 +112,23 @@ if (runtimeCheck) {
     if (adapterVersion.status !== 0 || adapterVersion.stdout.trim() !== adapter.version) {
       throw new Error(`claude-agent-acp version does not match ${adapter.version}`);
     }
-    fs.accessSync(manifest.runtime.claudeCode.configDir, fs.constants.R_OK);
     fs.accessSync(manifest.runtime.claudeCode.binary, fs.constants.X_OK);
     const claudeSha256 = createHash("sha256").update(fs.readFileSync(manifest.runtime.claudeCode.binary)).digest("hex");
     if (claudeSha256 !== manifest.runtime.claudeCode.binarySha256) {
       throw new Error("Claude Code binary SHA-256 does not match the manifest pin");
     }
+    const standardClaudeEnvironment = { ...process.env, ...artifact.environment };
+    delete standardClaudeEnvironment.CLAUDE_CONFIG_DIR;
     const claudeVersion = spawnSync(manifest.runtime.claudeCode.binary, ["--version"], {
       encoding: "utf8",
-      env: artifact.environment,
+      env: standardClaudeEnvironment,
     });
     if (claudeVersion.status !== 0 || !claudeVersion.stdout.startsWith(manifest.runtime.claudeCode.version)) {
       throw new Error(`Claude Code version does not match ${manifest.runtime.claudeCode.version}`);
     }
     const authStatus = spawnSync(manifest.runtime.claudeCode.binary, ["auth", "status"], {
       encoding: "utf8",
-      env: artifact.environment,
+      env: standardClaudeEnvironment,
     });
     let auth;
     try {
