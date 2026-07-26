@@ -213,7 +213,9 @@ export function validateManifest(manifest, identityMap) {
   for (const [label, value] of Object.entries({
     buzzAcpBinary: runtime?.buzzAcpBinary,
     configPath: runtime?.configPath,
-    ...(selector === "claude_cli" ? { logDir: runtime?.logDir, adapterRoot: adapter?.root } : {}),
+    ...(selector === "claude_cli"
+      ? { logDir: runtime?.logDir, signerPath: runtime?.signerPath, adapterRoot: adapter?.root }
+      : {}),
     adapterBinary: adapter?.binary,
   })) {
     if (!isAbsoluteSafePath(value)) errors.push(`${label} must be an absolute safe path`);
@@ -230,6 +232,7 @@ export function validateManifest(manifest, identityMap) {
       buzzAcpBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`,
       configPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/claude-cli.toml`,
       logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
+      signerPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/secrets/claude-code.sk`,
       adapterRoot: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}`,
       adapterBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}/node_modules/.bin/claude-agent-acp`,
     };
@@ -237,6 +240,7 @@ export function validateManifest(manifest, identityMap) {
       buzzAcpBinary: runtime?.buzzAcpBinary,
       configPath: runtime?.configPath,
       logDir: runtime?.logDir,
+      signerPath: runtime?.signerPath,
       adapterRoot: adapter?.root,
       adapterBinary: adapter?.binary,
     };
@@ -311,6 +315,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
   const principal = identityMap.members[manifest.worker.principal];
   const contract = WORKER_CONTRACTS[selector];
   const adapter = manifest.runtime[contract.adapterKey];
+  const signerFile = selector === "claude_cli" ? manifest.runtime.signerPath : principal.secret_ref;
   const allowlist = manifest.buzz.allowedInbound
     .filter((memberId) => memberId !== manifest.buzz.owner)
     .map((memberId) => memberPubkey(identityMap, memberId));
@@ -318,7 +323,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     "--relay-url",
     manifest.buzz.relayUrl,
     "--private-key-file",
-    principal.secret_ref,
+    signerFile,
     "--expected-public-key",
     principal.pubkey_hex,
     "--agent-owner",
@@ -380,7 +385,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
             PATH: manifest.runtime.path.join(":"),
             CLAUDE_CODE_EXECUTABLE: manifest.runtime.claudeCode.binary,
           },
-    signerFile: principal.secret_ref,
+    signerFile,
     expectedPublicKey: principal.pubkey_hex,
   };
 }
@@ -405,7 +410,11 @@ export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) 
 
   return {
     ...worker,
-    requiredDirectories: [path.dirname(manifest.runtime.configPath), logRoot],
+    requiredDirectories: [
+      path.dirname(manifest.runtime.configPath),
+      logRoot,
+      ...(selector === "claude_cli" ? [path.dirname(worker.signerFile)] : []),
+    ],
     runAtLoad: false,
     keepAlive: false,
     rollback: ["launchctl", "bootout", `gui/<uid>/${worker.label}`],

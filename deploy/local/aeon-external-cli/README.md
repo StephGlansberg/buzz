@@ -22,7 +22,7 @@ The Claude worker starts the maintained
 `@agentclientprotocol/claude-agent-acp@0.62.0` adapter at source checkpoint
 `53a0c36ce3b0b76929d11d8b9565e319da745608`. That adapter uses the official
 Claude Agent SDK and the pinned installed Claude Code `2.1.220` executable.
-Its adapter installation, subscription config, and logs live below
+Its adapter installation, runtime signer, subscription config, and logs live below
 `/Users/architect/Library/Application Support/AEON/aeon-v6`, matching the
 launchd-safe Data-volume layout used by the working Codex worker. Selected
 workspace paths may remain below `/Volumes/AEON/Projects`.
@@ -113,10 +113,22 @@ install -m 0444 \
 install -d -m 0755 \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/logs'
+install -d -m 0700 \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets'
 install -m 0444 \
   deploy/local/aeon-external-cli/config/claude_cli.toml \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/claude-cli.toml'
+install -m 0600 \
+  /Volumes/AEON/Projects/buzz-data/keys/claude_code.sk \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk'
 ```
+
+The signer copy command emits no key material. Canonical identity-map
+membership and `secret_ref` remain unchanged; runtime validation passes the
+Data-volume copy and canonical `claude_code` pubkey through the shared
+`buzz-acp` safe signer reader. That reader opens with no symlink following,
+requires a current-user-owned regular file with exact mode `0600`, and rejects
+any key that does not derive the canonical pubkey.
 
 Activation is intentionally absent: the generated plist has
 `RunAtLoad=false` and `KeepAlive=false`. A later operator action must install

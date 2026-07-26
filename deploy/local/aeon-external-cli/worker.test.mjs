@@ -79,7 +79,10 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], claudeManifest.runtime.claudeAcp.binary);
-  assert.equal(worker.signerFile, identityMap.members.claude_code.secret_ref);
+  assert.equal(
+    worker.signerFile,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk",
+  );
   assert.equal(worker.expectedPublicKey, identityMap.members.claude_code.pubkey_hex);
   assert.equal(worker.environment.CLAUDE_CODE_EXECUTABLE, "/Users/architect/.local/share/claude/versions/2.1.220");
   assert.equal(worker.environment.CLAUDE_CONFIG_DIR, undefined);
@@ -150,6 +153,7 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   assert.deepEqual(artifact.requiredDirectories, [
     "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets",
   ]);
   assert.match(
     artifact.plist,
@@ -157,6 +161,11 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   );
   assert.doesNotMatch(artifact.plist, /buzz-acp-claude-cli/);
   assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/runtime\/buzz\/external-cli\/claude_cli/);
+  assert.match(
+    artifact.plist,
+    /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/secrets\/claude-code\.sk/,
+  );
+  assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/Projects\/buzz-data\/keys\/claude_code\.sk/);
 });
 
 test("Claude authority contract rejects missing identity and mode drift", () => {
@@ -200,6 +209,10 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
   const sharedHarnessDrift = structuredClone(claudeManifest);
   sharedHarnessDrift.runtime.buzzAcpSha256 = "0".repeat(64);
   assert.match(validateManifest(sharedHarnessDrift, identityMap).errors.join("\n"), /shared buzz-acp checkpoint drift/);
+
+  const signerDrift = structuredClone(claudeManifest);
+  signerDrift.runtime.signerPath = identityMap.members.claude_code.secret_ref;
+  assert.match(validateManifest(signerDrift, identityMap).errors.join("\n"), /launchd-safe Data-volume path/);
 });
 
 test("Claude package closure digest detects adapter and dependency changes", () => {
