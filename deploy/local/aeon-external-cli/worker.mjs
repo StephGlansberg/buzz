@@ -14,12 +14,14 @@ const REQUIRED_CLAUDE_ACP_ENTRYPOINT_SHA256 = "260aac90bf75f197b93640087c1de6644
 const REQUIRED_CLAUDE_CODE_SHA256 = "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
 const WORKER_CONTRACTS = {
   codex_cli: {
+    principal: "codex_cli",
     adapterKey: "codexAcp",
     adapterPackage: "@agentclientprotocol/codex-acp",
     adapterVersion: REQUIRED_CODEX_ACP_VERSION,
     label: "org.aeon.buzz-acp.codex-cli",
   },
   claude_cli: {
+    principal: "claude_code",
     adapterKey: "claudeAcp",
     adapterPackage: "@agentclientprotocol/claude-agent-acp",
     adapterVersion: REQUIRED_CLAUDE_ACP_VERSION,
@@ -39,6 +41,10 @@ function memberPubkey(identityMap, memberId) {
   return identityMap.members?.[memberId]?.pubkey_hex;
 }
 
+function workerSelector(manifest) {
+  return manifest.worker?.selector ?? manifest.worker?.principal;
+}
+
 function exactRoomIds(manifest, identityMap) {
   return [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
     (roomId) => identityMap.channels?.[roomId]?.channel_id,
@@ -47,15 +53,19 @@ function exactRoomIds(manifest, identityMap) {
 
 export function validateManifest(manifest, identityMap) {
   const errors = [];
-  const member = identityMap.members?.[manifest.worker?.principal];
   const principal = manifest.worker?.principal;
-  const contract = WORKER_CONTRACTS[principal];
+  const selector = workerSelector(manifest);
+  const member = identityMap.members?.[principal];
+  const contract = WORKER_CONTRACTS[selector];
 
   if (manifest.schema !== "aeon_buzz_external_cli_worker_v1") {
     errors.push("unsupported external CLI worker schema");
   }
   if (manifest.enabled !== false) errors.push("external CLI worker must be disabled by default");
-  if (!contract) errors.push("worker principal must be codex_cli or claude_cli");
+  if (!contract) errors.push("worker selector must be codex_cli or claude_cli");
+  if (contract && principal !== contract.principal) {
+    errors.push(`${selector} worker must bind to ${contract.principal}`);
+  }
   if (manifest.worker?.agents !== 1) errors.push("exactly one ACP subprocess is required");
   if (!SAFE_LABEL.test(manifest.worker?.label ?? "")) errors.push("invalid launchd label");
   if (contract && manifest.worker?.label !== contract.label) {
@@ -110,7 +120,7 @@ export function validateManifest(manifest, identityMap) {
   if (!HEX_64.test(adapter?.entrypointSha256 ?? "")) {
     errors.push(`${principal} ACP entrypoint SHA-256 must be pinned`);
   }
-  if (principal === "claude_cli") {
+  if (selector === "claude_cli") {
     if (adapter?.integrity !== REQUIRED_CLAUDE_ACP_INTEGRITY) {
       errors.push("Claude ACP package integrity drift");
     }
@@ -128,13 +138,13 @@ export function validateManifest(manifest, identityMap) {
   })) {
     if (!isAbsoluteSafePath(value)) errors.push(`${label} must be an absolute safe path`);
   }
-  if (principal === "codex_cli") {
+  if (selector === "codex_cli") {
     if (!isAbsoluteSafePath(runtime?.codexHome)) errors.push("codexHome must be an absolute safe path");
     if (runtime?.initialAgentMode !== REQUIRED_AGENT_MODE) {
       errors.push(`INITIAL_AGENT_MODE must be ${REQUIRED_AGENT_MODE}`);
     }
   }
-  if (principal === "claude_cli") {
+  if (selector === "claude_cli") {
     const claudeCode = runtime?.claudeCode;
     if (claudeCode?.version !== REQUIRED_CLAUDE_CODE_VERSION) {
       errors.push(`Claude Code must be pinned to ${REQUIRED_CLAUDE_CODE_VERSION}`);
@@ -179,7 +189,7 @@ export function validateManifest(manifest, identityMap) {
   for (const field of ["presence", "typing", "memory", "basePrompt", "relayObserver"]) {
     if (posture?.[field] !== true) errors.push(`${field} must remain enabled`);
   }
-  const expectedPermissionMode = principal === "claude_cli" ? "bypass-permissions" : "default";
+  const expectedPermissionMode = selector === "claude_cli" ? "bypass-permissions" : "default";
   if (posture?.permissionMode !== expectedPermissionMode) {
     errors.push(`${principal} Buzz permission mode must be ${expectedPermissionMode}`);
   }
@@ -197,8 +207,9 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
 
   const workspace = manifest.workspaces.allowed[workspaceName];
   if (!workspace) throw new Error(`workspace is not allowed: ${workspaceName}`);
+  const selector = workerSelector(manifest);
   const principal = identityMap.members[manifest.worker.principal];
-  const contract = WORKER_CONTRACTS[manifest.worker.principal];
+  const contract = WORKER_CONTRACTS[selector];
   const adapter = manifest.runtime[contract.adapterKey];
   const allowlist = manifest.buzz.allowedInbound
     .filter((memberId) => memberId !== manifest.buzz.owner)
@@ -254,7 +265,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
       String(manifest.posture.maxTurnsPerSession),
     ],
     environment:
-      manifest.worker.principal === "codex_cli"
+      selector === "codex_cli"
         ? {
             PATH: manifest.runtime.path.join(":"),
             CODEX_HOME: manifest.runtime.codexHome,
@@ -283,8 +294,9 @@ export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) 
   const envXml = Object.entries(worker.environment)
     .map(([key, value]) => `    <key>${xml(key)}</key><string>${xml(value)}</string>`)
     .join("\n");
-  const logRoot = `/Volumes/AEON/runtime/buzz/external-cli/${manifest.worker.principal}/logs`;
-  const logName = manifest.worker.principal.replace("_", "-");
+  const selector = workerSelector(manifest);
+  const logRoot = `/Volumes/AEON/runtime/buzz/external-cli/${selector}/logs`;
+  const logName = selector.replace("_", "-");
 
   return {
     ...worker,
