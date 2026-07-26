@@ -38,6 +38,19 @@ const REQUIRED_CLAUDE_AUTH = {
 };
 const ANTHROPIC_CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 const CURSOR_OVERRIDE_ENV = ["CURSOR_API_KEY", "CURSOR_API_ENDPOINT"];
+const REQUIRED_SHARED_ROOMS = ["ops", "concilium"];
+const REQUIRED_OFFICE_ROOMS = [
+  "aspect_nexus",
+  "aspect_mechanon",
+  "aspect_fontis",
+  "aspect_sapientis",
+  "aspect_viatica",
+  "aspect_voxis",
+];
+export const REQUIRED_ROOM_NAMES = [
+  ...REQUIRED_SHARED_ROOMS,
+  ...REQUIRED_OFFICE_ROOMS,
+];
 const REQUIRED_CURSOR_ROOT = `/Users/architect/.local/share/cursor-agent/versions/${REQUIRED_CURSOR_CLI_VERSION}`;
 const REQUIRED_CURSOR_CLI = {
   package: "cursor-agent",
@@ -265,10 +278,152 @@ function workerSelector(manifest) {
   return manifest.worker?.selector ?? manifest.worker?.principal;
 }
 
-function exactRoomIds(manifest, identityMap) {
+export function exactRoomIds(manifest, identityMap) {
   return [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
-    (roomId) => identityMap.channels?.[roomId]?.channel_id,
+    (roomName) => identityMap.channels?.[roomName]?.channel_id,
   );
+}
+
+export function validateSubscriptionProjection(
+  configText,
+  manifest,
+  identityMap,
+) {
+  const errors = [];
+  const channelArrays = [];
+  const ruleNames = [];
+  const channelArrayPattern = /^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/gm;
+  const tableHeaderPattern = /^\s*\[[^\r\n]*$/gm;
+  const tableHeaders = [...configText.matchAll(tableHeaderPattern)];
+  const preamble = configText.slice(
+    0,
+    tableHeaders[0]?.index ?? configText.length,
+  );
+  const preambleLines = preamble
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"));
+  const validRuleHeader = (header) =>
+    /^\s*\[\[rules\]\]\s*(?:#.*)?$/.test(header[0]);
+  const ruleSections = tableHeaders.flatMap((header, index) => {
+    if (!validRuleHeader(header)) return [];
+    const bodyStart = header.index + header[0].length;
+    const bodyEnd = tableHeaders[index + 1]?.index ?? configText.length;
+    return [configText.slice(bodyStart, bodyEnd)];
+  });
+
+  if (/'''|"""/.test(configText)) {
+    errors.push("subscription projection must not contain multiline strings");
+  }
+  if (
+    preambleLines.length !== 0 ||
+    tableHeaders.length !== 2 ||
+    tableHeaders.some((header) => !validRuleHeader(header))
+  ) {
+    errors.push(
+      "subscription projection must not contain content outside the two canonical rules",
+    );
+  }
+  if (ruleSections.length !== 2) {
+    errors.push("subscription projection must contain exactly two rules");
+  }
+
+  for (const rule of ruleSections) {
+    const channelMatches = [...rule.matchAll(channelArrayPattern)];
+    if (channelMatches.length !== 1) {
+      errors.push(
+        "each subscription rule must contain exactly one channel array",
+      );
+      continue;
+    }
+    try {
+      const channels = JSON.parse(channelMatches[0][1].replace(/,\s*\]$/, "]"));
+      if (
+        !Array.isArray(channels) ||
+        !channels.every((id) => typeof id === "string")
+      ) {
+        errors.push("subscription channels must be string arrays");
+      } else {
+        channelArrays.push(channels);
+      }
+    } catch {
+      errors.push(
+        "subscription channels must use deterministic string-array syntax",
+      );
+    }
+
+    const mentionMatches = [
+      ...rule.matchAll(/^\s*require_mention\s*=\s*(true|false)\s*$/gm),
+    ];
+    if (mentionMatches.length !== 1 || mentionMatches[0][1] !== "true") {
+      errors.push("each subscription rule must require a mention");
+    }
+
+    const remainingLines = rule
+      .replace(channelArrayPattern, "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    const nameCount = remainingLines.filter((line) =>
+      /^name\s*=\s*"[a-z0-9-]+"$/.test(line),
+    ).length;
+    const kindsCount = remainingLines.filter((line) =>
+      /^kinds\s*=\s*\[\s*9\s*,\s*40002\s*\]$/.test(line),
+    ).length;
+    const mentionCount = remainingLines.filter((line) =>
+      /^require_mention\s*=\s*true$/.test(line),
+    ).length;
+    if (
+      nameCount !== 1 ||
+      kindsCount !== 1 ||
+      mentionCount !== 1 ||
+      remainingLines.length !== 3
+    ) {
+      errors.push(
+        "each subscription rule must use the deterministic name, channels, kinds, and mention schema",
+      );
+    } else {
+      ruleNames.push(
+        remainingLines
+          .find((line) => line.startsWith("name"))
+          .match(/^name\s*=\s*"([a-z0-9-]+)"$/)[1],
+      );
+    }
+  }
+
+  if (
+    JSON.stringify(ruleNames) !==
+    JSON.stringify(["aeon-shared-control", "aeon-aspect-offices"])
+  ) {
+    errors.push(
+      "subscription rules must be the canonical shared-control and Aspect-office rules",
+    );
+  }
+
+  const expectedChannelArrays = [
+    manifest.buzz.sharedRooms.map(
+      (roomName) => identityMap.channels?.[roomName]?.channel_id,
+    ),
+    manifest.buzz.officeRooms.map(
+      (roomName) => identityMap.channels?.[roomName]?.channel_id,
+    ),
+  ];
+  const expectedRoomIds = expectedChannelArrays.flat();
+  const actualRoomIds = channelArrays.flat();
+  if (
+    expectedRoomIds.some((id) => typeof id !== "string") ||
+    JSON.stringify(channelArrays) !== JSON.stringify(expectedChannelArrays)
+  ) {
+    errors.push(
+      "subscription projection must contain exactly the eight canonical rooms",
+    );
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    roomIds: actualRoomIds,
+  };
 }
 
 export function validateManifest(manifest, identityMap) {
@@ -327,12 +482,17 @@ export function validateManifest(manifest, identityMap) {
     errors.push("relay must remain loopback");
   if (
     JSON.stringify(manifest.buzz?.sharedRooms) !==
-    JSON.stringify(["ops", "concilium"])
+    JSON.stringify(REQUIRED_SHARED_ROOMS)
   ) {
     errors.push("shared rooms must be exactly ops and concilium");
   }
-  if ((manifest.buzz?.officeRooms ?? []).length !== 6) {
-    errors.push("all six configured Aspect offices are required");
+  if (
+    JSON.stringify(manifest.buzz?.officeRooms) !==
+    JSON.stringify(REQUIRED_OFFICE_ROOMS)
+  ) {
+    errors.push(
+      "office rooms must be exactly the six canonical Aspect offices",
+    );
   }
   const roomIds = exactRoomIds(manifest, identityMap);
   if (roomIds.some((roomId) => typeof roomId !== "string"))
@@ -640,6 +800,7 @@ export function renderWorker(
       ? manifest.runtime.supervisorWorkingDirectory
       : workspace,
     sessionCwd: workspace,
+    subscriptionRoomIds: exactRoomIds(manifest, identityMap),
     command: usesSafeSupervisor ? ENV_BINARY : manifest.runtime.buzzAcpBinary,
     args: usesSafeSupervisor
       ? [...scrubPrefix, manifest.runtime.buzzAcpBinary, ...buzzArgs]
