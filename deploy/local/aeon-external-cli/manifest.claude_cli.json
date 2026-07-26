@@ -28,6 +28,7 @@
     "buzzAcpSha256": "fd044bd1d4c66ef129c3fd7e8fdf4e0983f5184a9c60e60cb265db8a75440533",
     "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/claude-cli.toml",
     "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
+    "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk",
     "claudeAcp": {
       "package": "@agentclientprotocol/claude-agent-acp",
       "version": "0.62.0",

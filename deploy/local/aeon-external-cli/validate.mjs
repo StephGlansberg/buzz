@@ -127,6 +127,27 @@ if (runtimeCheck) {
     ) {
       throw new Error("shared buzz-acp does not advertise default managed publisher credential forwarding");
     }
+    const signerProbe = spawnSync(
+      manifest.runtime.buzzAcpBinary,
+      [
+        "--private-key-file",
+        artifact.signerFile,
+        "--expected-public-key",
+        artifact.expectedPublicKey,
+        "--heartbeat-interval",
+        "1",
+      ],
+      {
+        encoding: "utf8",
+        env: artifact.environment,
+      },
+    );
+    if (
+      signerProbe.status === 0 ||
+      !signerProbe.stderr.includes("heartbeat interval must be 0 (disabled)")
+    ) {
+      throw new Error(`shared buzz-acp signer validation failed: ${signerProbe.stderr.trim()}`);
+    }
     const packageRoot = dirname(dirname(adapterEntrypoint));
     const packageJson = loadJson(join(packageRoot, "package.json"));
     if (packageJson.name !== adapter.package || packageJson.version !== adapter.version) {
