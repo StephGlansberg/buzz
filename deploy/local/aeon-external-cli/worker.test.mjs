@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { dirname, join } from "node:path";
@@ -14,6 +15,7 @@ import {
   validateAmbientAnthropicCredentials,
   validateClaudeSubscriptionAuth,
   validateManifest,
+  validatePinnedNodeRuntime,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -27,6 +29,15 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
   assert.equal(result.ok, true);
   assert.equal(identityMap.members.codex_cli.gateway_agent_id, null);
   assert.equal(identityMap.members.codex_cli.aspect_slug, null);
+});
+
+test("both workers pin the same shared Data-volume buzz-acp release", () => {
+  const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
+  const sha256 = "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
+  assert.equal(manifest.runtime.buzzAcpBinary, binary);
+  assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
+  assert.equal(manifest.runtime.buzzAcpSha256, sha256);
+  assert.equal(claudeManifest.runtime.buzzAcpSha256, sha256);
 });
 
 test("claude_cli selector binds the established external claude_code identity", () => {
@@ -53,6 +64,7 @@ test("renderer exposes full Buzz CLI credentials only through managed spawn", ()
 
 test("renderer pins one full-access codex-acp subprocess", () => {
   const worker = renderWorker(manifest, identityMap);
+  assert.equal(worker.command, manifest.runtime.buzzAcpBinary);
   assert.equal(worker.environment.INITIAL_AGENT_MODE, "agent-full-access");
   assert.equal(worker.environment.CODEX_HOME, "/Users/architect/.codex");
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
@@ -70,7 +82,7 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
     "ANTHROPIC_AUTH_TOKEN",
     claudeManifest.runtime.buzzAcpBinary,
   ]);
-  assert.equal(worker.args.includes("--agent-publisher-credentials"), false);
+  assert.equal(worker.args.includes("--agent-publisher-credentials"), true);
   assert.equal(worker.args.includes("--no-agent-publisher-credentials"), false);
   assert.equal(
     worker.args[worker.args.indexOf("--agent-command") + 1],
@@ -88,6 +100,14 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   assert.equal(worker.environment.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(worker.environment.ANTHROPIC_API_KEY, undefined);
   assert.equal(worker.environment.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(
+    worker.environment.PATH.split(":")[0],
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/bin",
+  );
+  assert.equal(
+    worker.environment.PATH.includes("/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin"),
+    false,
+  );
 });
 
 test("Claude rendered command scrubs ambient API credentials from its child", () => {
@@ -122,9 +142,21 @@ test("renderer pins Architect, Nexus, and Mechanon inbound authority", () => {
 });
 
 test("workspace selection is bounded to the manifest allowlist", () => {
-  assert.equal(renderWorker(manifest, identityMap, "buzz").workingDirectory, "/Volumes/AEON/Projects/buzz");
+  const codexWorker = renderWorker(manifest, identityMap, "buzz");
+  assert.equal(codexWorker.workingDirectory, "/Volumes/AEON/Projects/buzz");
+  assert.equal(codexWorker.sessionCwd, "/Volumes/AEON/Projects/buzz");
+  assert.equal(codexWorker.args.includes("--session-cwd"), false);
   assert.throws(() => renderWorker(manifest, identityMap, "/tmp/escape"), /not allowed/);
-  assert.equal(renderWorker(claudeManifest, identityMap, "codex").workingDirectory, "/Volumes/AEON/Projects/codex");
+  const claudeWorker = renderWorker(claudeManifest, identityMap, "codex");
+  assert.equal(
+    claudeWorker.workingDirectory,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+  );
+  assert.equal(claudeWorker.sessionCwd, "/Volumes/AEON/Projects/codex");
+  assert.equal(
+    claudeWorker.args[claudeWorker.args.indexOf("--session-cwd") + 1],
+    "/Volumes/AEON/Projects/codex",
+  );
 });
 
 test("launchd artifact remains inert and secret-free", () => {
@@ -154,6 +186,8 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
     "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+    "/Volumes/AEON/Projects/aeon-v6",
   ]);
   assert.match(
     artifact.plist,
@@ -165,6 +199,11 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
     artifact.plist,
     /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/secrets\/claude-code\.sk/,
   );
+  assert.match(
+    artifact.plist,
+    /<key>WorkingDirectory<\/key><string>\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6<\/string>/,
+  );
+  assert.match(artifact.plist, /<string>--session-cwd<\/string>\s+<string>\/Volumes\/AEON\/Projects\/aeon-v6<\/string>/);
   assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/Projects\/buzz-data\/keys\/claude_code\.sk/);
 });
 
@@ -204,7 +243,7 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
 
   const volumeRuntime = structuredClone(claudeManifest);
   volumeRuntime.runtime.buzzAcpBinary = "/Volumes/AEON/runtime/buzz-acp";
-  assert.match(validateManifest(volumeRuntime, identityMap).errors.join("\n"), /launchd-safe Data-volume path/);
+  assert.match(validateManifest(volumeRuntime, identityMap).errors.join("\n"), /canonical Data-volume path/);
 
   const sharedHarnessDrift = structuredClone(claudeManifest);
   sharedHarnessDrift.runtime.buzzAcpSha256 = "0".repeat(64);
@@ -213,6 +252,28 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
   const signerDrift = structuredClone(claudeManifest);
   signerDrift.runtime.signerPath = identityMap.members.claude_code.secret_ref;
   assert.match(validateManifest(signerDrift, identityMap).errors.join("\n"), /launchd-safe Data-volume path/);
+
+  const nodeDrift = structuredClone(claudeManifest);
+  nodeDrift.runtime.node.sha256 = "0".repeat(64);
+  assert.match(validateManifest(nodeDrift, identityMap).errors.join("\n"), /Node runtime checkpoint drift/);
+
+  const nodePathFallback = structuredClone(claudeManifest);
+  nodePathFallback.runtime.path.reverse();
+  assert.match(validateManifest(nodePathFallback, identityMap).errors.join("\n"), /Node runtime first/);
+});
+
+test("Codex rejects shared harness path and digest drift without changing its cwd contract", () => {
+  const pathDrift = structuredClone(manifest);
+  pathDrift.runtime.buzzAcpBinary = "/Volumes/AEON/runtime/buzz-acp";
+  assert.match(validateManifest(pathDrift, identityMap).errors.join("\n"), /canonical Data-volume path/);
+
+  const digestDrift = structuredClone(manifest);
+  digestDrift.runtime.buzzAcpSha256 = "0".repeat(64);
+  assert.match(validateManifest(digestDrift, identityMap).errors.join("\n"), /shared buzz-acp checkpoint drift/);
+
+  const artifact = renderDisabledLaunchAgent(manifest, identityMap, "codex");
+  assert.equal(artifact.workingDirectory, "/Volumes/AEON/Projects/codex");
+  assert.equal(artifact.args.includes("--session-cwd"), false);
 });
 
 test("Claude package closure digest detects adapter and dependency changes", () => {
@@ -274,6 +335,48 @@ test("Claude runtime rejects ambient API credentials without exposing values", (
     "ANTHROPIC_AUTH_TOKEN must be absent for Claude subscription authentication",
   ]);
   assert.doesNotMatch(result.errors.join("\n"), /secret-/);
+});
+
+test("Claude Node validation rejects mode, symlink, hash, and version drift", () => {
+  const root = mkdtempSync(join(tmpdir(), "claude-node-runtime-"));
+  try {
+    const binary = join(root, "node");
+    writeFileSync(binary, "#!/bin/sh\nprintf 'v-test\\n'\n");
+    chmodSync(binary, 0o500);
+    const sha256 = createHash("sha256").update("#!/bin/sh\nprintf 'v-test\\n'\n").digest("hex");
+    const pin = { binary, mode: "0500", sha256, version: "v-test" };
+    assert.deepEqual(validatePinnedNodeRuntime(pin, process.env), { ok: true, errors: [] });
+
+    chmodSync(binary, 0o400);
+    const badMode = validatePinnedNodeRuntime(pin, process.env);
+    assert.equal(badMode.ok, false);
+    assert.match(badMode.errors.join("\n"), /mode must be 0500/);
+    chmodSync(binary, 0o500);
+
+    const marker = join(root, "executed");
+    chmodSync(binary, 0o700);
+    writeFileSync(binary, `#!/bin/sh\ntouch '${marker}'\nprintf 'v-test\\n'\n`);
+    chmodSync(binary, 0o500);
+    const badHash = validatePinnedNodeRuntime({ ...pin, sha256: "0".repeat(64) }, process.env);
+    assert.match(badHash.errors.join("\n"), /SHA-256/);
+    assert.equal(existsSync(marker), false);
+    chmodSync(binary, 0o700);
+    writeFileSync(binary, "#!/bin/sh\nprintf 'v-test\\n'\n");
+    chmodSync(binary, 0o500);
+    assert.match(
+      validatePinnedNodeRuntime({ ...pin, version: "v-wrong" }, process.env).errors.join("\n"),
+      /version/,
+    );
+
+    const link = join(root, "node-link");
+    symlinkSync(binary, link);
+    assert.match(
+      validatePinnedNodeRuntime({ ...pin, binary: link }, process.env).errors.join("\n"),
+      /non-symlink/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("verified receipt joins request, session, run, and signed reply", () => {

@@ -1526,6 +1526,11 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    let session_cwd = config
+        .session_cwd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("session cwd must be valid UTF-8 for the ACP protocol"))?
+        .to_owned();
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -1544,10 +1549,7 @@ async fn tokio_main() -> Result<()> {
             Some(include_str!("base_prompt.md"))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd: std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string(),
+        cwd: session_cwd,
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
@@ -4947,6 +4949,7 @@ mod build_mcp_servers_tests {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
+            session_cwd: std::path::PathBuf::from("."),
             agent_command: "goose".into(),
             agent_publisher_credentials: false,
             agent_args: vec!["acp".into()],
@@ -5111,6 +5114,7 @@ mod error_outcome_emission_tests {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
+            session_cwd: std::path::PathBuf::from("."),
             // `true` exits cleanly, so the async respawn fails fast and
             // harmlessly off the JoinSet — irrelevant to the synchronous
             // feed emission under test.

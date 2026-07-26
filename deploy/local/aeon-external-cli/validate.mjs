@@ -11,6 +11,7 @@ import {
   validateAmbientAnthropicCredentials,
   validateClaudeSubscriptionAuth,
   validateManifest,
+  validatePinnedNodeRuntime,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -61,38 +62,54 @@ if (artifact.args.includes("--no-agent-publisher-credentials")) {
   console.error(`external ${manifest.worker.principal} must receive its own managed Buzz credentials`);
   process.exit(1);
 }
-if (selector !== "claude_cli" && !artifact.args.includes("--agent-publisher-credentials")) {
+if (!artifact.args.includes("--agent-publisher-credentials")) {
   console.error(`external ${manifest.worker.principal} must explicitly opt into managed Buzz credentials`);
-  process.exit(1);
-}
-if (selector === "claude_cli" && artifact.args.includes("--agent-publisher-credentials")) {
-  console.error("Claude shared buzz-acp uses default publisher forwarding and rejects the positive flag");
   process.exit(1);
 }
 
 const runtimeCheck = process.argv.includes("--runtime");
 if (runtimeCheck) {
   const adapter = selector === "codex_cli" ? manifest.runtime.codexAcp : manifest.runtime.claudeAcp;
-  for (const binary of [manifest.runtime.buzzAcpBinary, adapter.binary]) {
-    fs.accessSync(binary, fs.constants.X_OK);
+  fs.accessSync(manifest.runtime.buzzAcpBinary, fs.constants.X_OK);
+  const buzzSha256 = createHash("sha256").update(fs.readFileSync(manifest.runtime.buzzAcpBinary)).digest("hex");
+  if (buzzSha256 !== manifest.runtime.buzzAcpSha256) {
+    throw new Error("shared buzz-acp SHA-256 does not match the manifest pin");
   }
+  const buzzHelp = spawnSync(manifest.runtime.buzzAcpBinary, ["--help"], {
+    encoding: "utf8",
+    env: artifact.environment,
+  });
+  if (
+    buzzHelp.status !== 0 ||
+    !buzzHelp.stdout.includes("--agent-publisher-credentials") ||
+    !buzzHelp.stdout.includes("--no-agent-publisher-credentials") ||
+    !buzzHelp.stdout.includes("--session-cwd")
+  ) {
+    throw new Error("shared buzz-acp does not advertise the required external worker contract");
+  }
+  fs.accessSync(adapter.binary, fs.constants.X_OK);
   for (const directory of artifact.requiredDirectories) {
     if (!fs.statSync(directory).isDirectory()) {
       throw new Error(`required runtime path is not a directory: ${directory}`);
     }
   }
-  const nodeBinary = manifest.runtime.path
-    .map((directory) => join(directory, "node"))
-    .find((candidate) => {
-      try {
-        fs.accessSync(candidate, fs.constants.X_OK);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-  if (!nodeBinary) {
-    throw new Error("rendered PATH does not contain an executable Node runtime");
+  if (selector === "claude_cli") {
+    const nodeValidation = validatePinnedNodeRuntime(manifest.runtime.node, artifact.environment);
+    if (!nodeValidation.ok) throw new Error(nodeValidation.errors.join("\n"));
+  } else {
+    const nodeBinary = manifest.runtime.path
+      .map((directory) => join(directory, "node"))
+      .find((candidate) => {
+        try {
+          fs.accessSync(candidate, fs.constants.X_OK);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    if (!nodeBinary) {
+      throw new Error("rendered PATH does not contain an executable Node runtime");
+    }
   }
   const adapterEntrypoint = fs.realpathSync(adapter.binary);
   const adapterSha256 = createHash("sha256").update(fs.readFileSync(adapterEntrypoint)).digest("hex");
@@ -112,21 +129,6 @@ if (runtimeCheck) {
       throw new Error(`codex-acp version does not match ${adapter.version}`);
     }
   } else {
-    const buzzSha256 = createHash("sha256").update(fs.readFileSync(manifest.runtime.buzzAcpBinary)).digest("hex");
-    if (buzzSha256 !== manifest.runtime.buzzAcpSha256) {
-      throw new Error("shared buzz-acp SHA-256 does not match the manifest pin");
-    }
-    const buzzHelp = spawnSync(manifest.runtime.buzzAcpBinary, ["--help"], {
-      encoding: "utf8",
-      env: artifact.environment,
-    });
-    if (
-      buzzHelp.status !== 0 ||
-      !buzzHelp.stdout.includes("--no-agent-publisher-credentials") ||
-      !buzzHelp.stdout.includes("instead of forwarding")
-    ) {
-      throw new Error("shared buzz-acp does not advertise default managed publisher credential forwarding");
-    }
     const signerProbe = spawnSync(
       manifest.runtime.buzzAcpBinary,
       [
@@ -208,7 +210,7 @@ const result = {
   enabled: false,
   principal: manifest.worker.principal,
   ...(selector !== manifest.worker.principal ? { worker: selector } : {}),
-  workspace: artifact.workingDirectory,
+  workspace: artifact.sessionCwd,
   ...(selector === "codex_cli"
     ? { agentMode: artifact.environment.INITIAL_AGENT_MODE }
     : { permissionMode: manifest.posture.permissionMode }),
