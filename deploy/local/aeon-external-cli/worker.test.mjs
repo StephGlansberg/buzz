@@ -12,6 +12,7 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url));
 const manifest = loadJson(join(here, "manifest.json"));
+const claudeManifest = loadJson(join(here, "manifest.claude_cli.json"));
 const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
 
 test("manifest binds external codex_cli identity without changing Aspect semantics", () => {
@@ -20,6 +21,15 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
   assert.equal(result.ok, true);
   assert.equal(identityMap.members.codex_cli.gateway_agent_id, null);
   assert.equal(identityMap.members.codex_cli.aspect_slug, null);
+});
+
+test("manifest binds a separate external claude_cli identity", () => {
+  const result = validateManifest(claudeManifest, identityMap);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+  assert.equal(identityMap.members.claude_cli.gateway_agent_id, null);
+  assert.equal(identityMap.members.claude_cli.aspect_slug, null);
+  assert.notEqual(identityMap.members.claude_cli.pubkey_hex, identityMap.members.codex_cli.pubkey_hex);
 });
 
 test("renderer exposes full Buzz CLI credentials only through managed spawn", () => {
@@ -42,25 +52,27 @@ test("renderer pins one full-access codex-acp subprocess", () => {
   assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], manifest.runtime.codexAcp.binary);
 });
 
+test("renderer pins one Claude ACP subprocess and installed Claude Code", () => {
+  const worker = renderWorker(claudeManifest, identityMap);
+  assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
+  assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
+  assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], claudeManifest.runtime.claudeAcp.binary);
+  assert.equal(worker.environment.CLAUDE_CODE_EXECUTABLE, "/Users/architect/.local/share/claude/versions/2.1.220");
+  assert.equal(worker.environment.CLAUDE_CONFIG_DIR, "/Users/architect/.claude");
+  assert.equal(worker.environment.ANTHROPIC_API_KEY, undefined);
+});
+
 test("renderer pins Architect, Nexus, and Mechanon inbound authority", () => {
   const worker = renderWorker(manifest, identityMap);
   const allowlist = worker.args[worker.args.indexOf("--respond-to-allowlist") + 1].split(",");
-  assert.deepEqual(allowlist, [
-    identityMap.members.nexus.pubkey_hex,
-    identityMap.members.mechanon.pubkey_hex,
-  ]);
-  assert.equal(
-    worker.args[worker.args.indexOf("--agent-owner") + 1],
-    identityMap.members.architect.pubkey_hex,
-  );
+  assert.deepEqual(allowlist, [identityMap.members.nexus.pubkey_hex, identityMap.members.mechanon.pubkey_hex]);
+  assert.equal(worker.args[worker.args.indexOf("--agent-owner") + 1], identityMap.members.architect.pubkey_hex);
 });
 
 test("workspace selection is bounded to the manifest allowlist", () => {
-  assert.equal(
-    renderWorker(manifest, identityMap, "buzz").workingDirectory,
-    "/Volumes/AEON/Projects/buzz",
-  );
+  assert.equal(renderWorker(manifest, identityMap, "buzz").workingDirectory, "/Volumes/AEON/Projects/buzz");
   assert.throws(() => renderWorker(manifest, identityMap, "/tmp/escape"), /not allowed/);
+  assert.equal(renderWorker(claudeManifest, identityMap, "codex").workingDirectory, "/Volumes/AEON/Projects/codex");
 });
 
 test("launchd artifact remains inert and secret-free", () => {
@@ -75,6 +87,36 @@ test("launchd artifact remains inert and secret-free", () => {
     "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/config",
     "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/logs",
   ]);
+});
+
+test("Claude launchd artifact is separate, inert, and secret-free", () => {
+  const artifact = renderDisabledLaunchAgent(claudeManifest, identityMap);
+  assert.equal(artifact.label, "org.aeon.buzz-acp.claude-cli");
+  assert.equal(artifact.runAtLoad, false);
+  assert.equal(artifact.keepAlive, false);
+  assert.match(artifact.plist, /CLAUDE_CODE_EXECUTABLE/);
+  assert.doesNotMatch(artifact.plist, /ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|nsec1/);
+  assert.deepEqual(artifact.requiredDirectories, [
+    "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/config",
+    "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/logs",
+  ]);
+});
+
+test("Claude authority contract rejects missing identity and mode drift", () => {
+  const missingIdentity = structuredClone(identityMap);
+  delete missingIdentity.members.claude_cli;
+  assert.match(
+    validateManifest(claudeManifest, missingIdentity).errors.join("\n"),
+    /identity map is missing claude_cli/,
+  );
+
+  const modeDrift = structuredClone(claudeManifest);
+  modeDrift.posture.permissionMode = "default";
+  assert.match(validateManifest(modeDrift, identityMap).errors.join("\n"), /must be bypass-permissions/);
+
+  const adapterDrift = structuredClone(claudeManifest);
+  adapterDrift.runtime.claudeAcp.integrity = "sha512-ZHJpZnQ=";
+  assert.match(validateManifest(adapterDrift, identityMap).errors.join("\n"), /package integrity drift/);
 });
 
 test("verified receipt joins request, session, run, and signed reply", () => {
