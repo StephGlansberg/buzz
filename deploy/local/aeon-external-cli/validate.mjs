@@ -29,7 +29,8 @@ if (!validation.ok) {
   process.exit(1);
 }
 
-const configText = fs.readFileSync(join(here, "config", `${manifest.worker.principal}.toml`), "utf8");
+const selector = manifest.worker.selector ?? manifest.worker.principal;
+const configText = fs.readFileSync(join(here, "config", `${selector}.toml`), "utf8");
 const expectedRooms = [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
   (roomName) => identityMap.channels[roomName].channel_id,
 );
@@ -60,7 +61,7 @@ if (!artifact.args.includes("--agent-publisher-credentials")) {
 
 const runtimeCheck = process.argv.includes("--runtime");
 if (runtimeCheck) {
-  const adapter = manifest.worker.principal === "codex_cli" ? manifest.runtime.codexAcp : manifest.runtime.claudeAcp;
+  const adapter = selector === "codex_cli" ? manifest.runtime.codexAcp : manifest.runtime.claudeAcp;
   for (const binary of [manifest.runtime.buzzAcpBinary, adapter.binary]) {
     fs.accessSync(binary, fs.constants.X_OK);
   }
@@ -87,7 +88,7 @@ if (runtimeCheck) {
   if (adapterSha256 !== adapter.entrypointSha256) {
     throw new Error(`${manifest.worker.principal} ACP entrypoint SHA-256 does not match the manifest pin`);
   }
-  if (manifest.worker.principal === "codex_cli") {
+  if (selector === "codex_cli") {
     fs.accessSync(manifest.runtime.codexHome, fs.constants.R_OK);
     const adapterVersion = spawnSync(adapter.binary, ["--version"], {
       encoding: "utf8",
@@ -146,8 +147,9 @@ const result = {
   ok: true,
   enabled: false,
   principal: manifest.worker.principal,
+  ...(selector !== manifest.worker.principal ? { worker: selector } : {}),
   workspace: artifact.workingDirectory,
-  ...(manifest.worker.principal === "codex_cli"
+  ...(selector === "codex_cli"
     ? { agentMode: artifact.environment.INITIAL_AGENT_MODE }
     : { permissionMode: manifest.posture.permissionMode }),
   runtimeCheck,

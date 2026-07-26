@@ -23,13 +23,15 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
   assert.equal(identityMap.members.codex_cli.aspect_slug, null);
 });
 
-test("manifest binds a separate external claude_cli identity", () => {
+test("claude_cli selector binds the established external claude_code identity", () => {
   const result = validateManifest(claudeManifest, identityMap);
   assert.deepEqual(result.errors, []);
   assert.equal(result.ok, true);
-  assert.equal(identityMap.members.claude_cli.gateway_agent_id, null);
-  assert.equal(identityMap.members.claude_cli.aspect_slug, null);
-  assert.notEqual(identityMap.members.claude_cli.pubkey_hex, identityMap.members.codex_cli.pubkey_hex);
+  assert.equal(claudeManifest.worker.selector, "claude_cli");
+  assert.equal(claudeManifest.worker.principal, "claude_code");
+  assert.equal(identityMap.members.claude_code.gateway_agent_id, null);
+  assert.equal(identityMap.members.claude_code.aspect_slug, null);
+  assert.notEqual(identityMap.members.claude_code.pubkey_hex, identityMap.members.codex_cli.pubkey_hex);
 });
 
 test("renderer exposes full Buzz CLI credentials only through managed spawn", () => {
@@ -57,6 +59,8 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], claudeManifest.runtime.claudeAcp.binary);
+  assert.equal(worker.signerFile, identityMap.members.claude_code.secret_ref);
+  assert.equal(worker.expectedPublicKey, identityMap.members.claude_code.pubkey_hex);
   assert.equal(worker.environment.CLAUDE_CODE_EXECUTABLE, "/Users/architect/.local/share/claude/versions/2.1.220");
   assert.equal(worker.environment.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(worker.environment.ANTHROPIC_API_KEY, undefined);
@@ -104,10 +108,17 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
 
 test("Claude authority contract rejects missing identity and mode drift", () => {
   const missingIdentity = structuredClone(identityMap);
-  delete missingIdentity.members.claude_cli;
+  delete missingIdentity.members.claude_code;
   assert.match(
     validateManifest(claudeManifest, missingIdentity).errors.join("\n"),
-    /identity map is missing claude_cli/,
+    /identity map is missing claude_code/,
+  );
+
+  const duplicateIdentity = structuredClone(claudeManifest);
+  duplicateIdentity.worker.principal = "claude_cli";
+  assert.match(
+    validateManifest(duplicateIdentity, identityMap).errors.join("\n"),
+    /must bind to claude_code/,
   );
 
   const modeDrift = structuredClone(claudeManifest);

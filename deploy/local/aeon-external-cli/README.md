@@ -1,11 +1,13 @@
 # AEON external CLI workers
 
 This package renders separate disabled-by-default `buzz-acp` workers for the
-external `codex_cli` and `claude_cli` principals. They are separate from each
-other and from the six internal Aspect workers. Buzz owns transport, presence,
-typing, queueing, thread context, signed replies, observer events, `!cancel`,
-`!rotate`, and the managed Buzz CLI publisher. Each ACP adapter owns coding
-tools in the selected workspace.
+external `codex_cli` and `claude_code` principals. The Claude deploy selector,
+launchd label, and runtime namespace remain `claude_cli`; its signed Buzz
+identity and Concilium seat remain the established `claude_code`. The workers
+are separate from each other and from the six internal Aspect workers. Buzz
+owns transport, presence, typing, queueing, thread context, signed replies,
+observer events, `!cancel`, `!rotate`, and the managed Buzz CLI publisher. Each
+ACP adapter owns coding tools in the selected workspace.
 
 Each worker accepts mentioned messages from Architect, Nexus, or Mechanon in
 `#ops`, `#concilium`, and the configured Aspect offices. It starts one pinned

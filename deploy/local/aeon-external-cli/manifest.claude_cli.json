@@ -3,8 +3,9 @@
   "enabled": false,
   "identityMap": "/Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json",
   "worker": {
-    "principal": "claude_cli",
-    "displayName": "Claude CLI",
+    "selector": "claude_cli",
+    "principal": "claude_code",
+    "displayName": "Claude Code",
     "label": "org.aeon.buzz-acp.claude-cli",
     "agents": 1
   },
