@@ -31,11 +31,10 @@
     "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk",
     "supervisorWorkingDirectory": "/Users/architect/Library/Application Support/AEON/aeon-v6",
     "node": {
-      "version": "v24.15.0",
-      "sha256": "3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32",
-      "mode": "0500",
-      "sourceBinary": "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin/node",
-      "binary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/node"
+      "version": "v24.1.0",
+      "sha256": "59450bb6448c8a40b3f3b86da45c3babb2e0503e04c47e5a715e8e137389878b",
+      "mode": "0755",
+      "binary": "/Users/architect/.nvm/versions/node/v24.1.0/bin/node"
     },
     "claudeAcp": {
       "package": "@agentclientprotocol/claude-agent-acp",
@@ -59,7 +58,7 @@
       }
     },
     "path": [
-      "/Users/architect/Library/Application Support/AEON/aeon-v6/bin",
+      "/Users/architect/.nvm/versions/node/v24.1.0/bin",
       "/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0/node_modules/.bin",
       "/usr/bin",
       "/bin",

@@ -19,11 +19,10 @@ const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Suppo
 const REQUIRED_SHARED_BUZZ_ACP_BINARY = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`;
 const REQUIRED_SHARED_BUZZ_ACP_SHA256 = "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
 const REQUIRED_CLAUDE_NODE = {
-  version: "v24.15.0",
-  sha256: "3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32",
-  mode: "0500",
-  sourceBinary: "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin/node",
-  binary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/node`,
+  version: "v24.1.0",
+  sha256: "59450bb6448c8a40b3f3b86da45c3babb2e0503e04c47e5a715e8e137389878b",
+  mode: "0755",
+  binary: "/Users/architect/.nvm/versions/node/v24.1.0/bin/node",
 };
 const REQUIRED_CLAUDE_AUTH = {
   mode: "existing-claude-subscription",
@@ -324,7 +323,7 @@ export function validateManifest(manifest, identityMap) {
     errors.push("PATH must include the pinned ACP adapter bin directory");
   }
   if (selector === "claude_cli" && runtime?.path?.[0] !== path.dirname(runtime?.node?.binary ?? "")) {
-    errors.push("Claude PATH must resolve the pinned Data-volume Node runtime first");
+    errors.push("Claude PATH must resolve the pinned trusted Node runtime first");
   }
 
   const workspaces = manifest.workspaces;

@@ -34,13 +34,14 @@ manifests pin the release at SHA-256
 The pinned harness supports
 `--session-cwd` and requires the explicit `--agent-publisher-credentials`
 grant, so the renderer cannot silently depend on legacy default forwarding.
-The LaunchAgent PATH resolves
-`/Users/architect/Library/Application Support/AEON/aeon-v6/bin/node` first.
-That runtime is an exact regular-file copy of the canonical service Node
-`v24.15.0`, pinned at SHA-256
-`3200fbd9f7fd4410426dd541e10d1ab829d3472f270d743c7fabd1696c03fe32`.
+The LaunchAgent PATH resolves the trusted
+`/Users/architect/.nvm/versions/node/v24.1.0/bin/node` first. That runtime is
+pinned at SHA-256
+`59450bb6448c8a40b3f3b86da45c3babb2e0503e04c47e5a715e8e137389878b`.
 Runtime validation rejects symlinks, non-regular files, non-executable or
-non-`0500` modes, hash drift, and version drift.
+non-`0755` modes, hash drift, and version drift. The service does not use the
+Data-volume Node copy, whose filesystem watcher cannot reliably watch the
+selected workspace on `/Volumes`.
 The Claude supervisor itself starts from the Data-volume runtime root, so
 launchd and Node never resolve the process cwd through `/Volumes`. The selected
 manifest workspace is passed separately as `--session-cwd`; `buzz-acp`
@@ -125,9 +126,6 @@ install -d -m 0755 \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/bin' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/logs'
-install -m 0500 \
-  /Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin/node \
-  '/Users/architect/Library/Application Support/AEON/aeon-v6/bin/node'
 install -m 0500 \
   target/release/buzz-acp \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp'
