@@ -1,10 +1,12 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadJson,
   renderDisabledLaunchAgent,
   validateManifest,
+  validateSubscriptionProjection,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +30,20 @@ const identityMap = loadJson(identityPath);
 const validation = validateManifest(manifest, identityMap);
 if (!validation.ok) {
   console.error(validation.errors.join("\n"));
+  process.exit(1);
+}
+const selector = manifest.worker.selector ?? manifest.worker.principal;
+const configText = fs.readFileSync(
+  join(here, "config", `${selector}.toml`),
+  "utf8",
+);
+const subscriptionValidation = validateSubscriptionProjection(
+  configText,
+  manifest,
+  identityMap,
+);
+if (!subscriptionValidation.ok) {
+  console.error(subscriptionValidation.errors.join("\n"));
   process.exit(1);
 }
 

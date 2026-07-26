@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -15,6 +16,7 @@ import test from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  REQUIRED_ROOM_NAMES,
   correlateVerifiedReceipt,
   hashCursorClosure,
   hashPackageClosure,
@@ -27,6 +29,7 @@ import {
   validateCursorSubscriptionAuth,
   validateManifest,
   validatePinnedNodeRuntime,
+  validateSubscriptionProjection,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -34,6 +37,10 @@ const manifest = loadJson(join(here, "manifest.json"));
 const claudeManifest = loadJson(join(here, "manifest.claude_cli.json"));
 const cursorManifest = loadJson(join(here, "manifest.cursor_cli.json"));
 const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
+const codexConfig = readFileSync(
+  join(here, "config", "codex_cli.toml"),
+  "utf8",
+);
 
 test("manifest binds external codex_cli identity without changing Aspect semantics", () => {
   const result = validateManifest(manifest, identityMap);
@@ -84,15 +91,221 @@ test("cursor_cli selector binds the established external Cursor identity", () =>
   );
 });
 
-test("renderer exposes full Buzz CLI credentials only through managed spawn", () => {
+test("Codex launch argv binds publisher credentials, identity, and all eight rooms", () => {
   const worker = renderWorker(manifest, identityMap);
   assert.equal(worker.args.includes("--no-agent-publisher-credentials"), false);
-  assert.equal(worker.args.includes("--agent-publisher-credentials"), true);
+  assert.equal(
+    worker.args.filter((arg) => arg === "--agent-publisher-credentials").length,
+    1,
+  );
   assert.equal(worker.args.includes("--private-key"), false);
   assert.equal(worker.args.includes("--private-key-file"), true);
   assert.equal(worker.args.includes("--relay-observer"), true);
+  assert.equal(
+    worker.args[worker.args.indexOf("--private-key-file") + 1],
+    identityMap.members.codex_cli.secret_ref,
+  );
+  assert.equal(
+    worker.args[worker.args.indexOf("--expected-public-key") + 1],
+    identityMap.members.codex_cli.pubkey_hex,
+  );
+  assert.equal(
+    worker.args[worker.args.indexOf("--subscribe") + 1],
+    manifest.posture.subscribe,
+  );
+  assert.equal(
+    worker.args[worker.args.indexOf("--config") + 1],
+    manifest.runtime.configPath,
+  );
+  assert.deepEqual(
+    worker.subscriptionRoomIds,
+    [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
+      (roomName) => identityMap.channels[roomName].channel_id,
+    ),
+  );
+  assert.equal(worker.subscriptionRoomIds.length, 8);
+  assert.equal(new Set(worker.subscriptionRoomIds).size, 8);
   assert.equal(worker.environment.BUZZ_PRIVATE_KEY, undefined);
   assert.equal(worker.environment.BUZZ_RELAY_URL, undefined);
+});
+
+test("subscription validator requires the exact source-projected room set", () => {
+  assert.deepEqual(
+    [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms],
+    REQUIRED_ROOM_NAMES,
+  );
+  const result = validateSubscriptionProjection(
+    codexConfig,
+    manifest,
+    identityMap,
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(
+    result.roomIds,
+    renderWorker(manifest, identityMap).subscriptionRoomIds,
+  );
+
+  const duplicateRoom = codexConfig.replace(
+    result.roomIds.at(-1),
+    result.roomIds[0],
+  );
+  assert.match(
+    validateSubscriptionProjection(
+      duplicateRoom,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /exactly the eight canonical rooms/,
+  );
+
+  const extraRoom = codexConfig.replace(
+    result.roomIds.at(-1),
+    "ffffffff-ffff-4fff-8fff-ffffffffffff",
+  );
+  assert.match(
+    validateSubscriptionProjection(
+      extraRoom,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /exactly the eight canonical rooms/,
+  );
+
+  const channelBlocks = [
+    ...codexConfig.matchAll(/^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/gm),
+  ].map((match) => match[0]);
+  const swappedArrays = codexConfig
+    .replace(channelBlocks[0], "__FIRST_CHANNEL_ARRAY__")
+    .replace(channelBlocks[1], channelBlocks[0])
+    .replace("__FIRST_CHANNEL_ARRAY__", channelBlocks[1]);
+  assert.match(
+    validateSubscriptionProjection(
+      swappedArrays,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /exactly the eight canonical rooms/,
+  );
+
+  const officeDrift = structuredClone(manifest);
+  officeDrift.buzz.officeRooms[5] = "ops";
+  assert.match(
+    validateManifest(officeDrift, identityMap).errors.join("\n"),
+    /six canonical Aspect offices/,
+  );
+
+  const extraRule = `${codexConfig}
+[[rules]]
+name = "unrestricted"
+kinds = [9]
+require_mention = false
+`;
+  assert.match(
+    validateSubscriptionProjection(
+      extraRule,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /exactly two rules/,
+  );
+
+  const misplacedMention = `require_mention = true
+${codexConfig.replace("require_mention = true", "")}`;
+  assert.match(
+    validateSubscriptionProjection(
+      misplacedMention,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /each subscription rule must require a mention/,
+  );
+
+  const firstChannels = codexConfig.match(
+    /^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/m,
+  )[0];
+  const misplacedTableFields = codexConfig
+    .replace(firstChannels, "")
+    .replace(
+      "require_mention = true",
+      `[other]\n${firstChannels}\nrequire_mention = true`,
+    );
+  assert.match(
+    validateSubscriptionProjection(
+      misplacedTableFields,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /each subscription rule must contain exactly one channel array/,
+  );
+
+  const commentedTableBoundary = codexConfig.replace(
+    "require_mention = true",
+    "[other] # valid trailing comment\nrequire_mention = true",
+  );
+  assert.match(
+    validateSubscriptionProjection(
+      commentedTableBoundary,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /each subscription rule must require a mention/,
+  );
+
+  const multilineBypass = codexConfig
+    .replace(firstChannels, `channels = "all"\nignored = """\n${firstChannels}`)
+    .replace("require_mention = true", 'require_mention = true\n"""');
+  assert.match(
+    validateSubscriptionProjection(
+      multilineBypass,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /must not contain multiline strings/,
+  );
+
+  const duplicateName = codexConfig.replace(
+    'name = "aeon-aspect-offices"',
+    'name = "aeon-shared-control"',
+  );
+  assert.match(
+    validateSubscriptionProjection(
+      duplicateName,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /canonical shared-control and Aspect-office rules/,
+  );
+
+  const malformedHeader = codexConfig.replace("[[rules]]", "[[rules]]garbage");
+  assert.match(
+    validateSubscriptionProjection(
+      malformedHeader,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /exactly two rules/,
+  );
+
+  const unknownPreamble = `unexpected = true\n${codexConfig}`;
+  assert.match(
+    validateSubscriptionProjection(
+      unknownPreamble,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /must not contain content outside the two canonical rules/,
+  );
+
+  const unknownTable = `${codexConfig}\n[unexpected]\nvalue = true\n`;
+  assert.match(
+    validateSubscriptionProjection(
+      unknownTable,
+      manifest,
+      identityMap,
+    ).errors.join("\n"),
+    /must not contain content outside the two canonical rules/,
+  );
 });
 
 test("renderer pins one full-access codex-acp subprocess", () => {
@@ -374,6 +587,77 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
     "/Users/architect/Library/Application Support/AEON/aeon-v6",
     "/Volumes/AEON/Projects/aeon-v6",
   ]);
+});
+
+test("Claude and Cursor/Grok launch projections retain their current behavior", () => {
+  const claude = renderWorker(claudeManifest, identityMap);
+  assert.deepEqual(
+    {
+      command: claude.command,
+      principal: claude.expectedPublicKey,
+      permissionMode: claude.args[claude.args.indexOf("--permission-mode") + 1],
+      publisherFlagCount: claude.args.filter(
+        (arg) => arg === "--agent-publisher-credentials",
+      ).length,
+      rooms: claude.subscriptionRoomIds,
+    },
+    {
+      command: "/usr/bin/env",
+      principal: identityMap.members.claude_code.pubkey_hex,
+      permissionMode: "bypass-permissions",
+      publisherFlagCount: 1,
+      rooms: renderWorker(manifest, identityMap).subscriptionRoomIds,
+    },
+  );
+
+  const cursor = renderWorker(cursorManifest, identityMap);
+  assert.deepEqual(
+    {
+      command: cursor.command,
+      principal: cursor.expectedPublicKey,
+      model: cursor.args[cursor.args.indexOf("--model") + 1],
+      permissionMode: cursor.args[cursor.args.indexOf("--permission-mode") + 1],
+      publisherFlagCount: cursor.args.filter(
+        (arg) => arg === "--agent-publisher-credentials",
+      ).length,
+      rooms: cursor.subscriptionRoomIds,
+    },
+    {
+      command: "/usr/bin/env",
+      principal: identityMap.members.cursor_cli.pubkey_hex,
+      model: "grok-4.5[effort=high,fast=true]",
+      permissionMode: "bypass-permissions",
+      publisherFlagCount: 1,
+      rooms: renderWorker(manifest, identityMap).subscriptionRoomIds,
+    },
+  );
+});
+
+test("Codex plist, validator summary, and validator log expose no secrets", () => {
+  const sentinelSecret = "nsec1-validator-secret-sentinel";
+  const artifact = renderDisabledLaunchAgent(manifest, identityMap);
+  const validation = spawnSync(
+    process.execPath,
+    [join(here, "validate.mjs"), "--worker", "codex_cli"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        BUZZ_PRIVATE_KEY: sentinelSecret,
+      },
+    },
+  );
+  assert.equal(validation.status, 0, validation.stderr);
+  const summary = JSON.parse(validation.stdout);
+  assert.equal(summary.principal, "codex_cli");
+  assert.equal(summary.agentMode, "agent-full-access");
+  assert.equal(summary.roomCount, 8);
+  assert.equal(summary.publisherCredentials, "managed");
+
+  for (const output of [artifact.plist, validation.stdout, validation.stderr]) {
+    assert.doesNotMatch(output, /BUZZ_PRIVATE_KEY|nsec1/);
+    assert.equal(output.includes(sentinelSecret), false);
+  }
 });
 
 test("Claude authority contract rejects missing identity and mode drift", () => {

@@ -15,6 +15,7 @@ import {
   validateCursorSubscriptionAuth,
   validateManifest,
   validatePinnedNodeRuntime,
+  validateSubscriptionProjection,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -49,20 +50,13 @@ const configText = fs.readFileSync(
   join(here, "config", `${selector}.toml`),
   "utf8",
 );
-const expectedRooms = [
-  ...manifest.buzz.sharedRooms,
-  ...manifest.buzz.officeRooms,
-].map((roomName) => identityMap.channels[roomName].channel_id);
-for (const roomId of expectedRooms) {
-  if (configText.split(roomId).length !== 2) {
-    console.error(
-      `subscription config must contain room exactly once: ${roomId}`,
-    );
-    process.exit(1);
-  }
-}
-if ((configText.match(/require_mention = true/g) ?? []).length !== 2) {
-  console.error("every external CLI subscription rule must require a mention");
+const subscriptionValidation = validateSubscriptionProjection(
+  configText,
+  manifest,
+  identityMap,
+);
+if (!subscriptionValidation.ok) {
+  console.error(subscriptionValidation.errors.join("\n"));
   process.exit(1);
 }
 
@@ -84,6 +78,21 @@ if (!artifact.args.includes("--agent-publisher-credentials")) {
   console.error(
     `external ${manifest.worker.principal} must explicitly opt into managed Buzz credentials`,
   );
+  process.exit(1);
+}
+if (
+  artifact.args.filter((arg) => arg === "--agent-publisher-credentials")
+    .length !== 1 ||
+  artifact.args[artifact.args.indexOf("--subscribe") + 1] !==
+    manifest.posture.subscribe ||
+  artifact.args[artifact.args.indexOf("--config") + 1] !==
+    manifest.runtime.configPath ||
+  artifact.args[artifact.args.indexOf("--expected-public-key") + 1] !==
+    identityMap.members[manifest.worker.principal].pubkey_hex ||
+  artifact.subscriptionRoomIds.join("\n") !==
+    subscriptionValidation.roomIds.join("\n")
+) {
+  console.error("rendered launch argv does not match the source projection");
   process.exit(1);
 }
 
@@ -374,6 +383,8 @@ const result = {
   ...(selector === "codex_cli"
     ? { agentMode: artifact.environment.INITIAL_AGENT_MODE }
     : { permissionMode: manifest.posture.permissionMode }),
+  roomCount: subscriptionValidation.roomIds.length,
+  publisherCredentials: "managed",
   ...(selector === "cursor_cli"
     ? {
         requestedModel: manifest.runtime.cursorAcp.model.requested,
