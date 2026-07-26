@@ -146,8 +146,8 @@ export function validateManifest(manifest, identityMap) {
     if (claudeCode?.binarySha256 !== REQUIRED_CLAUDE_CODE_SHA256) {
       errors.push("Claude Code binary checkpoint drift");
     }
-    if (!isAbsoluteSafePath(claudeCode?.configDir)) {
-      errors.push("Claude config directory must be an absolute safe path");
+    if (claudeCode?.configDir !== undefined) {
+      errors.push("Claude config directory override must be absent");
     }
     if (claudeCode?.auth !== "existing-claude-login") {
       errors.push("Claude auth must use the existing Claude login");
@@ -263,7 +263,6 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
         : {
             PATH: manifest.runtime.path.join(":"),
             CLAUDE_CODE_EXECUTABLE: manifest.runtime.claudeCode.binary,
-            CLAUDE_CONFIG_DIR: manifest.runtime.claudeCode.configDir,
           },
     signerFile: principal.secret_ref,
     expectedPublicKey: principal.pubkey_hex,

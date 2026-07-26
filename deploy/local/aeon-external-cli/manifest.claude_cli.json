@@ -37,7 +37,6 @@
       "version": "2.1.220",
       "binary": "/Users/architect/.local/share/claude/versions/2.1.220",
       "binarySha256": "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081",
-      "configDir": "/Users/architect/.claude",
       "auth": "existing-claude-login"
     },
     "path": [

@@ -22,9 +22,11 @@ The Claude worker starts the maintained
 Claude Agent SDK and the pinned installed Claude Code `2.1.220` executable.
 Buzz requests ACP `bypassPermissions` through its `bypass-permissions` mode;
 the adapter remains the owner of tool execution and permission enforcement.
-Authentication reuses the existing Claude login under `/Users/architect/.claude`;
-no API key or token is added to source, argv, or the plist. The adapter must not
-be launched with `--hide-claude-auth`, because that mode rejects Claude
+Authentication reuses the standard Claude user login without setting
+`CLAUDE_CONFIG_DIR`; relocating that directory would make Claude Code look for
+credentials below the override instead of the standard `~/.claude.json`. No
+API key or token is added to source, argv, or the plist. The adapter must not be
+launched with `--hide-claude-auth`, because that mode rejects Claude
 subscription authentication.
 
 The harness reads each principal's signer from its own `0600` non-symlink file,
