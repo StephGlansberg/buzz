@@ -4,12 +4,20 @@ import { fileURLToPath } from "node:url";
 import { loadJson, renderDisabledLaunchAgent, validateManifest } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const workspaceArg = process.argv.indexOf("--workspace");
-const workspace = workspaceArg >= 0 ? process.argv[workspaceArg + 1] : undefined;
-const identityArg = process.argv.indexOf("--identity-map");
-const identityPath =
-  identityArg >= 0 ? process.argv[identityArg + 1] : join(here, "fixtures", "identity-map.json");
-const manifest = loadJson(join(here, "manifest.json"));
+function option(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+const workspace = option("--workspace");
+const identityPath = option("--identity-map") ?? join(here, "fixtures", "identity-map.json");
+const worker = option("--worker") ?? "codex_cli";
+const manifestName = worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
+if (!["codex_cli", "claude_cli"].includes(worker)) {
+  console.error(`unsupported external CLI worker: ${worker}`);
+  process.exit(1);
+}
+const manifest = loadJson(join(here, manifestName));
 const identityMap = loadJson(identityPath);
 const validation = validateManifest(manifest, identityMap);
 if (!validation.ok) {

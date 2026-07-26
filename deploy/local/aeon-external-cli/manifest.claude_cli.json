@@ -1,0 +1,85 @@
+{
+  "schema": "aeon_buzz_external_cli_worker_v1",
+  "enabled": false,
+  "identityMap": "/Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json",
+  "worker": {
+    "principal": "claude_cli",
+    "displayName": "Claude CLI",
+    "label": "org.aeon.buzz-acp.claude-cli",
+    "agents": 1
+  },
+  "buzz": {
+    "relayUrl": "ws://localhost:3000",
+    "owner": "architect",
+    "allowedInbound": ["architect", "nexus", "mechanon"],
+    "sharedRooms": ["ops", "concilium"],
+    "officeRooms": [
+      "aspect_nexus",
+      "aspect_mechanon",
+      "aspect_fontis",
+      "aspect_sapientis",
+      "aspect_viatica",
+      "aspect_voxis"
+    ]
+  },
+  "runtime": {
+    "buzzAcpBinary": "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/bin/buzz-acp",
+    "configPath": "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/config/claude_cli.toml",
+    "claudeAcp": {
+      "package": "@agentclientprotocol/claude-agent-acp",
+      "version": "0.62.0",
+      "integrity": "sha512-8QRNmyk5Cfy4XVREeg5KCPoCDtmYS0xALY9WqI640PfopLMpeUzMByXbzLkBLbD819zB67DBhLG5ta98uOEPKg==",
+      "gitHead": "53a0c36ce3b0b76929d11d8b9565e319da745608",
+      "entrypointSha256": "260aac90bf75f197b93640087c1de66441761d43c2784efa035fdcee60b5dacd",
+      "binary": "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/claude-agent-acp/0.62.0/bin/claude-agent-acp"
+    },
+    "claudeCode": {
+      "version": "2.1.220",
+      "binary": "/Users/architect/.local/share/claude/versions/2.1.220",
+      "binarySha256": "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081",
+      "configDir": "/Users/architect/.claude",
+      "auth": "existing-claude-login"
+    },
+    "path": [
+      "/Volumes/AEON/runtime/buzz/external-cli/claude_cli/claude-agent-acp/0.62.0/bin",
+      "/Volumes/AEON/Projects/buzz/target/release",
+      "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin"
+    ]
+  },
+  "workspaces": {
+    "default": "aeon-v6",
+    "allowed": {
+      "aeon-v6": "/Volumes/AEON/Projects/aeon-v6",
+      "buzz": "/Volumes/AEON/Projects/buzz",
+      "codex": "/Volumes/AEON/Projects/codex"
+    }
+  },
+  "posture": {
+    "subscribe": "config",
+    "respondTo": "allowlist",
+    "allowedRespondTo": ["allowlist"],
+    "dedup": "queue",
+    "multipleEventHandling": "queue",
+    "presence": true,
+    "typing": true,
+    "memory": true,
+    "basePrompt": true,
+    "relayObserver": true,
+    "permissionMode": "bypass-permissions",
+    "heartbeatIntervalSecs": 0,
+    "turnLivenessSecs": 10,
+    "idleTimeoutSecs": 900,
+    "maxTurnDurationSecs": 7200,
+    "contextMessageLimit": 24,
+    "maxTurnsPerSession": 0
+  },
+  "supervisor": {
+    "runAtLoad": false,
+    "keepAlive": false,
+    "throttleSeconds": 10
+  }
+}
