@@ -15,6 +15,7 @@ const REQUIRED_CLAUDE_ACP_ENTRYPOINT_SHA256 = "260aac90bf75f197b93640087c1de6644
 const REQUIRED_CLAUDE_ACP_CLOSURE_SHA256 = "ba5650a750d25811f36f4e6e91ad079d700743ddfb4f52abb90d46c9e9d86002";
 const REQUIRED_CLAUDE_CODE_SHA256 = "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
 const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
+const REQUIRED_CLAUDE_BUZZ_ACP_SHA256 = "fd044bd1d4c66ef129c3fd7e8fdf4e0983f5184a9c60e60cb265db8a75440533";
 const REQUIRED_CLAUDE_AUTH = {
   mode: "existing-claude-subscription",
   authMethod: "claude.ai",
@@ -226,7 +227,7 @@ export function validateManifest(manifest, identityMap) {
   if (selector === "claude_cli") {
     const claudeCode = runtime?.claudeCode;
     const expectedPaths = {
-      buzzAcpBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp-claude-cli`,
+      buzzAcpBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`,
       configPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/claude-cli.toml`,
       logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
       adapterRoot: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/claude-acp/${REQUIRED_CLAUDE_ACP_VERSION}`,
@@ -241,6 +242,9 @@ export function validateManifest(manifest, identityMap) {
     };
     for (const [label, expected] of Object.entries(expectedPaths)) {
       if (actualPaths[label] !== expected) errors.push(`Claude ${label} must use the launchd-safe Data-volume path`);
+    }
+    if (runtime?.buzzAcpSha256 !== REQUIRED_CLAUDE_BUZZ_ACP_SHA256) {
+      errors.push("Claude shared buzz-acp checkpoint drift");
     }
     if (claudeCode?.version !== REQUIRED_CLAUDE_CODE_VERSION) {
       errors.push(`Claude Code must be pinned to ${REQUIRED_CLAUDE_CODE_VERSION}`);
@@ -321,7 +325,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     memberPubkey(identityMap, manifest.buzz.owner),
     "--agent-command",
     adapter.binary,
-    "--agent-publisher-credentials",
+    ...(selector === "claude_cli" ? [] : ["--agent-publisher-credentials"]),
     "--agents",
     "1",
     "--subscribe",

@@ -70,6 +70,8 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
     "ANTHROPIC_AUTH_TOKEN",
     claudeManifest.runtime.buzzAcpBinary,
   ]);
+  assert.equal(worker.args.includes("--agent-publisher-credentials"), false);
+  assert.equal(worker.args.includes("--no-agent-publisher-credentials"), false);
   assert.equal(
     worker.args[worker.args.indexOf("--agent-command") + 1],
     "/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0/node_modules/.bin/claude-agent-acp",
@@ -151,8 +153,9 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   ]);
   assert.match(
     artifact.plist,
-    /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/bin\/buzz-acp-claude-cli/,
+    /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/bin\/buzz-acp/,
   );
+  assert.doesNotMatch(artifact.plist, /buzz-acp-claude-cli/);
   assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/runtime\/buzz\/external-cli\/claude_cli/);
 });
 
@@ -193,6 +196,10 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
   const volumeRuntime = structuredClone(claudeManifest);
   volumeRuntime.runtime.buzzAcpBinary = "/Volumes/AEON/runtime/buzz-acp";
   assert.match(validateManifest(volumeRuntime, identityMap).errors.join("\n"), /launchd-safe Data-volume path/);
+
+  const sharedHarnessDrift = structuredClone(claudeManifest);
+  sharedHarnessDrift.runtime.buzzAcpSha256 = "0".repeat(64);
+  assert.match(validateManifest(sharedHarnessDrift, identityMap).errors.join("\n"), /shared buzz-acp checkpoint drift/);
 });
 
 test("Claude package closure digest detects adapter and dependency changes", () => {
