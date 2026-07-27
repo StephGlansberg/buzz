@@ -369,6 +369,12 @@ test("renderer pins one native Grok ACP subprocess with full coding authority", 
     `--agent-args=${grokManifest.runtime.grokAcp.args.join(",")}`,
   );
   assert.equal(worker.args.includes("--agent-args"), false);
+  // Regression: Grok model/reasoning stay inside the single packed --agent-args=
+  // token; buzz-acp must not see them as top-level flags (Cursor alone uses --model).
+  assert.equal(
+    worker.args.includes("--model") || worker.args.includes("--reasoning-effort"),
+    false,
+  );
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args.filter((arg) => arg === "--agent-publisher-credentials").length, 1);
   assert.equal(worker.expectedPublicKey, identityMap.members.grok_cli.pubkey_hex);
