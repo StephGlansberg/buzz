@@ -694,11 +694,9 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     memberPubkey(identityMap, manifest.buzz.owner),
     "--agent-command",
     adapter.binary,
-    ...(selector === "cursor_cli"
+    ...((adapter.args?.length ?? 0) > 0
       ? [`--agent-args=${adapter.args.join(",")}`]
-      : selector === "grok_cli"
-        ? ["--agent-args", adapter.args.join(",")]
-        : (adapter.args ?? []).flatMap((value) => ["--agent-args", value])),
+      : []),
     ...(usesSafeSupervisor ? ["--session-cwd", workspace] : []),
     ...(selector === "cursor_cli" ? ["--model", adapter.model.effective] : []),
     "--agent-publisher-credentials",

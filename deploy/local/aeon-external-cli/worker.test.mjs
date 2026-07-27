@@ -344,6 +344,20 @@ test("renderer pins one native Cursor ACP subprocess with truthful fast-only mod
   assert.equal(worker.expectedPublicKey, identityMap.members.cursor_cli.pubkey_hex);
 });
 
+test("Codex and Claude omit --agent-args when adapters have no child args", () => {
+  for (const worker of [
+    renderWorker(manifest, identityMap),
+    renderWorker(claudeManifest, identityMap),
+  ]) {
+    assert.equal(
+      worker.args.some(
+        (value) => value === "--agent-args" || value.startsWith("--agent-args="),
+      ),
+      false,
+    );
+  }
+});
+
 test("renderer pins one native Grok ACP subprocess with full coding authority", () => {
   const worker = renderWorker(grokManifest, identityMap);
   assert.equal(worker.command, "/usr/bin/env");
@@ -351,9 +365,10 @@ test("renderer pins one native Grok ACP subprocess with full coding authority", 
   assert.equal(worker.environment.HOME, "/Users/architect");
   assert.equal(worker.environment.PATH.startsWith("/Users/architect/.grok/bin:"), true);
   assert.equal(
-    worker.args[worker.args.indexOf("--agent-args") + 1],
-    grokManifest.runtime.grokAcp.args.join(","),
+    worker.args.find((value) => value.startsWith("--agent-args=")),
+    `--agent-args=${grokManifest.runtime.grokAcp.args.join(",")}`,
   );
+  assert.equal(worker.args.includes("--agent-args"), false);
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.args.filter((arg) => arg === "--agent-publisher-credentials").length, 1);
   assert.equal(worker.expectedPublicKey, identityMap.members.grok_cli.pubkey_hex);
@@ -509,7 +524,7 @@ test("Grok launchd artifact is separate, inert, and scrubs auth overrides", () =
   assert.doesNotMatch(artifact.plist, /<key>XAI_API_KEY|<key>GROK_AUTH|<key>GROK_HOME|nsec1/);
   assert.match(
     artifact.plist,
-    /<string>agent,--model,grok-4\.5,--reasoning-effort,high,--always-approve,stdio<\/string>/,
+    /<string>--agent-args=agent,--model,grok-4\.5,--reasoning-effort,high,--always-approve,stdio<\/string>/,
   );
 });
 
