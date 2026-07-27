@@ -618,10 +618,23 @@ impl AcpClient {
     /// Must be called exactly once, before any other ACP method.
     /// The caller may inspect `agentCapabilities` in the returned value.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
+        self.initialize_with_timeout(Self::REQUEST_TIMEOUT).await
+    }
+
+    /// Initialize with a caller-owned deadline.
+    ///
+    /// Supervisors use a longer bound for cold agent processes; probes retain
+    /// the normal request deadline through [`Self::initialize`].
+    pub async fn initialize_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
-        let result = self.send_request("initialize", params).await?;
+        let result = self
+            .send_request_with_timeout("initialize", params, timeout)
+            .await?;
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -1100,6 +1113,16 @@ impl AcpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, AcpError> {
+        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -1115,13 +1138,17 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
             Err(_) => return Err(AcpError::Timeout(timeout)),
         }
 
-        match tokio::time::timeout(timeout, self.read_until_response(id)).await {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AcpError::Timeout(timeout));
+        }
+        match tokio::time::timeout(remaining, self.read_until_response(id)).await {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
         }
