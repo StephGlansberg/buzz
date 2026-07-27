@@ -749,7 +749,9 @@ export function renderWorker(
     memberPubkey(identityMap, manifest.buzz.owner),
     "--agent-command",
     adapter.binary,
-    ...(adapter.args ?? []).flatMap((value) => ["--agent-args", value]),
+    ...((adapter.args?.length ?? 0) > 0
+      ? [`--agent-args=${adapter.args.join(",")}`]
+      : []),
     ...(usesSafeSupervisor ? ["--session-cwd", workspace] : []),
     ...(selector === "cursor_cli" ? ["--model", adapter.model.effective] : []),
     "--agent-publisher-credentials",

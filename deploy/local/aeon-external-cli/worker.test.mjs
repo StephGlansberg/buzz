@@ -392,12 +392,11 @@ test("renderer pins one native Cursor ACP subprocess with truthful fast-only mod
     worker.args[worker.args.indexOf("--agent-command") + 1],
     adapter.binary,
   );
-  assert.deepEqual(
-    worker.args.flatMap((value, index) =>
-      value === "--agent-args" ? [worker.args[index + 1]] : [],
-    ),
-    ["--trust", "acp"],
+  assert.equal(
+    worker.args.find((value) => value.startsWith("--agent-args=")),
+    "--agent-args=--trust,acp",
   );
+  assert.equal(worker.args.includes("--agent-args"), false);
   assert.equal(
     worker.args[worker.args.indexOf("--model") + 1],
     adapter.model.effective,
