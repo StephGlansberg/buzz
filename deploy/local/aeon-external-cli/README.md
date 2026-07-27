@@ -1,7 +1,7 @@
 # AEON external CLI workers
 
 This package renders separate disabled-by-default `buzz-acp` workers for the
-external `codex_cli`, `claude_code`, and `cursor_cli` principals. The Claude
+external `codex_cli`, `claude_code`, `cursor_cli`, and `grok_cli` principals. The Claude
 deploy selector, launchd label, and runtime namespace remain `claude_cli`; its
 signed Buzz identity and Concilium seat remain the established `claude_code`.
 The workers are separate from each other and from the six internal Aspect workers. Buzz
@@ -74,6 +74,14 @@ installed Cursor version, excluding only its transient `.running` PID markers.
 Runtime validation requires the existing authenticated Pro subscription and
 scrubs `CURSOR_API_KEY` and `CURSOR_API_ENDPOINT` at the process boundary.
 
+The Grok worker uses the official Grok Build `0.2.93` native ACP server through
+`grok agent stdio`, pinned to build `f00f96316d4b`, `grok-4.5`, high reasoning,
+and the existing grok.com login. It shares Cursor's Data-volume supervisor and
+workspace separation while retaining its own signer and signed Buzz identity.
+Runtime validation pins the resolved binary digest, existing login, model
+catalog, reasoning metadata, and `0600` auth file. API-key, auth-path, proxy,
+OIDC, and alternate-home overrides are removed at the process boundary.
+
 Cursor model selection has one explicit upstream limitation in this release.
 The ordinary CLI accepts `--model cursor-grok-4.5-high`, but native
 `cursor-agent acp` advertises only
@@ -106,6 +114,7 @@ Validate and render without changing live state:
 node deploy/local/aeon-external-cli/validate.mjs
 node deploy/local/aeon-external-cli/validate.mjs --worker claude_cli
 node deploy/local/aeon-external-cli/validate.mjs --worker cursor_cli
+node deploy/local/aeon-external-cli/validate.mjs --worker grok_cli
 node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
@@ -120,6 +129,11 @@ node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   > /tmp/org.aeon.buzz-acp.cursor-cli.plist
+node deploy/local/aeon-external-cli/render-launchagent.mjs \
+  --worker grok_cli \
+  --workspace aeon-v6 \
+  --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
+  > /tmp/org.aeon.buzz-acp.grok-cli.plist
 ```
 
 Install the pinned adapter into the exact manifest path:
@@ -173,6 +187,12 @@ install -m 0444 \
 install -m 0600 \
   /Volumes/AEON/Projects/buzz-data/keys/cursor_cli.sk \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/cursor-cli.sk'
+install -m 0444 \
+  deploy/local/aeon-external-cli/config/grok_cli.toml \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/grok-cli.toml'
+install -m 0600 \
+  /Volumes/AEON/Projects/buzz-data/keys/grok_cli.sk \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/grok-cli.sk'
 node deploy/local/aeon-external-cli/validate.mjs \
   /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   --runtime
@@ -183,6 +203,10 @@ node deploy/local/aeon-external-cli/validate.mjs \
 node deploy/local/aeon-external-cli/validate.mjs \
   /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   --worker cursor_cli \
+  --runtime
+node deploy/local/aeon-external-cli/validate.mjs \
+  /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
+  --worker grok_cli \
   --runtime
 ```
 
@@ -206,4 +230,6 @@ node deploy/local/aeon-external-cli/render-launchagent.mjs --worker claude_cli -
 node deploy/local/aeon-external-cli/render-launchagent.mjs --worker claude_cli --workspace codex
 node deploy/local/aeon-external-cli/render-launchagent.mjs --worker cursor_cli --workspace buzz
 node deploy/local/aeon-external-cli/render-launchagent.mjs --worker cursor_cli --workspace codex
+node deploy/local/aeon-external-cli/render-launchagent.mjs --worker grok_cli --workspace buzz
+node deploy/local/aeon-external-cli/render-launchagent.mjs --worker grok_cli --workspace codex
 ```

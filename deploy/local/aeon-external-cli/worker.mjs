@@ -19,8 +19,7 @@ const REQUIRED_CLAUDE_ACP_CLOSURE_SHA256 =
   "ba5650a750d25811f36f4e6e91ad079d700743ddfb4f52abb90d46c9e9d86002";
 const REQUIRED_CLAUDE_CODE_SHA256 =
   "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
-const REQUIRED_CLAUDE_RUNTIME_ROOT =
-  "/Users/architect/Library/Application Support/AEON/aeon-v6";
+const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
 const REQUIRED_SHARED_BUZZ_ACP_BINARY = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`;
 const REQUIRED_SHARED_BUZZ_ACP_SHA256 =
   "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
@@ -47,20 +46,15 @@ const REQUIRED_OFFICE_ROOMS = [
   "aspect_viatica",
   "aspect_voxis",
 ];
-export const REQUIRED_ROOM_NAMES = [
-  ...REQUIRED_SHARED_ROOMS,
-  ...REQUIRED_OFFICE_ROOMS,
-];
+export const REQUIRED_ROOM_NAMES = [...REQUIRED_SHARED_ROOMS, ...REQUIRED_OFFICE_ROOMS];
 const REQUIRED_CURSOR_ROOT = `/Users/architect/.local/share/cursor-agent/versions/${REQUIRED_CURSOR_CLI_VERSION}`;
 const REQUIRED_CURSOR_CLI = {
   package: "cursor-agent",
   version: REQUIRED_CURSOR_CLI_VERSION,
   binary: "/Users/architect/.local/bin/cursor-agent",
   root: REQUIRED_CURSOR_ROOT,
-  entrypointSha256:
-    "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831",
-  closureSha256:
-    "9d122b76c57011bda873b34eb23e5c891a0c8b6d273dcacc1fdf9b429fe726be",
+  entrypointSha256: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831",
+  closureSha256: "400227a16df5e9f7bb4273f176cf68e41ef499f06fac5e6c9c6c3556ab2cc726",
   args: ["--trust", "acp"],
   auth: {
     mode: "existing-cursor-subscription",
@@ -73,6 +67,37 @@ const REQUIRED_CURSOR_CLI = {
     selectionStatus: "blocked_by_cursor_acp_catalog",
   },
 };
+const REQUIRED_GROK_CLI = {
+  package: "grok-build",
+  version: "0.2.93",
+  build: "f00f96316d4b",
+  binary: "/Users/architect/.grok/bin/grok",
+  realBinary: "/Users/architect/.grok/downloads/grok-0.2.93-macos-aarch64",
+  entrypointSha256: "2a97ba675bd992aa9b981e2e83776460d94f469b510c0b8efe28b50d236d767c",
+  args: ["agent", "--model", "grok-4.5", "--reasoning-effort", "high", "--always-approve", "stdio"],
+  auth: {
+    mode: "existing-grok-login",
+    provider: "grok.com",
+    authFile: "/Users/architect/.grok/auth.json",
+  },
+  model: {
+    requested: "grok-4.5-high",
+    effective: "grok-4.5",
+    reasoningEffort: "high",
+  },
+};
+const GROK_OVERRIDE_ENV = [
+  "XAI_API_KEY",
+  "GROK_CODE_XAI_API_KEY",
+  "GROK_AUTH",
+  "GROK_AUTH_PATH",
+  "GROK_HOME",
+  "GROK_AUTH_PROVIDER_COMMAND",
+  "GROK_OIDC_ISSUER",
+  "GROK_OIDC_CLIENT_ID",
+  "GROK_CLI_CHAT_PROXY_BASE_URL",
+  "XAI_API_BASE_URL",
+];
 const ENV_BINARY = "/usr/bin/env";
 const WORKER_CONTRACTS = {
   codex_cli: {
@@ -97,6 +122,14 @@ const WORKER_CONTRACTS = {
     label: "org.aeon.buzz-acp.cursor-cli",
     native: true,
   },
+  grok_cli: {
+    principal: "grok_cli",
+    adapterKey: "grokAcp",
+    adapterPackage: "grok-build",
+    adapterVersion: REQUIRED_GROK_CLI.version,
+    label: "org.aeon.buzz-acp.grok-cli",
+    native: true,
+  },
 };
 
 export function loadJson(filePath) {
@@ -104,16 +137,11 @@ export function loadJson(filePath) {
 }
 
 function isAbsoluteSafePath(value) {
-  return (
-    typeof value === "string" &&
-    path.isAbsolute(value) &&
-    !/[\0\r\n,]/.test(value)
-  );
+  return typeof value === "string" && path.isAbsolute(value) && !/[\0\r\n,]/.test(value);
 }
 
 export function hashPackageClosure(root, ignoredTopLevel = []) {
-  if (!isAbsoluteSafePath(root))
-    throw new Error("package root must be an absolute safe path");
+  if (!isAbsoluteSafePath(root)) throw new Error("package root must be an absolute safe path");
   const hash = createHash("sha256");
   const entries = [];
 
@@ -121,9 +149,7 @@ export function hashPackageClosure(root, ignoredTopLevel = []) {
     for (const name of fs.readdirSync(directory).sort()) {
       if (!relativeDirectory && ignoredTopLevel.includes(name)) continue;
       const absolutePath = path.join(directory, name);
-      const relativePath = relativeDirectory
-        ? `${relativeDirectory}/${name}`
-        : name;
+      const relativePath = relativeDirectory ? `${relativeDirectory}/${name}` : name;
       const stat = fs.lstatSync(absolutePath);
       if (stat.isDirectory()) {
         visit(absolutePath, relativePath);
@@ -169,21 +195,17 @@ export function hashCursorClosure(root) {
 
 export function validateAmbientAnthropicCredentials(environment) {
   const present = ANTHROPIC_CREDENTIAL_ENV.filter(
-    (name) =>
-      typeof environment?.[name] === "string" && environment[name].length > 0,
+    (name) => typeof environment?.[name] === "string" && environment[name].length > 0,
   );
   return {
     ok: present.length === 0,
-    errors: present.map(
-      (name) => `${name} must be absent for Claude subscription authentication`,
-    ),
+    errors: present.map((name) => `${name} must be absent for Claude subscription authentication`),
   };
 }
 
 export function validateClaudeSubscriptionAuth(status, contract) {
   const errors = [];
-  if (status?.loggedIn !== true)
-    errors.push("Claude Code existing login is unavailable");
+  if (status?.loggedIn !== true) errors.push("Claude Code existing login is unavailable");
   if (status?.authMethod !== contract?.authMethod) {
     errors.push(`Claude Code auth method must be ${contract?.authMethod}`);
   }
@@ -213,14 +235,21 @@ export function validateCursorSubscriptionAuth(status, about, contract) {
 
 export function validateAmbientCursorOverrides(environment) {
   const present = CURSOR_OVERRIDE_ENV.filter(
-    (name) =>
-      typeof environment?.[name] === "string" && environment[name].length > 0,
+    (name) => typeof environment?.[name] === "string" && environment[name].length > 0,
   );
   return {
     ok: present.length === 0,
-    errors: present.map(
-      (name) => `${name} must be absent for Cursor subscription authentication`,
-    ),
+    errors: present.map((name) => `${name} must be absent for Cursor subscription authentication`),
+  };
+}
+
+export function validateAmbientGrokOverrides(environment) {
+  const present = GROK_OVERRIDE_ENV.filter(
+    (name) => typeof environment?.[name] === "string" && environment[name].length > 0,
+  );
+  return {
+    ok: present.length === 0,
+    errors: present.map((name) => `${name} must be absent for Grok subscription authentication`),
   };
 }
 
@@ -248,9 +277,7 @@ export function validatePinnedNodeRuntime(node, environment) {
   } catch {
     return { ok: false, errors: ["pinned Node runtime must be executable"] };
   }
-  const sha256 = createHash("sha256")
-    .update(fs.readFileSync(node.binary))
-    .digest("hex");
+  const sha256 = createHash("sha256").update(fs.readFileSync(node.binary)).digest("hex");
   if (sha256 !== node.sha256) {
     return {
       ok: false,
@@ -284,27 +311,19 @@ export function exactRoomIds(manifest, identityMap) {
   );
 }
 
-export function validateSubscriptionProjection(
-  configText,
-  manifest,
-  identityMap,
-) {
+export function validateSubscriptionProjection(configText, manifest, identityMap) {
   const errors = [];
   const channelArrays = [];
   const ruleNames = [];
   const channelArrayPattern = /^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/gm;
   const tableHeaderPattern = /^\s*\[[^\r\n]*$/gm;
   const tableHeaders = [...configText.matchAll(tableHeaderPattern)];
-  const preamble = configText.slice(
-    0,
-    tableHeaders[0]?.index ?? configText.length,
-  );
+  const preamble = configText.slice(0, tableHeaders[0]?.index ?? configText.length);
   const preambleLines = preamble
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"));
-  const validRuleHeader = (header) =>
-    /^\s*\[\[rules\]\]\s*(?:#.*)?$/.test(header[0]);
+  const validRuleHeader = (header) => /^\s*\[\[rules\]\]\s*(?:#.*)?$/.test(header[0]);
   const ruleSections = tableHeaders.flatMap((header, index) => {
     if (!validRuleHeader(header)) return [];
     const bodyStart = header.index + header[0].length;
@@ -320,9 +339,7 @@ export function validateSubscriptionProjection(
     tableHeaders.length !== 2 ||
     tableHeaders.some((header) => !validRuleHeader(header))
   ) {
-    errors.push(
-      "subscription projection must not contain content outside the two canonical rules",
-    );
+    errors.push("subscription projection must not contain content outside the two canonical rules");
   }
   if (ruleSections.length !== 2) {
     errors.push("subscription projection must contain exactly two rules");
@@ -331,30 +348,21 @@ export function validateSubscriptionProjection(
   for (const rule of ruleSections) {
     const channelMatches = [...rule.matchAll(channelArrayPattern)];
     if (channelMatches.length !== 1) {
-      errors.push(
-        "each subscription rule must contain exactly one channel array",
-      );
+      errors.push("each subscription rule must contain exactly one channel array");
       continue;
     }
     try {
       const channels = JSON.parse(channelMatches[0][1].replace(/,\s*\]$/, "]"));
-      if (
-        !Array.isArray(channels) ||
-        !channels.every((id) => typeof id === "string")
-      ) {
+      if (!Array.isArray(channels) || !channels.every((id) => typeof id === "string")) {
         errors.push("subscription channels must be string arrays");
       } else {
         channelArrays.push(channels);
       }
     } catch {
-      errors.push(
-        "subscription channels must use deterministic string-array syntax",
-      );
+      errors.push("subscription channels must use deterministic string-array syntax");
     }
 
-    const mentionMatches = [
-      ...rule.matchAll(/^\s*require_mention\s*=\s*(true|false)\s*$/gm),
-    ];
+    const mentionMatches = [...rule.matchAll(/^\s*require_mention\s*=\s*(true|false)\s*$/gm)];
     if (mentionMatches.length !== 1 || mentionMatches[0][1] !== "true") {
       errors.push("each subscription rule must require a mention");
     }
@@ -373,12 +381,7 @@ export function validateSubscriptionProjection(
     const mentionCount = remainingLines.filter((line) =>
       /^require_mention\s*=\s*true$/.test(line),
     ).length;
-    if (
-      nameCount !== 1 ||
-      kindsCount !== 1 ||
-      mentionCount !== 1 ||
-      remainingLines.length !== 3
-    ) {
+    if (nameCount !== 1 || kindsCount !== 1 || mentionCount !== 1 || remainingLines.length !== 3) {
       errors.push(
         "each subscription rule must use the deterministic name, channels, kinds, and mention schema",
       );
@@ -392,21 +395,14 @@ export function validateSubscriptionProjection(
   }
 
   if (
-    JSON.stringify(ruleNames) !==
-    JSON.stringify(["aeon-shared-control", "aeon-aspect-offices"])
+    JSON.stringify(ruleNames) !== JSON.stringify(["aeon-shared-control", "aeon-aspect-offices"])
   ) {
-    errors.push(
-      "subscription rules must be the canonical shared-control and Aspect-office rules",
-    );
+    errors.push("subscription rules must be the canonical shared-control and Aspect-office rules");
   }
 
   const expectedChannelArrays = [
-    manifest.buzz.sharedRooms.map(
-      (roomName) => identityMap.channels?.[roomName]?.channel_id,
-    ),
-    manifest.buzz.officeRooms.map(
-      (roomName) => identityMap.channels?.[roomName]?.channel_id,
-    ),
+    manifest.buzz.sharedRooms.map((roomName) => identityMap.channels?.[roomName]?.channel_id),
+    manifest.buzz.officeRooms.map((roomName) => identityMap.channels?.[roomName]?.channel_id),
   ];
   const expectedRoomIds = expectedChannelArrays.flat();
   const actualRoomIds = channelArrays.flat();
@@ -414,9 +410,7 @@ export function validateSubscriptionProjection(
     expectedRoomIds.some((id) => typeof id !== "string") ||
     JSON.stringify(channelArrays) !== JSON.stringify(expectedChannelArrays)
   ) {
-    errors.push(
-      "subscription projection must contain exactly the eight canonical rooms",
-    );
+    errors.push("subscription projection must contain exactly the eight canonical rooms");
   }
 
   return {
@@ -436,17 +430,15 @@ export function validateManifest(manifest, identityMap) {
   if (manifest.schema !== "aeon_buzz_external_cli_worker_v1") {
     errors.push("unsupported external CLI worker schema");
   }
-  if (manifest.enabled !== false)
-    errors.push("external CLI worker must be disabled by default");
-  if (!contract)
-    errors.push("worker selector must be codex_cli, claude_cli, or cursor_cli");
+  if (manifest.enabled !== false) errors.push("external CLI worker must be disabled by default");
+  if (!contract) {
+    errors.push("worker selector must be codex_cli, claude_cli, cursor_cli, or grok_cli");
+  }
   if (contract && principal !== contract.principal) {
     errors.push(`${selector} worker must bind to ${contract.principal}`);
   }
-  if (manifest.worker?.agents !== 1)
-    errors.push("exactly one ACP subprocess is required");
-  if (!SAFE_LABEL.test(manifest.worker?.label ?? ""))
-    errors.push("invalid launchd label");
+  if (manifest.worker?.agents !== 1) errors.push("exactly one ACP subprocess is required");
+  if (!SAFE_LABEL.test(manifest.worker?.label ?? "")) errors.push("invalid launchd label");
   if (contract && manifest.worker?.label !== contract.label) {
     errors.push(`${principal} launchd label drift`);
   }
@@ -454,8 +446,7 @@ export function validateManifest(manifest, identityMap) {
   if (member?.gateway_agent_id !== null || member?.aspect_slug !== null) {
     errors.push(`${principal} must remain an external non-Aspect principal`);
   }
-  if (member?.concilium_seat !== principal)
-    errors.push(`${principal} Concilium seat drift`);
+  if (member?.concilium_seat !== principal) errors.push(`${principal} Concilium seat drift`);
   if (!HEX_64.test(member?.pubkey_hex ?? ""))
     errors.push(`${principal} pubkey must be 64 lowercase hex`);
   if (!isAbsoluteSafePath(member?.secret_ref)) {
@@ -463,49 +454,32 @@ export function validateManifest(manifest, identityMap) {
   }
 
   const inbound = manifest.buzz?.allowedInbound ?? [];
-  if (
-    JSON.stringify(inbound) !==
-    JSON.stringify(["architect", "nexus", "mechanon"])
-  ) {
-    errors.push(
-      "inbound allowlist must be exactly Architect, Nexus, and Mechanon",
-    );
+  if (JSON.stringify(inbound) !== JSON.stringify(["architect", "nexus", "mechanon"])) {
+    errors.push("inbound allowlist must be exactly Architect, Nexus, and Mechanon");
   }
   for (const memberId of inbound) {
     if (!HEX_64.test(memberPubkey(identityMap, memberId) ?? "")) {
       errors.push(`${memberId}: inbound identity is missing a valid pubkey`);
     }
   }
-  if (manifest.buzz?.owner !== "architect")
-    errors.push("Architect must own the worker");
-  if (manifest.buzz?.relayUrl !== "ws://localhost:3000")
-    errors.push("relay must remain loopback");
-  if (
-    JSON.stringify(manifest.buzz?.sharedRooms) !==
-    JSON.stringify(REQUIRED_SHARED_ROOMS)
-  ) {
+  if (manifest.buzz?.owner !== "architect") errors.push("Architect must own the worker");
+  if (manifest.buzz?.relayUrl !== "ws://localhost:3000") errors.push("relay must remain loopback");
+  if (JSON.stringify(manifest.buzz?.sharedRooms) !== JSON.stringify(REQUIRED_SHARED_ROOMS)) {
     errors.push("shared rooms must be exactly ops and concilium");
   }
-  if (
-    JSON.stringify(manifest.buzz?.officeRooms) !==
-    JSON.stringify(REQUIRED_OFFICE_ROOMS)
-  ) {
-    errors.push(
-      "office rooms must be exactly the six canonical Aspect offices",
-    );
+  if (JSON.stringify(manifest.buzz?.officeRooms) !== JSON.stringify(REQUIRED_OFFICE_ROOMS)) {
+    errors.push("office rooms must be exactly the six canonical Aspect offices");
   }
   const roomIds = exactRoomIds(manifest, identityMap);
   if (roomIds.some((roomId) => typeof roomId !== "string"))
     errors.push("configured room is absent from identity map");
-  if (new Set(roomIds).size !== roomIds.length)
-    errors.push("configured rooms must be unique");
+  if (new Set(roomIds).size !== roomIds.length) errors.push("configured rooms must be unique");
   for (const roomName of [
     ...(manifest.buzz?.sharedRooms ?? []),
     ...(manifest.buzz?.officeRooms ?? []),
   ]) {
     const members = identityMap.channels?.[roomName]?.members ?? [];
-    if (!members.includes(principal))
-      errors.push(`${roomName}: ${principal} is not a member`);
+    if (!members.includes(principal)) errors.push(`${roomName}: ${principal} is not a member`);
   }
 
   const runtime = manifest.runtime;
@@ -514,14 +488,9 @@ export function validateManifest(manifest, identityMap) {
     errors.push(`${principal} ACP package owner drift`);
   }
   if (contract && adapter?.version !== contract.adapterVersion) {
-    errors.push(
-      `${principal} ACP adapter must be pinned to ${contract.adapterVersion}`,
-    );
+    errors.push(`${principal} ACP adapter must be pinned to ${contract.adapterVersion}`);
   }
-  if (
-    !contract?.native &&
-    !/^sha512-[A-Za-z0-9+/]+=*$/.test(adapter?.integrity ?? "")
-  ) {
+  if (!contract?.native && !/^sha512-[A-Za-z0-9+/]+=*$/.test(adapter?.integrity ?? "")) {
     errors.push(`${principal} ACP integrity must be pinned`);
   }
   if (!HEX_64.test(adapter?.entrypointSha256 ?? "")) {
@@ -552,8 +521,13 @@ export function validateManifest(manifest, identityMap) {
       errors.push("Cursor CLI runtime, auth, or model contract drift");
     }
   }
+  if (selector === "grok_cli") {
+    if (JSON.stringify(adapter) !== JSON.stringify(REQUIRED_GROK_CLI)) {
+      errors.push("Grok CLI runtime, auth, or model contract drift");
+    }
+  }
   const usesSafeSupervisor =
-    selector === "claude_cli" || selector === "cursor_cli";
+    selector === "claude_cli" || selector === "cursor_cli" || selector === "grok_cli";
   for (const [label, value] of Object.entries({
     buzzAcpBinary: runtime?.buzzAcpBinary,
     configPath: runtime?.configPath,
@@ -567,8 +541,7 @@ export function validateManifest(manifest, identityMap) {
     ...(selector === "claude_cli" ? { adapterRoot: adapter?.root } : {}),
     adapterBinary: adapter?.binary,
   })) {
-    if (!isAbsoluteSafePath(value))
-      errors.push(`${label} must be an absolute safe path`);
+    if (!isAbsoluteSafePath(value)) errors.push(`${label} must be an absolute safe path`);
   }
   if (selector === "codex_cli") {
     if (!isAbsoluteSafePath(runtime?.codexHome))
@@ -597,19 +570,13 @@ export function validateManifest(manifest, identityMap) {
     };
     for (const [label, expected] of Object.entries(expectedPaths)) {
       if (actualPaths[label] !== expected)
-        errors.push(
-          `Claude ${label} must use the launchd-safe Data-volume path`,
-        );
+        errors.push(`Claude ${label} must use the launchd-safe Data-volume path`);
     }
-    if (
-      JSON.stringify(runtime?.node) !== JSON.stringify(REQUIRED_CLAUDE_NODE)
-    ) {
+    if (JSON.stringify(runtime?.node) !== JSON.stringify(REQUIRED_CLAUDE_NODE)) {
       errors.push("Claude Node runtime checkpoint drift");
     }
     if (claudeCode?.version !== REQUIRED_CLAUDE_CODE_VERSION) {
-      errors.push(
-        `Claude Code must be pinned to ${REQUIRED_CLAUDE_CODE_VERSION}`,
-      );
+      errors.push(`Claude Code must be pinned to ${REQUIRED_CLAUDE_CODE_VERSION}`);
     }
     if (!isAbsoluteSafePath(claudeCode?.binary))
       errors.push("Claude Code binary must be an absolute safe path");
@@ -622,9 +589,7 @@ export function validateManifest(manifest, identityMap) {
     if (claudeCode?.configDir !== undefined) {
       errors.push("Claude config directory override must be absent");
     }
-    if (
-      JSON.stringify(claudeCode?.auth) !== JSON.stringify(REQUIRED_CLAUDE_AUTH)
-    ) {
+    if (JSON.stringify(claudeCode?.auth) !== JSON.stringify(REQUIRED_CLAUDE_AUTH)) {
       errors.push("Claude auth must use the pinned Claude subscription login");
     }
   }
@@ -637,9 +602,20 @@ export function validateManifest(manifest, identityMap) {
     };
     for (const [label, expected] of Object.entries(expectedPaths)) {
       if (runtime?.[label] !== expected)
-        errors.push(
-          `Cursor ${label} must use the launchd-safe Data-volume path`,
-        );
+        errors.push(`Cursor ${label} must use the launchd-safe Data-volume path`);
+    }
+  }
+  if (selector === "grok_cli") {
+    const expectedPaths = {
+      configPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/grok-cli.toml`,
+      logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
+      signerPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/secrets/grok-cli.sk`,
+      supervisorWorkingDirectory: REQUIRED_CLAUDE_RUNTIME_ROOT,
+    };
+    for (const [label, expected] of Object.entries(expectedPaths)) {
+      if (runtime?.[label] !== expected) {
+        errors.push(`Grok ${label} must use the launchd-safe Data-volume path`);
+      }
     }
   }
   if (!(runtime?.path ?? []).every(isAbsoluteSafePath))
@@ -651,19 +627,13 @@ export function validateManifest(manifest, identityMap) {
     selector === "claude_cli" &&
     runtime?.path?.[0] !== path.dirname(runtime?.node?.binary ?? "")
   ) {
-    errors.push(
-      "Claude PATH must resolve the pinned trusted Node runtime first",
-    );
+    errors.push("Claude PATH must resolve the pinned trusted Node runtime first");
   }
 
   const workspaces = manifest.workspaces;
-  if (!workspaces?.allowed?.[workspaces?.default])
-    errors.push("default workspace must be allowed");
-  for (const [name, workspacePath] of Object.entries(
-    workspaces?.allowed ?? {},
-  )) {
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(name))
-      errors.push(`invalid workspace name: ${name}`);
+  if (!workspaces?.allowed?.[workspaces?.default]) errors.push("default workspace must be allowed");
+  for (const [name, workspacePath] of Object.entries(workspaces?.allowed ?? {})) {
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) errors.push(`invalid workspace name: ${name}`);
     if (
       !isAbsoluteSafePath(workspacePath) ||
       !workspacePath.startsWith("/Volumes/AEON/Projects/")
@@ -673,54 +643,31 @@ export function validateManifest(manifest, identityMap) {
   }
 
   const posture = manifest.posture;
-  if (posture?.subscribe !== "config")
-    errors.push("worker must use config subscriptions");
-  if (posture?.respondTo !== "allowlist")
-    errors.push("worker must use inbound allowlist");
-  if (
-    JSON.stringify(posture?.allowedRespondTo) !== JSON.stringify(["allowlist"])
-  ) {
+  if (posture?.subscribe !== "config") errors.push("worker must use config subscriptions");
+  if (posture?.respondTo !== "allowlist") errors.push("worker must use inbound allowlist");
+  if (JSON.stringify(posture?.allowedRespondTo) !== JSON.stringify(["allowlist"])) {
     errors.push("worker may only use allowlist response mode");
   }
-  if (
-    posture?.dedup !== "queue" ||
-    posture?.multipleEventHandling !== "queue"
-  ) {
+  if (posture?.dedup !== "queue" || posture?.multipleEventHandling !== "queue") {
     errors.push("queue semantics must remain enabled");
   }
-  for (const field of [
-    "presence",
-    "typing",
-    "memory",
-    "basePrompt",
-    "relayObserver",
-  ]) {
+  for (const field of ["presence", "typing", "memory", "basePrompt", "relayObserver"]) {
     if (posture?.[field] !== true) errors.push(`${field} must remain enabled`);
   }
-  const expectedPermissionMode =
-    selector === "codex_cli" ? "default" : "bypass-permissions";
+  const expectedPermissionMode = selector === "codex_cli" ? "default" : "bypass-permissions";
   if (posture?.permissionMode !== expectedPermissionMode) {
-    errors.push(
-      `${principal} Buzz permission mode must be ${expectedPermissionMode}`,
-    );
+    errors.push(`${principal} Buzz permission mode must be ${expectedPermissionMode}`);
   }
   if (posture?.heartbeatIntervalSecs !== 0)
     errors.push("autonomous heartbeat prompts must remain off");
-  if (
-    manifest.supervisor?.runAtLoad !== false ||
-    manifest.supervisor?.keepAlive !== false
-  ) {
+  if (manifest.supervisor?.runAtLoad !== false || manifest.supervisor?.keepAlive !== false) {
     errors.push("live activation must remain off");
   }
 
   return { ok: errors.length === 0, errors };
 }
 
-export function renderWorker(
-  manifest,
-  identityMap,
-  workspaceName = manifest.workspaces.default,
-) {
+export function renderWorker(manifest, identityMap, workspaceName = manifest.workspaces.default) {
   const validation = validateManifest(manifest, identityMap);
   if (!validation.ok) throw new Error(validation.errors.join("\n"));
 
@@ -731,10 +678,8 @@ export function renderWorker(
   const contract = WORKER_CONTRACTS[selector];
   const adapter = manifest.runtime[contract.adapterKey];
   const usesSafeSupervisor =
-    selector === "claude_cli" || selector === "cursor_cli";
-  const signerFile = usesSafeSupervisor
-    ? manifest.runtime.signerPath
-    : principal.secret_ref;
+    selector === "claude_cli" || selector === "cursor_cli" || selector === "grok_cli";
+  const signerFile = usesSafeSupervisor ? manifest.runtime.signerPath : principal.secret_ref;
   const allowlist = manifest.buzz.allowedInbound
     .filter((memberId) => memberId !== manifest.buzz.owner)
     .map((memberId) => memberPubkey(identityMap, memberId));
@@ -749,7 +694,11 @@ export function renderWorker(
     memberPubkey(identityMap, manifest.buzz.owner),
     "--agent-command",
     adapter.binary,
-    ...(adapter.args ?? []).flatMap((value) => ["--agent-args", value]),
+    ...(selector === "cursor_cli"
+      ? [`--agent-args=${adapter.args.join(",")}`]
+      : selector === "grok_cli"
+        ? ["--agent-args", adapter.args.join(",")]
+        : (adapter.args ?? []).flatMap((value) => ["--agent-args", value])),
     ...(usesSafeSupervisor ? ["--session-cwd", workspace] : []),
     ...(selector === "cursor_cli" ? ["--model", adapter.model.effective] : []),
     "--agent-publisher-credentials",
@@ -785,20 +734,20 @@ export function renderWorker(
     "--max-turns-per-session",
     String(manifest.posture.maxTurnsPerSession),
   ];
-  const claudeScrubPrefix = ANTHROPIC_CREDENTIAL_ENV.flatMap((name) => [
-    "-u",
-    name,
-  ]);
+  const claudeScrubPrefix = ANTHROPIC_CREDENTIAL_ENV.flatMap((name) => ["-u", name]);
   const cursorScrubPrefix = CURSOR_OVERRIDE_ENV.flatMap((name) => ["-u", name]);
+  const grokScrubPrefix = GROK_OVERRIDE_ENV.flatMap((name) => ["-u", name]);
   const scrubPrefix =
-    selector === "claude_cli" ? claudeScrubPrefix : cursorScrubPrefix;
+    selector === "claude_cli"
+      ? claudeScrubPrefix
+      : selector === "cursor_cli"
+        ? cursorScrubPrefix
+        : grokScrubPrefix;
   return {
     enabled: false,
     label: manifest.worker.label,
     workspaceName,
-    workingDirectory: usesSafeSupervisor
-      ? manifest.runtime.supervisorWorkingDirectory
-      : workspace,
+    workingDirectory: usesSafeSupervisor ? manifest.runtime.supervisorWorkingDirectory : workspace,
     sessionCwd: workspace,
     subscriptionRoomIds: exactRoomIds(manifest, identityMap),
     command: usesSafeSupervisor ? ENV_BINARY : manifest.runtime.buzzAcpBinary,
@@ -818,6 +767,7 @@ export function renderWorker(
               CLAUDE_CODE_EXECUTABLE: manifest.runtime.claudeCode.binary,
             }
           : {
+              ...(selector === "grok_cli" ? { HOME: "/Users/architect" } : {}),
               PATH: manifest.runtime.path.join(":"),
             },
     signerFile,
@@ -833,25 +783,17 @@ function xml(value) {
     .replaceAll('"', "&quot;");
 }
 
-export function renderDisabledLaunchAgent(
-  manifest,
-  identityMap,
-  workspaceName,
-) {
+export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) {
   const worker = renderWorker(manifest, identityMap, workspaceName);
   const argvXml = [worker.command, ...worker.args]
     .map((value) => `    <string>${xml(value)}</string>`)
     .join("\n");
   const envXml = Object.entries(worker.environment)
-    .map(
-      ([key, value]) =>
-        `    <key>${xml(key)}</key><string>${xml(value)}</string>`,
-    )
+    .map(([key, value]) => `    <key>${xml(key)}</key><string>${xml(value)}</string>`)
     .join("\n");
   const selector = workerSelector(manifest);
   const logRoot =
-    manifest.runtime.logDir ??
-    `/Volumes/AEON/runtime/buzz/external-cli/${selector}/logs`;
+    manifest.runtime.logDir ?? `/Volumes/AEON/runtime/buzz/external-cli/${selector}/logs`;
   const logName = selector.replace("_", "-");
 
   return {
@@ -860,9 +802,7 @@ export function renderDisabledLaunchAgent(
       path.dirname(manifest.runtime.configPath),
       logRoot,
       ...(selector !== "codex_cli" ? [path.dirname(worker.signerFile)] : []),
-      ...(selector !== "codex_cli"
-        ? [worker.workingDirectory, worker.sessionCwd]
-        : []),
+      ...(selector !== "codex_cli" ? [worker.workingDirectory, worker.sessionCwd] : []),
     ],
     runAtLoad: false,
     keepAlive: false,
@@ -895,8 +835,7 @@ ${envXml}
 function exactTag(tags, expected) {
   return tags.filter(
     (tag) =>
-      tag.length === expected.length &&
-      tag.every((value, index) => value === expected[index]),
+      tag.length === expected.length && tag.every((value, index) => value === expected[index]),
   );
 }
 
@@ -910,8 +849,7 @@ export function correlateVerifiedReceipt({
   if (!HEX_64.test(requestEventId) || !HEX_64.test(expectedPubkey)) {
     throw new Error("request and signer ids must be 64 lowercase hex");
   }
-  if (replyEvent?.verified !== true)
-    throw new Error("reply signature must be verified");
+  if (replyEvent?.verified !== true) throw new Error("reply signature must be verified");
   if (
     replyEvent?.kind !== 9 ||
     replyEvent?.pubkey !== expectedPubkey ||
@@ -922,10 +860,7 @@ export function correlateVerifiedReceipt({
   if (exactTag(replyEvent.tags ?? [], ["h", channelId]).length !== 1) {
     throw new Error("reply requires one exact channel tag");
   }
-  if (
-    exactTag(replyEvent.tags ?? [], ["e", requestEventId, "", "reply"])
-      .length !== 1
-  ) {
+  if (exactTag(replyEvent.tags ?? [], ["e", requestEventId, "", "reply"]).length !== 1) {
     throw new Error("reply requires one exact request anchor");
   }
   if (

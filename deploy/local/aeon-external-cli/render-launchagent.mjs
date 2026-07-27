@@ -16,12 +16,10 @@ function option(name) {
 }
 
 const workspace = option("--workspace");
-const identityPath =
-  option("--identity-map") ?? join(here, "fixtures", "identity-map.json");
+const identityPath = option("--identity-map") ?? join(here, "fixtures", "identity-map.json");
 const worker = option("--worker") ?? "codex_cli";
-const manifestName =
-  worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
-if (!["codex_cli", "claude_cli", "cursor_cli"].includes(worker)) {
+const manifestName = worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
+if (!["codex_cli", "claude_cli", "cursor_cli", "grok_cli"].includes(worker)) {
   console.error(`unsupported external CLI worker: ${worker}`);
   process.exit(1);
 }
@@ -33,20 +31,11 @@ if (!validation.ok) {
   process.exit(1);
 }
 const selector = manifest.worker.selector ?? manifest.worker.principal;
-const configText = fs.readFileSync(
-  join(here, "config", `${selector}.toml`),
-  "utf8",
-);
-const subscriptionValidation = validateSubscriptionProjection(
-  configText,
-  manifest,
-  identityMap,
-);
+const configText = fs.readFileSync(join(here, "config", `${selector}.toml`), "utf8");
+const subscriptionValidation = validateSubscriptionProjection(configText, manifest, identityMap);
 if (!subscriptionValidation.ok) {
   console.error(subscriptionValidation.errors.join("\n"));
   process.exit(1);
 }
 
-process.stdout.write(
-  renderDisabledLaunchAgent(manifest, identityMap, workspace).plist,
-);
+process.stdout.write(renderDisabledLaunchAgent(manifest, identityMap, workspace).plist);
