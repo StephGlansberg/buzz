@@ -377,6 +377,20 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   );
 });
 
+test("Codex and Claude omit --agent-args when adapters have no child args", () => {
+  for (const worker of [
+    renderWorker(manifest, identityMap),
+    renderWorker(claudeManifest, identityMap),
+  ]) {
+    assert.equal(
+      worker.args.some(
+        (value) => value === "--agent-args" || value.startsWith("--agent-args="),
+      ),
+      false,
+    );
+  }
+});
+
 test("renderer pins one native Cursor ACP subprocess with truthful fast-only model", () => {
   const worker = renderWorker(cursorManifest, identityMap);
   const adapter = cursorManifest.runtime.cursorAcp;
