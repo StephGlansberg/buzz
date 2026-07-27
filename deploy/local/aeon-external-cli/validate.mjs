@@ -44,6 +44,24 @@ if (!validation.ok) {
   process.exit(1);
 }
 
+function validatePinnedPrompt(runtime) {
+  if (!runtime.systemPromptPath) return;
+  const promptStat = fs.lstatSync(runtime.systemPromptPath);
+  if (
+    !promptStat.isFile() ||
+    promptStat.isSymbolicLink() ||
+    (promptStat.mode & 0o777) !== 0o444
+  ) {
+    throw new Error("system prompt must be a regular mode-0444 file");
+  }
+  const promptSha256 = createHash("sha256")
+    .update(fs.readFileSync(runtime.systemPromptPath))
+    .digest("hex");
+  if (promptSha256 !== runtime.systemPromptSha256) {
+    throw new Error("system prompt SHA-256 does not match the manifest pin");
+  }
+}
+
 const selector = manifest.worker.selector ?? manifest.worker.principal;
 const configText = fs.readFileSync(join(here, "config", `${selector}.toml`), "utf8");
 const subscriptionValidation = validateSubscriptionProjection(configText, manifest, identityMap);
@@ -117,6 +135,7 @@ if (runtimeCheck) {
       throw new Error(`required runtime path is not a directory: ${directory}`);
     }
   }
+  validatePinnedPrompt(manifest.runtime);
   if (selector === "claude_cli") {
     const nodeValidation = validatePinnedNodeRuntime(manifest.runtime.node, artifact.environment);
     if (!nodeValidation.ok) throw new Error(nodeValidation.errors.join("\n"));
@@ -144,28 +163,26 @@ if (runtimeCheck) {
       `${manifest.worker.principal} ACP entrypoint SHA-256 does not match the manifest pin`,
     );
   }
-  if (selector !== "codex_cli") {
-    const signerProbe = spawnSync(
-      manifest.runtime.buzzAcpBinary,
-      [
-        "--private-key-file",
-        artifact.signerFile,
-        "--expected-public-key",
-        artifact.expectedPublicKey,
-        "--heartbeat-interval",
-        "1",
-      ],
-      {
-        encoding: "utf8",
-        env: artifact.environment,
-      },
-    );
-    if (
-      signerProbe.status === 0 ||
-      !signerProbe.stderr.includes("heartbeat interval must be 0 (disabled)")
-    ) {
-      throw new Error(`shared buzz-acp signer validation failed: ${signerProbe.stderr.trim()}`);
-    }
+  const signerProbe = spawnSync(
+    manifest.runtime.buzzAcpBinary,
+    [
+      "--private-key-file",
+      artifact.signerFile,
+      "--expected-public-key",
+      artifact.expectedPublicKey,
+      "--heartbeat-interval",
+      "1",
+    ],
+    {
+      encoding: "utf8",
+      env: artifact.environment,
+    },
+  );
+  if (
+    signerProbe.status === 0 ||
+    !signerProbe.stderr.includes("heartbeat interval must be 0 (disabled)")
+  ) {
+    throw new Error(`shared buzz-acp signer validation failed: ${signerProbe.stderr.trim()}`);
   }
   if (selector === "codex_cli") {
     fs.accessSync(manifest.runtime.codexHome, fs.constants.R_OK);
@@ -241,6 +258,20 @@ if (runtimeCheck) {
       throw new Error(authValidation.errors.join("\n"));
     }
   } else if (selector === "cursor_cli") {
+    const bootstrapStat = fs.lstatSync(manifest.runtime.bootstrapPath);
+    if (
+      !bootstrapStat.isFile() ||
+      bootstrapStat.isSymbolicLink() ||
+      (bootstrapStat.mode & 0o777) !== 0o444
+    ) {
+      throw new Error("Cursor ACP bootstrap must be a regular mode-0444 file");
+    }
+    const bootstrapSha256 = createHash("sha256")
+      .update(fs.readFileSync(manifest.runtime.bootstrapPath))
+      .digest("hex");
+    if (bootstrapSha256 !== manifest.runtime.bootstrapSha256) {
+      throw new Error("Cursor ACP bootstrap SHA-256 does not match the manifest pin");
+    }
     if (hashCursorClosure(adapter.root) !== adapter.closureSha256) {
       throw new Error("Cursor CLI installed closure does not match the manifest pin");
     }
@@ -277,37 +308,51 @@ if (runtimeCheck) {
     }
     const authValidation = validateCursorSubscriptionAuth(statusJson, aboutJson, adapter.auth);
     if (!authValidation.ok) throw new Error(authValidation.errors.join("\n"));
-    const modelArgs = [
-      "models",
-      "--agent-command",
-      adapter.binary,
-      `--agent-args=${adapter.args.join(",")}`,
-      "--json",
-    ];
-    const modelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, modelArgs, {
+    const modelCatalog = spawnSync(adapter.binary, ["models"], {
       encoding: "utf8",
       env: cursorEnvironment,
     });
-    let catalog;
+    if (modelCatalog.status !== 0) {
+      throw new Error("Cursor model catalog query failed");
+    }
+    const catalogModelIds = new Set(
+      modelCatalog.stdout
+        .split("\n")
+        .map((line) => line.match(/^(\S+) - /)?.[1])
+        .filter(Boolean),
+    );
+    if (!catalogModelIds.has(adapter.model.requested)) {
+      throw new Error("Cursor requested model alias is absent from its native catalog");
+    }
+    const acpModelArgs = [
+      "models",
+      "--agent-command",
+      `${adapter.root}/node`,
+      `--agent-args=${[
+        "--use-system-ca",
+        manifest.runtime.bootstrapPath,
+        manifest.workspaces.allowed[manifest.workspaces.default],
+        `${adapter.root}/index.js`,
+        ...adapter.args,
+      ].join(",")}`,
+      "--json",
+    ];
+    const acpModelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, acpModelArgs, {
+      cwd: manifest.runtime.supervisorWorkingDirectory,
+      encoding: "utf8",
+      env: cursorEnvironment,
+    });
+    let acpCatalog;
     try {
-      catalog = JSON.parse(modelCatalog.stdout);
+      acpCatalog = JSON.parse(acpModelCatalog.stdout);
     } catch {
       throw new Error("Cursor ACP model catalog did not return JSON");
     }
-    const available = catalog?.unstable?.availableModels ?? [];
-    if (
-      modelCatalog.status !== 0 ||
-      catalog?.unstable?.currentModelId !== adapter.model.effective
-    ) {
-      throw new Error("Cursor ACP effective model does not match the manifest pin");
-    }
-    if (!available.some((model) => model.modelId === adapter.model.effective)) {
-      throw new Error("Cursor ACP effective model is absent from its catalog");
-    }
-    if (available.some((model) => model.modelId === adapter.model.requested)) {
-      throw new Error(
-        "Cursor ACP non-fast model is now available; remove the blocked model-choice contract",
-      );
+    const acpModelIds = new Set(
+      (acpCatalog?.unstable?.availableModels ?? []).map((model) => model.modelId),
+    );
+    if (acpModelCatalog.status !== 0 || !acpModelIds.has(adapter.model.effective)) {
+      throw new Error("Cursor effective ACP model is absent from its catalog");
     }
   } else {
     const authStat = fs.lstatSync(adapter.auth.authFile);

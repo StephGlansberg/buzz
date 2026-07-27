@@ -1895,7 +1895,11 @@ pub fn resolve_model_switch_method(
     // 1. Search stable configOptions for a "model"-category entry whose
     //    options contain a value matching desired_model.
     for config_opt in extract_model_config_options(session_new_result) {
-        let config_id = match config_opt.get("configId").and_then(|v| v.as_str()) {
+        let config_id = match config_opt
+            .get("configId")
+            .or_else(|| config_opt.get("id"))
+            .and_then(|v| v.as_str())
+        {
             Some(id) => id,
             None => continue,
         };

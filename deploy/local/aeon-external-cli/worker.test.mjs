@@ -51,7 +51,7 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
 
 test("all external workers pin the same shared Data-volume buzz-acp release", () => {
   const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
-  const sha256 = "de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d";
+  const sha256 = "1d339abfe3702df1bb40fb58a859800e2f505ccacd593366f432321f32cd286d";
   assert.equal(manifest.runtime.buzzAcpBinary, binary);
   assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
   assert.equal(cursorManifest.runtime.buzzAcpBinary, binary);
@@ -110,6 +110,10 @@ test("grok_cli selector binds a distinct external Grok identity", () => {
 
 test("Codex launch argv binds publisher credentials, identity, and all eight rooms", () => {
   const worker = renderWorker(manifest, identityMap);
+  assert.equal(
+    worker.environment.PATH.split(":")[0],
+    "/Users/architect/.nvm/versions/node/v24.1.0/bin",
+  );
   assert.equal(worker.args.includes("--no-agent-publisher-credentials"), false);
   assert.equal(worker.args.filter((arg) => arg === "--agent-publisher-credentials").length, 1);
   assert.equal(worker.args.includes("--private-key"), false);
@@ -117,7 +121,7 @@ test("Codex launch argv binds publisher credentials, identity, and all eight roo
   assert.equal(worker.args.includes("--relay-observer"), true);
   assert.equal(
     worker.args[worker.args.indexOf("--private-key-file") + 1],
-    identityMap.members.codex_cli.secret_ref,
+    manifest.runtime.signerPath,
   );
   assert.equal(
     worker.args[worker.args.indexOf("--expected-public-key") + 1],
@@ -255,15 +259,24 @@ ${codexConfig.replace("require_mention = true", "")}`;
 
 test("renderer pins one full-access codex-acp subprocess", () => {
   const worker = renderWorker(manifest, identityMap);
-  assert.equal(worker.command, manifest.runtime.buzzAcpBinary);
+  assert.equal(worker.command, "/usr/bin/env");
   assert.equal(worker.environment.INITIAL_AGENT_MODE, "agent-full-access");
-  assert.equal(worker.environment.CODEX_HOME, "/Users/architect/.codex");
+  assert.equal(
+    worker.environment.CODEX_HOME,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/codex-home",
+  );
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "default");
   assert.equal(
     worker.args[worker.args.indexOf("--agent-command") + 1],
     manifest.runtime.codexAcp.binary,
   );
+  assert.equal(
+    worker.args[worker.args.indexOf("--system-prompt-file") + 1],
+    manifest.runtime.systemPromptPath,
+  );
+  assert.match(manifest.runtime.systemPromptSha256, /^[0-9a-f]{64}$/);
+  assert.equal(worker.args[worker.args.indexOf("--model") + 1], manifest.runtime.codexAcp.model);
 });
 
 test("renderer pins one Claude ACP subprocess and installed Claude Code", () => {
@@ -313,7 +326,7 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
   );
 });
 
-test("renderer pins one native Cursor ACP subprocess with truthful fast-only model", () => {
+test("renderer pins one native Cursor ACP subprocess with a proven operational model", () => {
   const worker = renderWorker(cursorManifest, identityMap);
   const adapter = cursorManifest.runtime.cursorAcp;
   assert.equal(worker.command, "/usr/bin/env");
@@ -324,15 +337,39 @@ test("renderer pins one native Cursor ACP subprocess with truthful fast-only mod
     "CURSOR_API_ENDPOINT",
     cursorManifest.runtime.buzzAcpBinary,
   ]);
-  assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], adapter.binary);
+  assert.equal(
+    worker.args[worker.args.indexOf("--agent-command") + 1],
+    `${adapter.root}/node`,
+  );
   assert.deepEqual(
     worker.args.filter((value) => value.startsWith("--agent-args=")),
-    [`--agent-args=${adapter.args.join(",")}`],
+    [
+      `--agent-args=--use-system-ca,${cursorManifest.runtime.bootstrapPath},/Volumes/AEON/Projects/aeon-v6,${adapter.root}/index.js,--trust,acp`,
+    ],
   );
   assert.equal(worker.args.includes("--agent-args"), false);
-  assert.equal(worker.args[worker.args.indexOf("--model") + 1], adapter.model.effective);
+  assert.equal(
+    worker.args[worker.args.lastIndexOf("--model") + 1],
+    "grok-4.5[effort=high,fast=true]",
+  );
+  assert.equal(
+    worker.args[worker.args.indexOf("--system-prompt-file") + 1],
+    cursorManifest.runtime.systemPromptPath,
+  );
+  assert.match(cursorManifest.runtime.systemPromptSha256, /^[0-9a-f]{64}$/);
+  assert.equal(worker.args.includes("--no-base-prompt"), true);
+  assert.equal(worker.args.includes("--no-memory"), true);
+  assert.equal(
+    worker.args[worker.args.indexOf("--context-message-limit") + 1],
+    "0",
+  );
+  assert.doesNotMatch(
+    worker.args.find((value) => value.startsWith("--agent-args=")),
+    /--model/,
+  );
   assert.equal(adapter.model.requested, "cursor-grok-4.5-high");
-  assert.equal(adapter.model.selectionStatus, "blocked_by_cursor_acp_catalog");
+  assert.equal(adapter.model.effective, "grok-4.5[effort=high,fast=true]");
+  assert.equal(adapter.model.selectionStatus, "upstream_limited_to_fast_wire_variant");
   assert.equal(
     worker.args[worker.args.indexOf("--session-cwd") + 1],
     "/Volumes/AEON/Projects/aeon-v6",
@@ -364,6 +401,11 @@ test("renderer pins one native Grok ACP subprocess with full coding authority", 
   assert.equal(worker.sessionCwd, "/Volumes/AEON/Projects/aeon-v6");
   assert.equal(worker.environment.HOME, "/Users/architect");
   assert.equal(worker.environment.PATH.startsWith("/Users/architect/.grok/bin:"), true);
+  assert.equal(worker.environment.PATH.includes("/Users/architect/.local/bin"), true);
+  const buzzPublisher = worker.environment.PATH.split(":")
+    .map((directory) => join(directory, "buzz"))
+    .find((candidate) => existsSync(candidate));
+  assert.equal(buzzPublisher, "/Users/architect/.local/bin/buzz");
   assert.equal(
     worker.args.find((value) => value.startsWith("--agent-args=")),
     `--agent-args=${grokManifest.runtime.grokAcp.args.join(",")}`,
@@ -486,9 +528,15 @@ test("renderer rejects colliding authorities and Aspects absent from their offic
 
 test("workspace selection is bounded to the manifest allowlist", () => {
   const codexWorker = renderWorker(manifest, identityMap, "buzz");
-  assert.equal(codexWorker.workingDirectory, "/Volumes/AEON/Projects/buzz");
+  assert.equal(
+    codexWorker.workingDirectory,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+  );
   assert.equal(codexWorker.sessionCwd, "/Volumes/AEON/Projects/buzz");
-  assert.equal(codexWorker.args.includes("--session-cwd"), false);
+  assert.equal(
+    codexWorker.args[codexWorker.args.indexOf("--session-cwd") + 1],
+    "/Volumes/AEON/Projects/buzz",
+  );
   assert.throws(() => renderWorker(manifest, identityMap, "/tmp/escape"), /not allowed/);
   const claudeWorker = renderWorker(claudeManifest, identityMap, "codex");
   assert.equal(
@@ -499,6 +547,29 @@ test("workspace selection is bounded to the manifest allowlist", () => {
   assert.equal(
     claudeWorker.args[claudeWorker.args.indexOf("--session-cwd") + 1],
     "/Volumes/AEON/Projects/codex",
+  );
+  const cursorWorker = renderWorker(cursorManifest, identityMap, "buzz");
+  assert.equal(
+    cursorWorker.workingDirectory,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+  );
+  assert.equal(cursorWorker.sessionCwd, "/Volumes/AEON/Projects/buzz");
+  assert.equal(
+    cursorWorker.args.find((value) => value.startsWith("--agent-args=")),
+    `--agent-args=--use-system-ca,${cursorManifest.runtime.bootstrapPath},/Volumes/AEON/Projects/buzz,${cursorManifest.runtime.cursorAcp.root}/index.js,--trust,acp`,
+  );
+  assert.equal(
+    cursorWorker.args[cursorWorker.args.indexOf("--session-cwd") + 1],
+    "/Volumes/AEON/Projects/buzz",
+  );
+  const grokWorker = renderWorker(grokManifest, identityMap, "aeon-v6");
+  assert.equal(
+    grokWorker.workingDirectory,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+  );
+  assert.equal(
+    grokWorker.args.find((value) => value.startsWith("--agent-args=")),
+    `--agent-args=${grokManifest.runtime.grokAcp.args.join(",")}`,
   );
 });
 
@@ -511,8 +582,11 @@ test("launchd artifact remains inert and secret-free", () => {
   assert.match(artifact.plist, /INITIAL_AGENT_MODE<\/key><string>agent-full-access/);
   assert.doesNotMatch(artifact.plist, /BUZZ_PRIVATE_KEY|nsec1/);
   assert.deepEqual(artifact.requiredDirectories, [
-    "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/config",
-    "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/logs",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets",
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+    "/Volumes/AEON/Projects/aeon-v6",
   ]);
 });
 
@@ -569,10 +643,23 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>CURSOR_API_KEY<\/string>/);
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>CURSOR_API_ENDPOINT<\/string>/);
   assert.doesNotMatch(artifact.plist, /<key>CURSOR_API_KEY|<key>CURSOR_API_ENDPOINT|nsec1/);
-  assert.match(artifact.plist, /<string>--model<\/string>/);
   assert.match(artifact.plist, /grok-4\.5\[effort=high,fast=true\]/);
+  assert.match(artifact.plist, /cursor-cli-system\.md/);
+  assert.match(artifact.plist, /<string>--no-base-prompt<\/string>/);
   assert.match(artifact.plist, /<string>--session-cwd<\/string>/);
-  assert.match(artifact.plist, /\/Users\/architect\/\.local\/bin\/cursor-agent/);
+  assert.match(
+    artifact.plist,
+    /\/Users\/architect\/\.local\/share\/cursor-agent\/versions\/2026\.07\.23-e383d2b\/node/,
+  );
+  assert.match(artifact.plist, /cursor-acp-bootstrap\.cjs/);
+  assert.match(
+    artifact.plist,
+    /--agent-args=--use-system-ca,\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/buzz\/cursor-acp-bootstrap\.cjs,\/Volumes\/AEON\/Projects\/aeon-v6,\/Users\/architect\/\.local\/share\/cursor-agent\/versions\/2026\.07\.23-e383d2b\/index\.js,--trust,acp/,
+  );
+  assert.match(
+    artifact.plist,
+    /<key>WorkingDirectory<\/key><string>\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6<\/string>/,
+  );
   assert.deepEqual(artifact.requiredDirectories, [
     "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
@@ -580,6 +667,14 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
     "/Users/architect/Library/Application Support/AEON/aeon-v6",
     "/Volumes/AEON/Projects/aeon-v6",
   ]);
+});
+
+test("Cursor ACP bootstrap is isolated from the other CLI seats", () => {
+  for (const workerManifest of [manifest, claudeManifest, grokManifest]) {
+    const worker = renderWorker(workerManifest, identityMap);
+    assert.equal(worker.command, "/usr/bin/env");
+    assert.equal(worker.args.includes(cursorManifest.runtime.bootstrapPath), false);
+  }
 });
 
 test("Grok launchd artifact is separate, inert, and scrubs auth overrides", () => {
@@ -622,7 +717,7 @@ test("Claude and Cursor/Grok launch projections retain their current behavior", 
     {
       command: cursor.command,
       principal: cursor.expectedPublicKey,
-      model: cursor.args[cursor.args.indexOf("--model") + 1],
+      model: cursorManifest.runtime.cursorAcp.model.effective,
       permissionMode: cursor.args[cursor.args.indexOf("--permission-mode") + 1],
       publisherFlagCount: cursor.args.filter((arg) => arg === "--agent-publisher-credentials")
         .length,
@@ -686,6 +781,12 @@ test("Claude authority contract rejects missing identity and mode drift", () => 
   assert.match(
     validateManifest(modeDrift, identityMap).errors.join("\n"),
     /must be bypass-permissions/,
+  );
+  const missingPromptPin = structuredClone(cursorManifest);
+  delete missingPromptPin.runtime.systemPromptSha256;
+  assert.match(
+    validateManifest(missingPromptPin, identityMap).errors.join("\n"),
+    /systemPromptSha256/,
   );
 
   const adapterDrift = structuredClone(claudeManifest);
@@ -767,8 +868,10 @@ test("Cursor contract rejects identity, runtime, auth, and model drift", () => {
     (value) => (value.runtime.cursorAcp.args = ["acp"]),
     (value) => (value.runtime.cursorAcp.auth.subscriptionTypes = ["Free"]),
     (value) => (value.runtime.cursorAcp.model.requested = "cursor-grok-4.5-high-fast"),
-    (value) => (value.runtime.cursorAcp.model.effective = "cursor-grok-4.5-high"),
+    (value) => (value.runtime.cursorAcp.model.effective = "cursor-grok-4.5-high-fast"),
     (value) => (value.runtime.signerPath = identityMap.members.cursor_cli.secret_ref),
+    (value) => (value.runtime.bootstrapPath = "/tmp/cursor-acp-bootstrap.cjs"),
+    (value) => (value.runtime.bootstrapSha256 = "0".repeat(64)),
   ]) {
     const drift = structuredClone(cursorManifest);
     mutate(drift);
@@ -812,7 +915,7 @@ test("Grok worker rejects ambient API and auth overrides", () => {
   ]);
 });
 
-test("Codex rejects shared harness path and digest drift without changing its cwd contract", () => {
+test("Codex rejects shared harness path and digest drift under the safe supervisor", () => {
   const pathDrift = structuredClone(manifest);
   pathDrift.runtime.buzzAcpBinary = "/Volumes/AEON/runtime/buzz-acp";
   assert.match(
@@ -828,8 +931,15 @@ test("Codex rejects shared harness path and digest drift without changing its cw
   );
 
   const artifact = renderDisabledLaunchAgent(manifest, identityMap, "codex");
-  assert.equal(artifact.workingDirectory, "/Volumes/AEON/Projects/codex");
-  assert.equal(artifact.args.includes("--session-cwd"), false);
+  assert.equal(
+    artifact.workingDirectory,
+    "/Users/architect/Library/Application Support/AEON/aeon-v6",
+  );
+  assert.equal(artifact.sessionCwd, "/Volumes/AEON/Projects/codex");
+  assert.equal(
+    artifact.args[artifact.args.indexOf("--session-cwd") + 1],
+    "/Volumes/AEON/Projects/codex",
+  );
 });
 
 test("Claude package closure digest detects adapter and dependency changes", () => {

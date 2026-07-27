@@ -22,7 +22,10 @@ const REQUIRED_CLAUDE_CODE_SHA256 =
 const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
 const REQUIRED_SHARED_BUZZ_ACP_BINARY = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`;
 const REQUIRED_SHARED_BUZZ_ACP_SHA256 =
-  "de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d";
+  "1d339abfe3702df1bb40fb58a859800e2f505ccacd593366f432321f32cd286d";
+const REQUIRED_CURSOR_BOOTSTRAP_PATH = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/cursor-acp-bootstrap.cjs`;
+const REQUIRED_CURSOR_BOOTSTRAP_SHA256 =
+  "b3f4e90e675bd0e8f0827b618203c33b9904cbd01becd2b80fc868d75b8797e8";
 const REQUIRED_CLAUDE_NODE = {
   version: "v24.1.0",
   sha256: "59450bb6448c8a40b3f3b86da45c3babb2e0503e04c47e5a715e8e137389878b",
@@ -73,7 +76,7 @@ const REQUIRED_CURSOR_CLI = {
   model: {
     requested: "cursor-grok-4.5-high",
     effective: "grok-4.5[effort=high,fast=true]",
-    selectionStatus: "blocked_by_cursor_acp_catalog",
+    selectionStatus: "upstream_limited_to_fast_wire_variant",
   },
 };
 const REQUIRED_GROK_CLI = {
@@ -558,8 +561,7 @@ export function validateManifest(manifest, identityMap) {
       errors.push("Grok CLI runtime, auth, or model contract drift");
     }
   }
-  const usesSafeSupervisor =
-    selector === "claude_cli" || selector === "cursor_cli" || selector === "grok_cli";
+  const usesSafeSupervisor = true;
   for (const [label, value] of Object.entries({
     buzzAcpBinary: runtime?.buzzAcpBinary,
     configPath: runtime?.configPath,
@@ -571,15 +573,40 @@ export function validateManifest(manifest, identityMap) {
         }
       : {}),
     ...(selector === "claude_cli" ? { adapterRoot: adapter?.root } : {}),
+    ...(selector === "cursor_cli" ? { bootstrapPath: runtime?.bootstrapPath } : {}),
     adapterBinary: adapter?.binary,
   })) {
     if (!isAbsoluteSafePath(value)) errors.push(`${label} must be an absolute safe path`);
   }
   if (selector === "codex_cli") {
+    const expectedPaths = {
+      configPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/codex-cli.toml`,
+      logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
+      signerPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/secrets/codex-cli.sk`,
+      systemPromptPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/codex-cli-system.md`,
+      supervisorWorkingDirectory: REQUIRED_CLAUDE_RUNTIME_ROOT,
+      adapterBinary: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/codex-acp/${REQUIRED_CODEX_ACP_VERSION}/node_modules/.bin/codex-acp`,
+    };
+    const actualPaths = {
+      configPath: runtime?.configPath,
+      logDir: runtime?.logDir,
+      signerPath: runtime?.signerPath,
+      systemPromptPath: runtime?.systemPromptPath,
+      supervisorWorkingDirectory: runtime?.supervisorWorkingDirectory,
+      adapterBinary: adapter?.binary,
+    };
+    for (const [label, expected] of Object.entries(expectedPaths)) {
+      if (actualPaths[label] !== expected) {
+        errors.push(`Codex ${label} must use the launchd-safe Data-volume path`);
+      }
+    }
     if (!isAbsoluteSafePath(runtime?.codexHome))
       errors.push("codexHome must be an absolute safe path");
     if (runtime?.initialAgentMode !== REQUIRED_AGENT_MODE) {
       errors.push(`INITIAL_AGENT_MODE must be ${REQUIRED_AGENT_MODE}`);
+    }
+    if (adapter?.model !== "gpt-5.6-sol[medium]") {
+      errors.push("Codex ACP model must be gpt-5.6-sol[medium]");
     }
   }
   if (selector === "claude_cli") {
@@ -631,10 +658,14 @@ export function validateManifest(manifest, identityMap) {
       logDir: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/logs`,
       signerPath: `${REQUIRED_CLAUDE_RUNTIME_ROOT}/secrets/cursor-cli.sk`,
       supervisorWorkingDirectory: REQUIRED_CLAUDE_RUNTIME_ROOT,
+      bootstrapPath: REQUIRED_CURSOR_BOOTSTRAP_PATH,
     };
     for (const [label, expected] of Object.entries(expectedPaths)) {
       if (runtime?.[label] !== expected)
         errors.push(`Cursor ${label} must use the launchd-safe Data-volume path`);
+    }
+    if (runtime?.bootstrapSha256 !== REQUIRED_CURSOR_BOOTSTRAP_SHA256) {
+      errors.push("Cursor ACP bootstrap checkpoint drift");
     }
   }
   if (selector === "grok_cli") {
@@ -685,8 +716,27 @@ export function validateManifest(manifest, identityMap) {
   if (posture?.dedup !== "queue" || posture?.multipleEventHandling !== "queue") {
     errors.push("queue semantics must remain enabled");
   }
-  for (const field of ["presence", "typing", "memory", "basePrompt", "relayObserver"]) {
+  for (const field of ["presence", "typing", "relayObserver"]) {
     if (posture?.[field] !== true) errors.push(`${field} must remain enabled`);
+  }
+  const expectedMemory = selector !== "cursor_cli";
+  if (posture?.memory !== expectedMemory) {
+    errors.push(`memory must remain ${expectedMemory ? "enabled" : "disabled"}`);
+  }
+  if (posture?.basePrompt !== true && posture?.basePrompt !== false) {
+    errors.push("basePrompt must be a boolean");
+  }
+  if (
+    posture?.basePrompt === false &&
+    !isAbsoluteSafePath(manifest.runtime?.systemPromptPath)
+  ) {
+    errors.push("a compact systemPromptPath is required when basePrompt is disabled");
+  }
+  if (
+    manifest.runtime?.systemPromptPath !== undefined &&
+    !HEX_64.test(manifest.runtime?.systemPromptSha256 ?? "")
+  ) {
+    errors.push("systemPromptSha256 must pin every configured system prompt");
   }
   const expectedPermissionMode = selector === "codex_cli" ? "default" : "bypass-permissions";
   if (posture?.permissionMode !== expectedPermissionMode) {
@@ -711,9 +761,8 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
   const principal = identityMap.members[manifest.worker.principal];
   const contract = WORKER_CONTRACTS[selector];
   const adapter = manifest.runtime[contract.adapterKey];
-  const usesSafeSupervisor =
-    selector === "claude_cli" || selector === "cursor_cli" || selector === "grok_cli";
-  const signerFile = usesSafeSupervisor ? manifest.runtime.signerPath : principal.secret_ref;
+  const usesSafeSupervisor = true;
+  const signerFile = manifest.runtime.signerPath;
   const allowlist = manifest.buzz.allowedInbound
     .filter((memberId) => memberId !== manifest.buzz.owner)
     .map((memberId) => memberPubkey(identityMap, memberId));
@@ -727,12 +776,33 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     "--agent-owner",
     memberPubkey(identityMap, manifest.buzz.owner),
     "--agent-command",
-    adapter.binary,
+    selector === "cursor_cli" ? `${adapter.root}/node` : adapter.binary,
     ...((adapter.args?.length ?? 0) > 0
-      ? [`--agent-args=${adapter.args.join(",")}`]
+      ? [
+          `--agent-args=${
+            selector === "cursor_cli"
+              ? [
+                  "--use-system-ca",
+                  manifest.runtime.bootstrapPath,
+                  workspace,
+                  `${adapter.root}/index.js`,
+                  ...adapter.args,
+                ].join(",")
+              : adapter.args.join(",")
+          }`,
+        ]
       : []),
     ...(usesSafeSupervisor ? ["--session-cwd", workspace] : []),
-    ...(selector === "cursor_cli" ? ["--model", adapter.model.effective] : []),
+    ...(manifest.runtime.systemPromptPath
+      ? ["--system-prompt-file", manifest.runtime.systemPromptPath]
+      : []),
+    ...(manifest.posture.basePrompt ? [] : ["--no-base-prompt"]),
+    ...(manifest.posture.memory ? [] : ["--no-memory"]),
+    ...(selector === "codex_cli"
+      ? ["--model", adapter.model]
+      : selector === "cursor_cli"
+        ? ["--model", adapter.model.effective]
+        : []),
     "--agent-publisher-credentials",
     "--agents",
     "1",
@@ -770,7 +840,9 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
   const cursorScrubPrefix = CURSOR_OVERRIDE_ENV.flatMap((name) => ["-u", name]);
   const grokScrubPrefix = GROK_OVERRIDE_ENV.flatMap((name) => ["-u", name]);
   const scrubPrefix =
-    selector === "claude_cli"
+    selector === "codex_cli"
+      ? []
+      : selector === "claude_cli"
       ? claudeScrubPrefix
       : selector === "cursor_cli"
         ? cursorScrubPrefix
@@ -779,7 +851,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     enabled: false,
     label: manifest.worker.label,
     workspaceName,
-    workingDirectory: usesSafeSupervisor ? manifest.runtime.supervisorWorkingDirectory : workspace,
+    workingDirectory: manifest.runtime.supervisorWorkingDirectory,
     sessionCwd: workspace,
     subscriptionRoomIds: exactRoomIds(manifest, identityMap),
     command: usesSafeSupervisor ? ENV_BINARY : manifest.runtime.buzzAcpBinary,
@@ -831,10 +903,19 @@ export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) 
   return {
     ...worker,
     requiredDirectories: [
-      path.dirname(manifest.runtime.configPath),
-      logRoot,
-      ...(selector !== "codex_cli" ? [path.dirname(worker.signerFile)] : []),
-      ...(selector !== "codex_cli" ? [worker.workingDirectory, worker.sessionCwd] : []),
+      ...new Set([
+        path.dirname(manifest.runtime.configPath),
+        ...(selector === "cursor_cli"
+          ? [
+              path.dirname(manifest.runtime.bootstrapPath),
+              path.dirname(manifest.runtime.systemPromptPath),
+            ]
+          : []),
+        logRoot,
+        path.dirname(worker.signerFile),
+        worker.workingDirectory,
+        worker.sessionCwd,
+      ]),
     ],
     runAtLoad: false,
     keepAlive: false,

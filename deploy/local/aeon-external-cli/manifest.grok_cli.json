@@ -33,7 +33,7 @@
   },
   "runtime": {
     "buzzAcpBinary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp",
-    "buzzAcpSha256": "de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d",
+    "buzzAcpSha256": "1d339abfe3702df1bb40fb58a859800e2f505ccacd593366f432321f32cd286d",
     "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/grok-cli.toml",
     "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/grok-cli.sk",
@@ -65,7 +65,14 @@
         "reasoningEffort": "high"
       }
     },
-    "path": ["/Users/architect/.grok/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    "path": [
+      "/Users/architect/.grok/bin",
+      "/Users/architect/.local/bin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin"
+    ]
   },
   "workspaces": {
     "default": "aeon-v6",

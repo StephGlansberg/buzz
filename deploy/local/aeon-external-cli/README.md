@@ -17,7 +17,7 @@ External CLI seats cannot direct each other. Each worker starts one pinned ACP
 process.
 
 The Codex worker starts `@agentclientprotocol/codex-acp@1.1.7` with
-`CODEX_HOME=/Users/architect/.codex` and
+an isolated `CODEX_HOME` under the AEON Application Support runtime and
 `INITIAL_AGENT_MODE=agent-full-access`. Buzz's permission mode stays `default`;
 it does not attempt to translate `bypass-permissions` into a Codex mode.
 
@@ -33,7 +33,7 @@ Both services reuse the canonical shared
 `/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp`;
 neither worker installs or maintains a private harness executable. Both
 manifests pin the release at SHA-256
-`de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d`.
+`1d339abfe3702df1bb40fb58a859800e2f505ccacd593366f432321f32cd286d`.
 The pinned harness supports
 `--session-cwd` and requires the explicit `--agent-publisher-credentials`
 grant, so the renderer cannot silently depend on legacy default forwarding.
@@ -68,7 +68,8 @@ authentication.
 
 The Cursor worker reuses the same renderer and starts the official
 `/Users/architect/.local/bin/cursor-agent` at exact version
-`2026.07.23-e383d2b` with native ACP arguments `--trust acp`. It uses the same
+`2026.07.23-e383d2b` with native ACP arguments
+`--trust acp`. It uses the same
 rooms, bounded workspace selector, managed signer isolation, Data-volume
 supervisor cwd, explicit `--session-cwd`, canonical Aspect inbound authority,
 and `bypass-permissions` posture as the Claude worker. The manifest pins the
@@ -85,18 +86,13 @@ Runtime validation pins the resolved binary digest, existing login, model
 catalog, reasoning metadata, and `0600` auth file. API-key, auth-path, proxy,
 OIDC, and alternate-home overrides are removed at the process boundary.
 
-Cursor model selection has one explicit upstream limitation in this release.
-The ordinary CLI accepts `--model cursor-grok-4.5-high`, but native
-`cursor-agent acp` advertises only
-`grok-4.5[effort=high,fast=true]` and ignores the same global non-fast model
-selection. The disabled manifest therefore records
-`requested=cursor-grok-4.5-high`,
-`effective=grok-4.5[effort=high,fast=true]`, and
-`selectionStatus=blocked_by_cursor_acp_catalog`. The renderer truthfully passes
-the effective ACP model through `buzz-acp --model`; it does not claim that the
-requested non-fast semantics are active. Runtime validation fails for catalog
-drift and requires this blocked contract to be removed once Cursor ACP exposes
-the requested model.
+The authenticated Cursor catalog exposes the user-facing alias
+`cursor-grok-4.5-high`; Cursor ACP advertises its wire model as
+`grok-4.5[effort=high,fast=true]`. The manifest records both and reports
+`selectionStatus=upstream_limited_to_fast_wire_variant`; it does not claim that
+Cursor ACP currently offers the requested non-fast variant. Buzz ACP applies the
+advertised wire model to every new session. The
+dedicated Grok CLI seat remains a separate Grok 4.5 High execution path.
 
 The manifest pins npm registry integrity and git-head provenance plus a
 deterministic SHA-256 over the complete installed
@@ -142,8 +138,9 @@ node deploy/local/aeon-external-cli/render-launchagent.mjs \
 Install the pinned adapter into the exact manifest path:
 
 ```sh
-npm install --global \
-  --prefix /Volumes/AEON/runtime/buzz/external-cli/codex_cli/codex-acp/1.1.7 \
+npm install \
+  --prefix '/Users/architect/Library/Application Support/AEON/aeon-v6/codex-acp/1.1.7' \
+  --save-exact \
   --ignore-scripts --no-audit --no-fund \
   @agentclientprotocol/codex-acp@1.1.7
 ```
@@ -164,12 +161,6 @@ config at its exact path:
 ```sh
 cargo build --release -p buzz-acp
 install -d -m 0755 \
-  /Volumes/AEON/runtime/buzz/external-cli/codex_cli/config \
-  /Volumes/AEON/runtime/buzz/external-cli/codex_cli/logs
-install -m 0444 \
-  deploy/local/aeon-external-cli/config/codex_cli.toml \
-  /Volumes/AEON/runtime/buzz/external-cli/codex_cli/config/codex_cli.toml
-install -d -m 0755 \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/bin' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz' \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/logs'
@@ -177,7 +168,23 @@ install -m 0500 \
   target/release/buzz-acp \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp'
 install -d -m 0700 \
-  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets'
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets' \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/codex-home'
+install -m 0600 \
+  /Users/architect/.codex/auth.json \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/codex-home/auth.json'
+install -m 0600 \
+  /Users/architect/.codex/config.toml \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/codex-home/config.toml'
+install -m 0444 \
+  deploy/local/aeon-external-cli/config/codex_cli.toml \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/codex-cli.toml'
+install -m 0444 \
+  deploy/local/aeon-external-cli/config/codex_cli_system.md \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/codex-cli-system.md'
+install -m 0600 \
+  /Volumes/AEON/Projects/buzz-data/keys/codex_cli.sk \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/codex-cli.sk'
 install -m 0444 \
   deploy/local/aeon-external-cli/config/claude_cli.toml \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/claude-cli.toml'
@@ -187,6 +194,12 @@ install -m 0600 \
 install -m 0444 \
   deploy/local/aeon-external-cli/config/cursor_cli.toml \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-cli.toml'
+install -m 0444 \
+  deploy/local/aeon-external-cli/config/cursor_acp_bootstrap.cjs \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-acp-bootstrap.cjs'
+install -m 0444 \
+  deploy/local/aeon-external-cli/config/cursor_cli_system.md \
+  '/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-cli-system.md'
 install -m 0600 \
   /Volumes/AEON/Projects/buzz-data/keys/cursor_cli.sk \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/cursor-cli.sk'
