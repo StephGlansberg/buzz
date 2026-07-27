@@ -136,8 +136,9 @@ pub enum MultipleEventHandling {
 
 /// Inbound author gate: which authors' events the harness forwards to the agent.
 ///
-/// - `owner-only` — only the agent's registered owner (default).
-/// - `allowlist`  — owner + explicit pubkey list (`--respond-to-allowlist`).
+/// - `owner-only` — owner + verified same-owner siblings (default).
+/// - `allowlist`  — owner + same-owner siblings + explicit pubkey list.
+/// - `strict-allowlist` — owner + explicit pubkey list, excluding siblings.
 /// - `anyone`     — all events forwarded (no author filtering).
 /// - `nobody`     — all events dropped (proactive/heartbeat-only mode).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
@@ -145,6 +146,7 @@ pub enum RespondTo {
     #[default]
     OwnerOnly,
     Allowlist,
+    StrictAllowlist,
     Anyone,
     Nobody,
 }
@@ -154,6 +156,7 @@ impl std::fmt::Display for RespondTo {
         match self {
             Self::OwnerOnly => f.write_str("owner-only"),
             Self::Allowlist => f.write_str("allowlist"),
+            Self::StrictAllowlist => f.write_str("strict-allowlist"),
             Self::Anyone => f.write_str("anyone"),
             Self::Nobody => f.write_str("nobody"),
         }
@@ -315,7 +318,7 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_CWD")]
     pub session_cwd: Option<PathBuf>,
 
-    /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
+    /// Agent owner pubkey (64-char hex). Used by owner-aware author gates.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
     pub agent_owner: Option<String>,
 
@@ -528,7 +531,7 @@ pub struct CliArgs {
     pub permission_mode: PermissionMode,
 
     /// Inbound author gate: which authors' events the harness forwards.
-    /// Modes: owner-only (default), allowlist, anyone, nobody.
+    /// Modes: owner-only (default), allowlist, strict-allowlist, anyone, nobody.
     #[arg(
         long,
         env = "BUZZ_ACP_RESPOND_TO",
@@ -537,14 +540,14 @@ pub struct CliArgs {
     )]
     pub respond_to: RespondTo,
 
-    /// Comma-separated 64-char hex pubkeys for allowlist mode.
+    /// Comma-separated 64-char hex pubkeys for allowlist modes.
     /// Owner pubkey is always implicitly included.
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
     pub respond_to_allowlist: Option<Vec<String>>,
 
     /// Comma-separated list of allowed `--respond-to` modes.
     /// When set, the harness rejects startup if `--respond-to` is not in this list.
-    /// Modes: owner-only, allowlist, anyone, nobody.
+    /// Modes: owner-only, allowlist, strict-allowlist, anyone, nobody.
     /// Default: empty (all modes allowed — no restriction).
     /// Example: `BUZZ_ACP_ALLOWED_RESPOND_TO=owner-only,allowlist`
     #[arg(long, env = "BUZZ_ACP_ALLOWED_RESPOND_TO", value_delimiter = ',')]
@@ -618,7 +621,7 @@ pub struct Config {
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
-    /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
+    /// Validated pubkeys used by both allowlist modes.
     pub respond_to_allowlist: HashSet<String>,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
     pub allowed_respond_to: Vec<String>,
@@ -1042,18 +1045,23 @@ impl Config {
             )));
         }
 
-        let respond_to_allowlist = if args.respond_to == RespondTo::Allowlist {
+        let uses_allowlist = matches!(
+            args.respond_to,
+            RespondTo::Allowlist | RespondTo::StrictAllowlist
+        );
+        let respond_to_allowlist = if uses_allowlist {
             let raw = args.respond_to_allowlist.unwrap_or_default();
             if raw.is_empty() {
-                return Err(ConfigError::ConfigFile(
-                    "--respond-to=allowlist requires --respond-to-allowlist with at least one pubkey".into(),
-                ));
+                return Err(ConfigError::ConfigFile(format!(
+                    "--respond-to={} requires --respond-to-allowlist with at least one pubkey",
+                    args.respond_to
+                )));
             }
             validate_allowlist(&raw)?
         } else {
             if args.respond_to_allowlist.is_some() {
                 tracing::warn!(
-                    "--respond-to-allowlist is ignored when --respond-to is not 'allowlist'"
+                    "--respond-to-allowlist is ignored when --respond-to is not an allowlist mode"
                 );
             }
             HashSet::new()
@@ -1066,7 +1074,7 @@ impl Config {
                 RespondTo::from_str(s.trim(), true).map_err(|_| {
                     ConfigError::ConfigFile(format!(
                         "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                         (valid values: owner-only, allowlist, anyone, nobody)"
+                         (valid values: owner-only, allowlist, strict-allowlist, anyone, nobody)"
                     ))
                 })?;
             }
@@ -1157,9 +1165,11 @@ impl Config {
     /// Human-readable summary (no secrets).
     pub fn summary(&self) -> String {
         let respond_to_detail = match &self.respond_to {
-            RespondTo::Allowlist => {
-                format!("respond_to=allowlist({})", self.respond_to_allowlist.len())
-            }
+            RespondTo::Allowlist | RespondTo::StrictAllowlist => format!(
+                "respond_to={}({})",
+                self.respond_to,
+                self.respond_to_allowlist.len()
+            ),
             other => format!("respond_to={other}"),
         };
         let allowed_respond_to_detail = if self.allowed_respond_to.is_empty() {
@@ -2439,6 +2449,10 @@ channels = "ALL"
     fn test_respond_to_display() {
         assert_eq!(format!("{}", RespondTo::OwnerOnly), "owner-only");
         assert_eq!(format!("{}", RespondTo::Allowlist), "allowlist");
+        assert_eq!(
+            format!("{}", RespondTo::StrictAllowlist),
+            "strict-allowlist"
+        );
         assert_eq!(format!("{}", RespondTo::Anyone), "anyone");
         assert_eq!(format!("{}", RespondTo::Nobody), "nobody");
     }
@@ -2453,6 +2467,10 @@ channels = "ALL"
         assert_eq!(
             RespondTo::from_str("allowlist", true).unwrap(),
             RespondTo::Allowlist
+        );
+        assert_eq!(
+            RespondTo::from_str("strict-allowlist", true).unwrap(),
+            RespondTo::StrictAllowlist
         );
         assert_eq!(
             RespondTo::from_str("anyone", true).unwrap(),
@@ -2483,6 +2501,18 @@ channels = "ALL"
         assert!(
             s.contains("respond_to=allowlist(2)"),
             "should show allowlist count, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_summary_respond_to_strict_allowlist_shows_count() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.respond_to = RespondTo::StrictAllowlist;
+        config.respond_to_allowlist = HashSet::from(["ab".repeat(32), "cd".repeat(32)]);
+        let s = config.summary();
+        assert!(
+            s.contains("respond_to=strict-allowlist(2)"),
+            "should show strict allowlist count, got: {s}"
         );
     }
 
@@ -2644,7 +2674,7 @@ channels = "ALL"
             let mode = RespondTo::from_str(s.trim(), true).map_err(|_| {
                 ConfigError::ConfigFile(format!(
                     "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                     (valid values: owner-only, allowlist, anyone, nobody)"
+                     (valid values: owner-only, allowlist, strict-allowlist, anyone, nobody)"
                 ))
             })?;
             set.insert(mode);
@@ -2798,6 +2828,24 @@ channels = "ALL"
             result.is_ok(),
             "from_args should accept respond_to=owner-only when in allowed set: {result:?}"
         );
+    }
+
+    #[test]
+    fn strict_allowlist_full_path_requires_explicit_pubkeys() {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "strict-allowlist",
+            "--allowed-respond-to",
+            "strict-allowlist",
+        ])
+        .expect("clap should parse args");
+        let error = Config::from_args(args).expect_err("strict allowlist must require pubkeys");
+        assert!(error
+            .to_string()
+            .contains("--respond-to=strict-allowlist requires --respond-to-allowlist"));
     }
 
     #[test]

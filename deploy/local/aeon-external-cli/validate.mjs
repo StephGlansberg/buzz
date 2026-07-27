@@ -106,7 +106,8 @@ if (runtimeCheck) {
     buzzHelp.status !== 0 ||
     !buzzHelp.stdout.includes("--agent-publisher-credentials") ||
     !buzzHelp.stdout.includes("--no-agent-publisher-credentials") ||
-    !buzzHelp.stdout.includes("--session-cwd")
+    !buzzHelp.stdout.includes("--session-cwd") ||
+    !buzzHelp.stdout.includes("strict-allowlist")
   ) {
     throw new Error("shared buzz-acp does not advertise the required external worker contract");
   }

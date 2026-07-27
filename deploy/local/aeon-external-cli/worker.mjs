@@ -22,7 +22,7 @@ const REQUIRED_CLAUDE_CODE_SHA256 =
 const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
 const REQUIRED_SHARED_BUZZ_ACP_BINARY = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`;
 const REQUIRED_SHARED_BUZZ_ACP_SHA256 =
-  "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
+  "de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d";
 const REQUIRED_CLAUDE_NODE = {
   version: "v24.1.0",
   sha256: "59450bb6448c8a40b3f3b86da45c3babb2e0503e04c47e5a715e8e137389878b",
@@ -45,6 +45,15 @@ const REQUIRED_OFFICE_ROOMS = [
   "aspect_sapientis",
   "aspect_viatica",
   "aspect_voxis",
+];
+const REQUIRED_INBOUND_MEMBERS = [
+  "architect",
+  "nexus",
+  "mechanon",
+  "fontis",
+  "sapientis",
+  "viatica",
+  "voxis",
 ];
 export const REQUIRED_ROOM_NAMES = [...REQUIRED_SHARED_ROOMS, ...REQUIRED_OFFICE_ROOMS];
 const REQUIRED_CURSOR_ROOT = `/Users/architect/.local/share/cursor-agent/versions/${REQUIRED_CURSOR_CLI_VERSION}`;
@@ -454,12 +463,35 @@ export function validateManifest(manifest, identityMap) {
   }
 
   const inbound = manifest.buzz?.allowedInbound ?? [];
-  if (JSON.stringify(inbound) !== JSON.stringify(["architect", "nexus", "mechanon"])) {
-    errors.push("inbound allowlist must be exactly Architect, Nexus, and Mechanon");
+  if (JSON.stringify(inbound) !== JSON.stringify(REQUIRED_INBOUND_MEMBERS)) {
+    errors.push("inbound allowlist must be exactly Architect and the six canonical Aspects");
   }
   for (const memberId of inbound) {
     if (!HEX_64.test(memberPubkey(identityMap, memberId) ?? "")) {
       errors.push(`${memberId}: inbound identity is missing a valid pubkey`);
+    }
+  }
+  const authorityPrincipals = [
+    ...REQUIRED_INBOUND_MEMBERS,
+    ...Object.values(WORKER_CONTRACTS).map((workerContract) => workerContract.principal),
+  ];
+  const authorityPubkeys = authorityPrincipals.map((memberId) =>
+    memberPubkey(identityMap, memberId),
+  );
+  if (new Set(authorityPubkeys).size !== authorityPubkeys.length) {
+    errors.push("Architect, Aspect, and external CLI pubkeys must be unique");
+  }
+  for (const aspectId of REQUIRED_INBOUND_MEMBERS.filter(
+    (memberId) => memberId !== "architect",
+  )) {
+    const officeName = `aspect_${aspectId}`;
+    const officeMembers = identityMap.channels?.[officeName]?.members ?? [];
+    if (!officeMembers.includes(aspectId)) {
+      errors.push(`${officeName}: ${aspectId} is not a member`);
+    }
+    const conciliumMembers = identityMap.channels?.concilium?.members ?? [];
+    if (!conciliumMembers.includes(aspectId)) {
+      errors.push(`concilium: ${aspectId} is not a member`);
     }
   }
   if (manifest.buzz?.owner !== "architect") errors.push("Architect must own the worker");
@@ -644,9 +676,11 @@ export function validateManifest(manifest, identityMap) {
 
   const posture = manifest.posture;
   if (posture?.subscribe !== "config") errors.push("worker must use config subscriptions");
-  if (posture?.respondTo !== "allowlist") errors.push("worker must use inbound allowlist");
-  if (JSON.stringify(posture?.allowedRespondTo) !== JSON.stringify(["allowlist"])) {
-    errors.push("worker may only use allowlist response mode");
+  if (posture?.respondTo !== "strict-allowlist") {
+    errors.push("worker must use the strict inbound allowlist");
+  }
+  if (JSON.stringify(posture?.allowedRespondTo) !== JSON.stringify(["strict-allowlist"])) {
+    errors.push("worker may only use strict-allowlist response mode");
   }
   if (posture?.dedup !== "queue" || posture?.multipleEventHandling !== "queue") {
     errors.push("queue semantics must remain enabled");
@@ -707,11 +741,11 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     "--config",
     manifest.runtime.configPath,
     "--respond-to",
-    "allowlist",
+    manifest.posture.respondTo,
     "--respond-to-allowlist",
     allowlist.join(","),
     "--allowed-respond-to",
-    "allowlist",
+    manifest.posture.allowedRespondTo.join(","),
     "--dedup",
     "queue",
     "--multiple-event-handling",

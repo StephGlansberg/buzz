@@ -51,7 +51,7 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
 
 test("all external workers pin the same shared Data-volume buzz-acp release", () => {
   const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
-  const sha256 = "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
+  const sha256 = "de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d";
   assert.equal(manifest.runtime.buzzAcpBinary, binary);
   assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
   assert.equal(cursorManifest.runtime.buzzAcpBinary, binary);
@@ -408,16 +408,79 @@ test("Claude rendered command scrubs ambient API credentials from its child", ()
   assert.deepEqual(JSON.parse(probe.stdout), {});
 });
 
-test("renderer pins Architect, Nexus, and Mechanon inbound authority", () => {
-  const worker = renderWorker(manifest, identityMap);
-  const allowlist = worker.args[worker.args.indexOf("--respond-to-allowlist") + 1].split(",");
-  assert.deepEqual(allowlist, [
+test("renderer pins Architect and all six Aspects as inbound authority", () => {
+  const expectedAllowlist = [
     identityMap.members.nexus.pubkey_hex,
     identityMap.members.mechanon.pubkey_hex,
-  ]);
-  assert.equal(
-    worker.args[worker.args.indexOf("--agent-owner") + 1],
-    identityMap.members.architect.pubkey_hex,
+    identityMap.members.fontis.pubkey_hex,
+    identityMap.members.sapientis.pubkey_hex,
+    identityMap.members.viatica.pubkey_hex,
+    identityMap.members.voxis.pubkey_hex,
+  ];
+  for (const workerManifest of [manifest, claudeManifest, cursorManifest, grokManifest]) {
+    const worker = renderWorker(workerManifest, identityMap);
+    const allowlist = worker.args[worker.args.indexOf("--respond-to-allowlist") + 1].split(",");
+    assert.deepEqual(allowlist, expectedAllowlist);
+    assert.equal(
+      worker.args[worker.args.indexOf("--agent-owner") + 1],
+      identityMap.members.architect.pubkey_hex,
+    );
+    assert.equal(worker.args[worker.args.indexOf("--respond-to") + 1], "strict-allowlist");
+    assert.equal(
+      worker.args[worker.args.indexOf("--allowed-respond-to") + 1],
+      "strict-allowlist",
+    );
+    for (const externalSeat of ["codex_cli", "claude_code", "cursor_cli", "grok_cli"]) {
+      assert.equal(allowlist.includes(identityMap.members[externalSeat].pubkey_hex), false);
+    }
+  }
+});
+
+test("renderer rejects missing or external-seat inbound authority", () => {
+  const missingAspect = structuredClone(manifest);
+  missingAspect.buzz.allowedInbound = missingAspect.buzz.allowedInbound.filter(
+    (memberId) => memberId !== "voxis",
+  );
+  assert.throws(
+    () => renderWorker(missingAspect, identityMap),
+    /inbound allowlist must be exactly Architect and the six canonical Aspects/,
+  );
+
+  const externalSeat = structuredClone(manifest);
+  externalSeat.buzz.allowedInbound = [...externalSeat.buzz.allowedInbound, "cursor_cli"];
+  assert.throws(
+    () => renderWorker(externalSeat, identityMap),
+    /inbound allowlist must be exactly Architect and the six canonical Aspects/,
+  );
+});
+
+test("renderer rejects colliding authorities and Aspects absent from their offices", () => {
+  const collidingIdentityMap = structuredClone(identityMap);
+  collidingIdentityMap.members.fontis.pubkey_hex =
+    collidingIdentityMap.members.cursor_cli.pubkey_hex;
+  assert.throws(
+    () => renderWorker(manifest, collidingIdentityMap),
+    /Architect, Aspect, and external CLI pubkeys must be unique/,
+  );
+
+  const missingOfficeMember = structuredClone(identityMap);
+  missingOfficeMember.channels.aspect_fontis.members =
+    missingOfficeMember.channels.aspect_fontis.members.filter(
+      (memberId) => memberId !== "fontis",
+    );
+  assert.throws(
+    () => renderWorker(manifest, missingOfficeMember),
+    /aspect_fontis: fontis is not a member/,
+  );
+
+  const missingSharedRoomMember = structuredClone(identityMap);
+  missingSharedRoomMember.channels.concilium.members =
+    missingSharedRoomMember.channels.concilium.members.filter(
+      (memberId) => memberId !== "fontis",
+    );
+  assert.throws(
+    () => renderWorker(manifest, missingSharedRoomMember),
+    /concilium: fontis is not a member/,
   );
 });
 

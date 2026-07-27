@@ -9,9 +9,12 @@ owns transport, presence, typing, queueing, thread context, signed replies,
 observer events, `!cancel`, `!rotate`, and the managed Buzz CLI publisher. Each
 ACP adapter owns coding tools in the selected workspace.
 
-Each worker accepts mentioned messages from Architect, Nexus, or Mechanon in
-`#ops`, `#concilium`, and the configured Aspect offices. It starts one pinned
-ACP process.
+Each worker accepts mentioned messages from Architect or any of the six
+canonical Aspects in `#concilium` and their configured Aspect offices. The
+workers also observe `#ops`; its narrower operational membership remains
+unchanged.
+External CLI seats cannot direct each other. Each worker starts one pinned ACP
+process.
 
 The Codex worker starts `@agentclientprotocol/codex-acp@1.1.7` with
 `CODEX_HOME=/Users/architect/.codex` and
@@ -30,7 +33,7 @@ Both services reuse the canonical shared
 `/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp`;
 neither worker installs or maintains a private harness executable. Both
 manifests pin the release at SHA-256
-`107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53`.
+`de42675977d6f449d2cc3004d3127a776c32b66edf465475d972753e50b8983d`.
 The pinned harness supports
 `--session-cwd` and requires the explicit `--agent-publisher-credentials`
 grant, so the renderer cannot silently depend on legacy default forwarding.
@@ -67,7 +70,7 @@ The Cursor worker reuses the same renderer and starts the official
 `/Users/architect/.local/bin/cursor-agent` at exact version
 `2026.07.23-e383d2b` with native ACP arguments `--trust acp`. It uses the same
 rooms, bounded workspace selector, managed signer isolation, Data-volume
-supervisor cwd, explicit `--session-cwd`, Nexus and Mechanon inbound authority,
+supervisor cwd, explicit `--session-cwd`, canonical Aspect inbound authority,
 and `bypass-permissions` posture as the Claude worker. The manifest pins the
 resolved launcher SHA-256 and a deterministic closure SHA-256 over the complete
 installed Cursor version, excluding only its transient `.running` PID markers.
