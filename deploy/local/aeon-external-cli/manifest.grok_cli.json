@@ -3,10 +3,10 @@
   "enabled": false,
   "identityMap": "/Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json",
   "worker": {
-    "selector": "cursor_cli",
-    "principal": "cursor_cli",
-    "displayName": "Cursor CLI",
-    "label": "org.aeon.buzz-acp.cursor-cli",
+    "selector": "grok_cli",
+    "principal": "grok_cli",
+    "displayName": "Grok CLI",
+    "label": "org.aeon.buzz-acp.grok-cli",
     "agents": 1
   },
   "buzz": {
@@ -26,36 +26,38 @@
   "runtime": {
     "buzzAcpBinary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp",
     "buzzAcpSha256": "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53",
-    "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-cli.toml",
+    "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/grok-cli.toml",
     "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
-    "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/cursor-cli.sk",
+    "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/grok-cli.sk",
     "supervisorWorkingDirectory": "/Users/architect/Library/Application Support/AEON/aeon-v6",
-    "cursorAcp": {
-      "package": "cursor-agent",
-      "version": "2026.07.23-e383d2b",
-      "binary": "/Users/architect/.local/bin/cursor-agent",
-      "root": "/Users/architect/.local/share/cursor-agent/versions/2026.07.23-e383d2b",
-      "entrypointSha256": "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831",
-      "closureSha256": "400227a16df5e9f7bb4273f176cf68e41ef499f06fac5e6c9c6c3556ab2cc726",
-      "args": ["--trust", "acp"],
+    "grokAcp": {
+      "package": "grok-build",
+      "version": "0.2.93",
+      "build": "f00f96316d4b",
+      "binary": "/Users/architect/.grok/bin/grok",
+      "realBinary": "/Users/architect/.grok/downloads/grok-0.2.93-macos-aarch64",
+      "entrypointSha256": "2a97ba675bd992aa9b981e2e83776460d94f469b510c0b8efe28b50d236d767c",
+      "args": [
+        "agent",
+        "--model",
+        "grok-4.5",
+        "--reasoning-effort",
+        "high",
+        "--always-approve",
+        "stdio"
+      ],
       "auth": {
-        "mode": "existing-cursor-subscription",
-        "status": "authenticated",
-        "subscriptionTypes": ["Pro"]
+        "mode": "existing-grok-login",
+        "provider": "grok.com",
+        "authFile": "/Users/architect/.grok/auth.json"
       },
       "model": {
-        "requested": "cursor-grok-4.5-high",
-        "effective": "grok-4.5[effort=high,fast=true]",
-        "selectionStatus": "blocked_by_cursor_acp_catalog"
+        "requested": "grok-4.5-high",
+        "effective": "grok-4.5",
+        "reasoningEffort": "high"
       }
     },
-    "path": [
-      "/Users/architect/.local/bin",
-      "/usr/bin",
-      "/bin",
-      "/usr/sbin",
-      "/sbin"
-    ]
+    "path": ["/Users/architect/.grok/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
   },
   "workspaces": {
     "default": "aeon-v6",

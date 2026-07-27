@@ -25,6 +25,7 @@ import {
   renderWorker,
   validateAmbientAnthropicCredentials,
   validateAmbientCursorOverrides,
+  validateAmbientGrokOverrides,
   validateClaudeSubscriptionAuth,
   validateCursorSubscriptionAuth,
   validateManifest,
@@ -36,11 +37,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const manifest = loadJson(join(here, "manifest.json"));
 const claudeManifest = loadJson(join(here, "manifest.claude_cli.json"));
 const cursorManifest = loadJson(join(here, "manifest.cursor_cli.json"));
+const grokManifest = loadJson(join(here, "manifest.grok_cli.json"));
 const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
-const codexConfig = readFileSync(
-  join(here, "config", "codex_cli.toml"),
-  "utf8",
-);
+const codexConfig = readFileSync(join(here, "config", "codex_cli.toml"), "utf8");
 
 test("manifest binds external codex_cli identity without changing Aspect semantics", () => {
   const result = validateManifest(manifest, identityMap);
@@ -51,16 +50,16 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
 });
 
 test("all external workers pin the same shared Data-volume buzz-acp release", () => {
-  const binary =
-    "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
-  const sha256 =
-    "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
+  const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
+  const sha256 = "107bbe8ba44f14ac114ecc434f09a05dc6ed9aee3e15ca8ca3647d496e781c53";
   assert.equal(manifest.runtime.buzzAcpBinary, binary);
   assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
   assert.equal(cursorManifest.runtime.buzzAcpBinary, binary);
+  assert.equal(grokManifest.runtime.buzzAcpBinary, binary);
   assert.equal(manifest.runtime.buzzAcpSha256, sha256);
   assert.equal(claudeManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(cursorManifest.runtime.buzzAcpSha256, sha256);
+  assert.equal(grokManifest.runtime.buzzAcpSha256, sha256);
 });
 
 test("claude_cli selector binds the established external claude_code identity", () => {
@@ -91,13 +90,28 @@ test("cursor_cli selector binds the established external Cursor identity", () =>
   );
 });
 
+test("grok_cli selector binds a distinct external Grok identity", () => {
+  const result = validateManifest(grokManifest, identityMap);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.ok, true);
+  assert.equal(grokManifest.worker.selector, "grok_cli");
+  assert.equal(grokManifest.worker.principal, "grok_cli");
+  assert.equal(identityMap.members.grok_cli.gateway_agent_id, null);
+  assert.equal(identityMap.members.grok_cli.aspect_slug, null);
+  assert.notEqual(
+    identityMap.members.grok_cli.pubkey_hex,
+    identityMap.members.codex_cli.pubkey_hex,
+  );
+  assert.notEqual(
+    identityMap.members.grok_cli.pubkey_hex,
+    identityMap.members.cursor_cli.pubkey_hex,
+  );
+});
+
 test("Codex launch argv binds publisher credentials, identity, and all eight rooms", () => {
   const worker = renderWorker(manifest, identityMap);
   assert.equal(worker.args.includes("--no-agent-publisher-credentials"), false);
-  assert.equal(
-    worker.args.filter((arg) => arg === "--agent-publisher-credentials").length,
-    1,
-  );
+  assert.equal(worker.args.filter((arg) => arg === "--agent-publisher-credentials").length, 1);
   assert.equal(worker.args.includes("--private-key"), false);
   assert.equal(worker.args.includes("--private-key-file"), true);
   assert.equal(worker.args.includes("--relay-observer"), true);
@@ -109,14 +123,8 @@ test("Codex launch argv binds publisher credentials, identity, and all eight roo
     worker.args[worker.args.indexOf("--expected-public-key") + 1],
     identityMap.members.codex_cli.pubkey_hex,
   );
-  assert.equal(
-    worker.args[worker.args.indexOf("--subscribe") + 1],
-    manifest.posture.subscribe,
-  );
-  assert.equal(
-    worker.args[worker.args.indexOf("--config") + 1],
-    manifest.runtime.configPath,
-  );
+  assert.equal(worker.args[worker.args.indexOf("--subscribe") + 1], manifest.posture.subscribe);
+  assert.equal(worker.args[worker.args.indexOf("--config") + 1], manifest.runtime.configPath);
   assert.deepEqual(
     worker.subscriptionRoomIds,
     [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
@@ -134,28 +142,14 @@ test("subscription validator requires the exact source-projected room set", () =
     [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms],
     REQUIRED_ROOM_NAMES,
   );
-  const result = validateSubscriptionProjection(
-    codexConfig,
-    manifest,
-    identityMap,
-  );
+  const result = validateSubscriptionProjection(codexConfig, manifest, identityMap);
   assert.equal(result.ok, true);
   assert.deepEqual(result.errors, []);
-  assert.deepEqual(
-    result.roomIds,
-    renderWorker(manifest, identityMap).subscriptionRoomIds,
-  );
+  assert.deepEqual(result.roomIds, renderWorker(manifest, identityMap).subscriptionRoomIds);
 
-  const duplicateRoom = codexConfig.replace(
-    result.roomIds.at(-1),
-    result.roomIds[0],
-  );
+  const duplicateRoom = codexConfig.replace(result.roomIds.at(-1), result.roomIds[0]);
   assert.match(
-    validateSubscriptionProjection(
-      duplicateRoom,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(duplicateRoom, manifest, identityMap).errors.join("\n"),
     /exactly the eight canonical rooms/,
   );
 
@@ -164,27 +158,19 @@ test("subscription validator requires the exact source-projected room set", () =
     "ffffffff-ffff-4fff-8fff-ffffffffffff",
   );
   assert.match(
-    validateSubscriptionProjection(
-      extraRoom,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(extraRoom, manifest, identityMap).errors.join("\n"),
     /exactly the eight canonical rooms/,
   );
 
-  const channelBlocks = [
-    ...codexConfig.matchAll(/^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/gm),
-  ].map((match) => match[0]);
+  const channelBlocks = [...codexConfig.matchAll(/^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/gm)].map(
+    (match) => match[0],
+  );
   const swappedArrays = codexConfig
     .replace(channelBlocks[0], "__FIRST_CHANNEL_ARRAY__")
     .replace(channelBlocks[1], channelBlocks[0])
     .replace("__FIRST_CHANNEL_ARRAY__", channelBlocks[1]);
   assert.match(
-    validateSubscriptionProjection(
-      swappedArrays,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(swappedArrays, manifest, identityMap).errors.join("\n"),
     /exactly the eight canonical rooms/,
   );
 
@@ -202,40 +188,23 @@ kinds = [9]
 require_mention = false
 `;
   assert.match(
-    validateSubscriptionProjection(
-      extraRule,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(extraRule, manifest, identityMap).errors.join("\n"),
     /exactly two rules/,
   );
 
   const misplacedMention = `require_mention = true
 ${codexConfig.replace("require_mention = true", "")}`;
   assert.match(
-    validateSubscriptionProjection(
-      misplacedMention,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(misplacedMention, manifest, identityMap).errors.join("\n"),
     /each subscription rule must require a mention/,
   );
 
-  const firstChannels = codexConfig.match(
-    /^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/m,
-  )[0];
+  const firstChannels = codexConfig.match(/^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/m)[0];
   const misplacedTableFields = codexConfig
     .replace(firstChannels, "")
-    .replace(
-      "require_mention = true",
-      `[other]\n${firstChannels}\nrequire_mention = true`,
-    );
+    .replace("require_mention = true", `[other]\n${firstChannels}\nrequire_mention = true`);
   assert.match(
-    validateSubscriptionProjection(
-      misplacedTableFields,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(misplacedTableFields, manifest, identityMap).errors.join("\n"),
     /each subscription rule must contain exactly one channel array/,
   );
 
@@ -244,11 +213,7 @@ ${codexConfig.replace("require_mention = true", "")}`;
     "[other] # valid trailing comment\nrequire_mention = true",
   );
   assert.match(
-    validateSubscriptionProjection(
-      commentedTableBoundary,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(commentedTableBoundary, manifest, identityMap).errors.join("\n"),
     /each subscription rule must require a mention/,
   );
 
@@ -256,11 +221,7 @@ ${codexConfig.replace("require_mention = true", "")}`;
     .replace(firstChannels, `channels = "all"\nignored = """\n${firstChannels}`)
     .replace("require_mention = true", 'require_mention = true\n"""');
   assert.match(
-    validateSubscriptionProjection(
-      multilineBypass,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(multilineBypass, manifest, identityMap).errors.join("\n"),
     /must not contain multiline strings/,
   );
 
@@ -269,41 +230,25 @@ ${codexConfig.replace("require_mention = true", "")}`;
     'name = "aeon-shared-control"',
   );
   assert.match(
-    validateSubscriptionProjection(
-      duplicateName,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(duplicateName, manifest, identityMap).errors.join("\n"),
     /canonical shared-control and Aspect-office rules/,
   );
 
   const malformedHeader = codexConfig.replace("[[rules]]", "[[rules]]garbage");
   assert.match(
-    validateSubscriptionProjection(
-      malformedHeader,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(malformedHeader, manifest, identityMap).errors.join("\n"),
     /exactly two rules/,
   );
 
   const unknownPreamble = `unexpected = true\n${codexConfig}`;
   assert.match(
-    validateSubscriptionProjection(
-      unknownPreamble,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(unknownPreamble, manifest, identityMap).errors.join("\n"),
     /must not contain content outside the two canonical rules/,
   );
 
   const unknownTable = `${codexConfig}\n[unexpected]\nvalue = true\n`;
   assert.match(
-    validateSubscriptionProjection(
-      unknownTable,
-      manifest,
-      identityMap,
-    ).errors.join("\n"),
+    validateSubscriptionProjection(unknownTable, manifest, identityMap).errors.join("\n"),
     /must not contain content outside the two canonical rules/,
   );
 });
@@ -314,10 +259,7 @@ test("renderer pins one full-access codex-acp subprocess", () => {
   assert.equal(worker.environment.INITIAL_AGENT_MODE, "agent-full-access");
   assert.equal(worker.environment.CODEX_HOME, "/Users/architect/.codex");
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
-  assert.equal(
-    worker.args[worker.args.indexOf("--permission-mode") + 1],
-    "default",
-  );
+  assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "default");
   assert.equal(
     worker.args[worker.args.indexOf("--agent-command") + 1],
     manifest.runtime.codexAcp.binary,
@@ -341,10 +283,7 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
     "/Users/architect/Library/Application Support/AEON/aeon-v6/claude-acp/0.62.0/node_modules/.bin/claude-agent-acp",
   );
   assert.equal(worker.args[worker.args.indexOf("--agents") + 1], "1");
-  assert.equal(
-    worker.args[worker.args.indexOf("--permission-mode") + 1],
-    "bypass-permissions",
-  );
+  assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(
     worker.args[worker.args.indexOf("--agent-command") + 1],
     claudeManifest.runtime.claudeAcp.binary,
@@ -353,10 +292,7 @@ test("renderer pins one Claude ACP subprocess and installed Claude Code", () => 
     worker.signerFile,
     "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk",
   );
-  assert.equal(
-    worker.expectedPublicKey,
-    identityMap.members.claude_code.pubkey_hex,
-  );
+  assert.equal(worker.expectedPublicKey, identityMap.members.claude_code.pubkey_hex);
   assert.equal(
     worker.environment.CLAUDE_CODE_EXECUTABLE,
     "/Users/architect/.local/share/claude/versions/2.1.220",
@@ -388,44 +324,48 @@ test("renderer pins one native Cursor ACP subprocess with truthful fast-only mod
     "CURSOR_API_ENDPOINT",
     cursorManifest.runtime.buzzAcpBinary,
   ]);
-  assert.equal(
-    worker.args[worker.args.indexOf("--agent-command") + 1],
-    adapter.binary,
-  );
+  assert.equal(worker.args[worker.args.indexOf("--agent-command") + 1], adapter.binary);
   assert.deepEqual(
-    worker.args.flatMap((value, index) =>
-      value === "--agent-args" ? [worker.args[index + 1]] : [],
-    ),
-    ["--trust", "acp"],
+    worker.args.filter((value) => value.startsWith("--agent-args=")),
+    [`--agent-args=${adapter.args.join(",")}`],
   );
-  assert.equal(
-    worker.args[worker.args.indexOf("--model") + 1],
-    adapter.model.effective,
-  );
+  assert.equal(worker.args.includes("--agent-args"), false);
+  assert.equal(worker.args[worker.args.indexOf("--model") + 1], adapter.model.effective);
   assert.equal(adapter.model.requested, "cursor-grok-4.5-high");
   assert.equal(adapter.model.selectionStatus, "blocked_by_cursor_acp_catalog");
   assert.equal(
     worker.args[worker.args.indexOf("--session-cwd") + 1],
     "/Volumes/AEON/Projects/aeon-v6",
   );
-  assert.equal(
-    worker.args[worker.args.indexOf("--permission-mode") + 1],
-    "bypass-permissions",
-  );
+  assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.environment.CURSOR_API_KEY, undefined);
   assert.equal(worker.environment.CURSOR_API_ENDPOINT, undefined);
   assert.equal(worker.signerFile, cursorManifest.runtime.signerPath);
+  assert.equal(worker.expectedPublicKey, identityMap.members.cursor_cli.pubkey_hex);
+});
+
+test("renderer pins one native Grok ACP subprocess with full coding authority", () => {
+  const worker = renderWorker(grokManifest, identityMap);
+  assert.equal(worker.command, "/usr/bin/env");
+  assert.equal(worker.sessionCwd, "/Volumes/AEON/Projects/aeon-v6");
+  assert.equal(worker.environment.HOME, "/Users/architect");
+  assert.equal(worker.environment.PATH.startsWith("/Users/architect/.grok/bin:"), true);
   assert.equal(
-    worker.expectedPublicKey,
-    identityMap.members.cursor_cli.pubkey_hex,
+    worker.args[worker.args.indexOf("--agent-args") + 1],
+    grokManifest.runtime.grokAcp.args.join(","),
+  );
+  assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
+  assert.equal(worker.args.filter((arg) => arg === "--agent-publisher-credentials").length, 1);
+  assert.equal(worker.expectedPublicKey, identityMap.members.grok_cli.pubkey_hex);
+  assert.deepEqual(
+    worker.subscriptionRoomIds,
+    renderWorker(manifest, identityMap).subscriptionRoomIds,
   );
 });
 
 test("Claude rendered command scrubs ambient API credentials from its child", () => {
   const worker = renderWorker(claudeManifest, identityMap);
-  const buzzBinaryIndex = worker.args.indexOf(
-    claudeManifest.runtime.buzzAcpBinary,
-  );
+  const buzzBinaryIndex = worker.args.indexOf(claudeManifest.runtime.buzzAcpBinary);
   const probe = spawnSync(
     worker.command,
     [
@@ -449,8 +389,7 @@ test("Claude rendered command scrubs ambient API credentials from its child", ()
 
 test("renderer pins Architect, Nexus, and Mechanon inbound authority", () => {
   const worker = renderWorker(manifest, identityMap);
-  const allowlist =
-    worker.args[worker.args.indexOf("--respond-to-allowlist") + 1].split(",");
+  const allowlist = worker.args[worker.args.indexOf("--respond-to-allowlist") + 1].split(",");
   assert.deepEqual(allowlist, [
     identityMap.members.nexus.pubkey_hex,
     identityMap.members.mechanon.pubkey_hex,
@@ -466,10 +405,7 @@ test("workspace selection is bounded to the manifest allowlist", () => {
   assert.equal(codexWorker.workingDirectory, "/Volumes/AEON/Projects/buzz");
   assert.equal(codexWorker.sessionCwd, "/Volumes/AEON/Projects/buzz");
   assert.equal(codexWorker.args.includes("--session-cwd"), false);
-  assert.throws(
-    () => renderWorker(manifest, identityMap, "/tmp/escape"),
-    /not allowed/,
-  );
+  assert.throws(() => renderWorker(manifest, identityMap, "/tmp/escape"), /not allowed/);
   const claudeWorker = renderWorker(claudeManifest, identityMap, "codex");
   assert.equal(
     claudeWorker.workingDirectory,
@@ -488,10 +424,7 @@ test("launchd artifact remains inert and secret-free", () => {
   assert.equal(artifact.keepAlive, false);
   assert.match(artifact.plist, /<key>RunAtLoad<\/key><false\/>/);
   assert.match(artifact.plist, /<key>KeepAlive<\/key><false\/>/);
-  assert.match(
-    artifact.plist,
-    /INITIAL_AGENT_MODE<\/key><string>agent-full-access/,
-  );
+  assert.match(artifact.plist, /INITIAL_AGENT_MODE<\/key><string>agent-full-access/);
   assert.doesNotMatch(artifact.plist, /BUZZ_PRIVATE_KEY|nsec1/);
   assert.deepEqual(artifact.requiredDirectories, [
     "/Volumes/AEON/runtime/buzz/external-cli/codex_cli/config",
@@ -505,14 +438,8 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   assert.equal(artifact.runAtLoad, false);
   assert.equal(artifact.keepAlive, false);
   assert.match(artifact.plist, /CLAUDE_CODE_EXECUTABLE/);
-  assert.match(
-    artifact.plist,
-    /<string>-u<\/string>\s+<string>ANTHROPIC_API_KEY<\/string>/,
-  );
-  assert.match(
-    artifact.plist,
-    /<string>-u<\/string>\s+<string>ANTHROPIC_AUTH_TOKEN<\/string>/,
-  );
+  assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_API_KEY<\/string>/);
+  assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_AUTH_TOKEN<\/string>/);
   assert.doesNotMatch(
     artifact.plist,
     /<key>ANTHROPIC_API_KEY|<key>ANTHROPIC_AUTH_TOKEN|CLAUDE_CONFIG_DIR|nsec1|sk-ant-/,
@@ -529,10 +456,7 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
     /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/bin\/buzz-acp/,
   );
   assert.doesNotMatch(artifact.plist, /buzz-acp-claude-cli/);
-  assert.doesNotMatch(
-    artifact.plist,
-    /\/Volumes\/AEON\/runtime\/buzz\/external-cli\/claude_cli/,
-  );
+  assert.doesNotMatch(artifact.plist, /\/Volumes\/AEON\/runtime\/buzz\/external-cli\/claude_cli/);
   assert.match(
     artifact.plist,
     /\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/secrets\/claude-code\.sk/,
@@ -541,10 +465,7 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
     artifact.plist,
     /<key>WorkingDirectory<\/key><string>\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6<\/string>/,
   );
-  assert.match(
-    artifact.plist,
-    /\/Users\/architect\/\.nvm\/versions\/node\/v24\.1\.0\/bin/,
-  );
+  assert.match(artifact.plist, /\/Users\/architect\/\.nvm\/versions\/node\/v24\.1\.0\/bin/);
   assert.match(
     artifact.plist,
     /<string>--session-cwd<\/string>\s+<string>\/Volumes\/AEON\/Projects\/aeon-v6<\/string>/,
@@ -561,25 +482,13 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
   assert.equal(artifact.label, "org.aeon.buzz-acp.cursor-cli");
   assert.equal(artifact.runAtLoad, false);
   assert.equal(artifact.keepAlive, false);
-  assert.match(
-    artifact.plist,
-    /<string>-u<\/string>\s+<string>CURSOR_API_KEY<\/string>/,
-  );
-  assert.match(
-    artifact.plist,
-    /<string>-u<\/string>\s+<string>CURSOR_API_ENDPOINT<\/string>/,
-  );
-  assert.doesNotMatch(
-    artifact.plist,
-    /<key>CURSOR_API_KEY|<key>CURSOR_API_ENDPOINT|nsec1/,
-  );
+  assert.match(artifact.plist, /<string>-u<\/string>\s+<string>CURSOR_API_KEY<\/string>/);
+  assert.match(artifact.plist, /<string>-u<\/string>\s+<string>CURSOR_API_ENDPOINT<\/string>/);
+  assert.doesNotMatch(artifact.plist, /<key>CURSOR_API_KEY|<key>CURSOR_API_ENDPOINT|nsec1/);
   assert.match(artifact.plist, /<string>--model<\/string>/);
   assert.match(artifact.plist, /grok-4\.5\[effort=high,fast=true\]/);
   assert.match(artifact.plist, /<string>--session-cwd<\/string>/);
-  assert.match(
-    artifact.plist,
-    /\/Users\/architect\/\.local\/bin\/cursor-agent/,
-  );
+  assert.match(artifact.plist, /\/Users\/architect\/\.local\/bin\/cursor-agent/);
   assert.deepEqual(artifact.requiredDirectories, [
     "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
@@ -589,6 +498,21 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
   ]);
 });
 
+test("Grok launchd artifact is separate, inert, and scrubs auth overrides", () => {
+  const artifact = renderDisabledLaunchAgent(grokManifest, identityMap);
+  assert.equal(artifact.label, "org.aeon.buzz-acp.grok-cli");
+  assert.equal(artifact.runAtLoad, false);
+  assert.equal(artifact.keepAlive, false);
+  for (const name of ["XAI_API_KEY", "GROK_AUTH", "GROK_HOME", "XAI_API_BASE_URL"]) {
+    assert.match(artifact.plist, new RegExp(`<string>-u<\\/string>\\s+<string>${name}<\\/string>`));
+  }
+  assert.doesNotMatch(artifact.plist, /<key>XAI_API_KEY|<key>GROK_AUTH|<key>GROK_HOME|nsec1/);
+  assert.match(
+    artifact.plist,
+    /<string>agent,--model,grok-4\.5,--reasoning-effort,high,--always-approve,stdio<\/string>/,
+  );
+});
+
 test("Claude and Cursor/Grok launch projections retain their current behavior", () => {
   const claude = renderWorker(claudeManifest, identityMap);
   assert.deepEqual(
@@ -596,9 +520,8 @@ test("Claude and Cursor/Grok launch projections retain their current behavior", 
       command: claude.command,
       principal: claude.expectedPublicKey,
       permissionMode: claude.args[claude.args.indexOf("--permission-mode") + 1],
-      publisherFlagCount: claude.args.filter(
-        (arg) => arg === "--agent-publisher-credentials",
-      ).length,
+      publisherFlagCount: claude.args.filter((arg) => arg === "--agent-publisher-credentials")
+        .length,
       rooms: claude.subscriptionRoomIds,
     },
     {
@@ -617,9 +540,8 @@ test("Claude and Cursor/Grok launch projections retain their current behavior", 
       principal: cursor.expectedPublicKey,
       model: cursor.args[cursor.args.indexOf("--model") + 1],
       permissionMode: cursor.args[cursor.args.indexOf("--permission-mode") + 1],
-      publisherFlagCount: cursor.args.filter(
-        (arg) => arg === "--agent-publisher-credentials",
-      ).length,
+      publisherFlagCount: cursor.args.filter((arg) => arg === "--agent-publisher-credentials")
+        .length,
       rooms: cursor.subscriptionRoomIds,
     },
     {
@@ -760,20 +682,50 @@ test("Cursor contract rejects identity, runtime, auth, and model drift", () => {
     (value) => (value.runtime.cursorAcp.closureSha256 = "0".repeat(64)),
     (value) => (value.runtime.cursorAcp.args = ["acp"]),
     (value) => (value.runtime.cursorAcp.auth.subscriptionTypes = ["Free"]),
-    (value) =>
-      (value.runtime.cursorAcp.model.requested = "cursor-grok-4.5-high-fast"),
-    (value) =>
-      (value.runtime.cursorAcp.model.effective = "cursor-grok-4.5-high"),
-    (value) =>
-      (value.runtime.signerPath = identityMap.members.cursor_cli.secret_ref),
+    (value) => (value.runtime.cursorAcp.model.requested = "cursor-grok-4.5-high-fast"),
+    (value) => (value.runtime.cursorAcp.model.effective = "cursor-grok-4.5-high"),
+    (value) => (value.runtime.signerPath = identityMap.members.cursor_cli.secret_ref),
   ]) {
     const drift = structuredClone(cursorManifest);
     mutate(drift);
-    assert.match(
-      validateManifest(drift, identityMap).errors.join("\n"),
-      /Cursor/,
-    );
+    assert.match(validateManifest(drift, identityMap).errors.join("\n"), /Cursor/);
   }
+});
+
+test("Grok contract rejects identity, runtime, auth, and model drift", () => {
+  const missingIdentity = structuredClone(identityMap);
+  delete missingIdentity.members.grok_cli;
+  assert.match(
+    validateManifest(grokManifest, missingIdentity).errors.join("\n"),
+    /identity map is missing grok_cli/,
+  );
+
+  for (const mutate of [
+    (value) => (value.runtime.grokAcp.version = "future"),
+    (value) => (value.runtime.grokAcp.entrypointSha256 = "0".repeat(64)),
+    (value) => (value.runtime.grokAcp.args = ["agent", "stdio"]),
+    (value) => (value.runtime.grokAcp.auth.provider = "api-key"),
+    (value) => (value.runtime.grokAcp.model.effective = "grok-4-fast"),
+    (value) => (value.runtime.signerPath = identityMap.members.grok_cli.secret_ref),
+  ]) {
+    const drift = structuredClone(grokManifest);
+    mutate(drift);
+    assert.match(validateManifest(drift, identityMap).errors.join("\n"), /Grok/);
+  }
+});
+
+test("Grok worker rejects ambient API and auth overrides", () => {
+  const clean = validateAmbientGrokOverrides({});
+  assert.equal(clean.ok, true);
+  const dirty = validateAmbientGrokOverrides({
+    XAI_API_KEY: "sentinel",
+    GROK_HOME: "/tmp/other",
+  });
+  assert.equal(dirty.ok, false);
+  assert.deepEqual(dirty.errors, [
+    "XAI_API_KEY must be absent for Grok subscription authentication",
+    "GROK_HOME must be absent for Grok subscription authentication",
+  ]);
 });
 
 test("Codex rejects shared harness path and digest drift without changing its cwd contract", () => {
@@ -849,10 +801,7 @@ test("Claude runtime auth requires the pinned subscription provider and type", (
     errors: [],
   });
 
-  const wrongMethod = validateClaudeSubscriptionAuth(
-    { ...valid, authMethod: "apiKey" },
-    contract,
-  );
+  const wrongMethod = validateClaudeSubscriptionAuth({ ...valid, authMethod: "apiKey" }, contract);
   assert.equal(wrongMethod.ok, false);
   assert.match(wrongMethod.errors.join("\n"), /auth method/);
 
@@ -892,10 +841,10 @@ test("Cursor runtime requires the pinned subscription without exposing account d
   const contract = cursorManifest.runtime.cursorAcp.auth;
   const validStatus = { status: "authenticated", isAuthenticated: true };
   const validAbout = { subscriptionTier: "Pro" };
-  assert.deepEqual(
-    validateCursorSubscriptionAuth(validStatus, validAbout, contract),
-    { ok: true, errors: [] },
-  );
+  assert.deepEqual(validateCursorSubscriptionAuth(validStatus, validAbout, contract), {
+    ok: true,
+    errors: [],
+  });
   assert.match(
     validateCursorSubscriptionAuth(
       { ...validStatus, isAuthenticated: false },
@@ -905,11 +854,9 @@ test("Cursor runtime requires the pinned subscription without exposing account d
     /unavailable/,
   );
   assert.match(
-    validateCursorSubscriptionAuth(
-      validStatus,
-      { subscriptionTier: "Free" },
-      contract,
-    ).errors.join("\n"),
+    validateCursorSubscriptionAuth(validStatus, { subscriptionTier: "Free" }, contract).errors.join(
+      "\n",
+    ),
     /subscription type/,
   );
 });
@@ -937,9 +884,7 @@ test("Claude Node validation rejects mode, symlink, hash, and version drift", ()
     const binary = join(root, "node");
     writeFileSync(binary, "#!/bin/sh\nprintf 'v-test\\n'\n");
     chmodSync(binary, 0o500);
-    const sha256 = createHash("sha256")
-      .update("#!/bin/sh\nprintf 'v-test\\n'\n")
-      .digest("hex");
+    const sha256 = createHash("sha256").update("#!/bin/sh\nprintf 'v-test\\n'\n").digest("hex");
     const pin = { binary, mode: "0500", sha256, version: "v-test" };
     assert.deepEqual(validatePinnedNodeRuntime(pin, process.env), {
       ok: true,
@@ -956,30 +901,21 @@ test("Claude Node validation rejects mode, symlink, hash, and version drift", ()
     chmodSync(binary, 0o700);
     writeFileSync(binary, `#!/bin/sh\ntouch '${marker}'\nprintf 'v-test\\n'\n`);
     chmodSync(binary, 0o500);
-    const badHash = validatePinnedNodeRuntime(
-      { ...pin, sha256: "0".repeat(64) },
-      process.env,
-    );
+    const badHash = validatePinnedNodeRuntime({ ...pin, sha256: "0".repeat(64) }, process.env);
     assert.match(badHash.errors.join("\n"), /SHA-256/);
     assert.equal(existsSync(marker), false);
     chmodSync(binary, 0o700);
     writeFileSync(binary, "#!/bin/sh\nprintf 'v-test\\n'\n");
     chmodSync(binary, 0o500);
     assert.match(
-      validatePinnedNodeRuntime(
-        { ...pin, version: "v-wrong" },
-        process.env,
-      ).errors.join("\n"),
+      validatePinnedNodeRuntime({ ...pin, version: "v-wrong" }, process.env).errors.join("\n"),
       /version/,
     );
 
     const link = join(root, "node-link");
     symlinkSync(binary, link);
     assert.match(
-      validatePinnedNodeRuntime(
-        { ...pin, binary: link },
-        process.env,
-      ).errors.join("\n"),
+      validatePinnedNodeRuntime({ ...pin, binary: link }, process.env).errors.join("\n"),
       /non-symlink/,
     );
   } finally {

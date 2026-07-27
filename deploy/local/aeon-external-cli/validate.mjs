@@ -11,6 +11,7 @@ import {
   renderDisabledLaunchAgent,
   validateAmbientAnthropicCredentials,
   validateAmbientCursorOverrides,
+  validateAmbientGrokOverrides,
   validateClaudeSubscriptionAuth,
   validateCursorSubscriptionAuth,
   validateManifest,
@@ -28,15 +29,13 @@ const optionValues = new Set([option("--worker")].filter(Boolean));
 const positional = process.argv
   .slice(2)
   .filter((arg) => !arg.startsWith("--") && !optionValues.has(arg));
-const identityPath =
-  positional[0] ?? join(here, "fixtures", "identity-map.json");
+const identityPath = positional[0] ?? join(here, "fixtures", "identity-map.json");
 const worker = option("--worker") ?? "codex_cli";
-if (!["codex_cli", "claude_cli", "cursor_cli"].includes(worker)) {
+if (!["codex_cli", "claude_cli", "cursor_cli", "grok_cli"].includes(worker)) {
   console.error(`unsupported external CLI worker: ${worker}`);
   process.exit(1);
 }
-const manifestName =
-  worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
+const manifestName = worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
 const manifest = loadJson(join(here, manifestName));
 const identityMap = loadJson(identityPath);
 const validation = validateManifest(manifest, identityMap);
@@ -46,25 +45,15 @@ if (!validation.ok) {
 }
 
 const selector = manifest.worker.selector ?? manifest.worker.principal;
-const configText = fs.readFileSync(
-  join(here, "config", `${selector}.toml`),
-  "utf8",
-);
-const subscriptionValidation = validateSubscriptionProjection(
-  configText,
-  manifest,
-  identityMap,
-);
+const configText = fs.readFileSync(join(here, "config", `${selector}.toml`), "utf8");
+const subscriptionValidation = validateSubscriptionProjection(configText, manifest, identityMap);
 if (!subscriptionValidation.ok) {
   console.error(subscriptionValidation.errors.join("\n"));
   process.exit(1);
 }
 
 const artifact = renderDisabledLaunchAgent(manifest, identityMap);
-if (
-  artifact.plist.includes("BUZZ_PRIVATE_KEY") ||
-  artifact.plist.includes("nsec1")
-) {
+if (artifact.plist.includes("BUZZ_PRIVATE_KEY") || artifact.plist.includes("nsec1")) {
   console.error("rendered artifact contains signer material");
   process.exit(1);
 }
@@ -81,16 +70,12 @@ if (!artifact.args.includes("--agent-publisher-credentials")) {
   process.exit(1);
 }
 if (
-  artifact.args.filter((arg) => arg === "--agent-publisher-credentials")
-    .length !== 1 ||
-  artifact.args[artifact.args.indexOf("--subscribe") + 1] !==
-    manifest.posture.subscribe ||
-  artifact.args[artifact.args.indexOf("--config") + 1] !==
-    manifest.runtime.configPath ||
+  artifact.args.filter((arg) => arg === "--agent-publisher-credentials").length !== 1 ||
+  artifact.args[artifact.args.indexOf("--subscribe") + 1] !== manifest.posture.subscribe ||
+  artifact.args[artifact.args.indexOf("--config") + 1] !== manifest.runtime.configPath ||
   artifact.args[artifact.args.indexOf("--expected-public-key") + 1] !==
     identityMap.members[manifest.worker.principal].pubkey_hex ||
-  artifact.subscriptionRoomIds.join("\n") !==
-    subscriptionValidation.roomIds.join("\n")
+  artifact.subscriptionRoomIds.join("\n") !== subscriptionValidation.roomIds.join("\n")
 ) {
   console.error("rendered launch argv does not match the source projection");
   process.exit(1);
@@ -103,7 +88,9 @@ if (runtimeCheck) {
       ? manifest.runtime.codexAcp
       : selector === "claude_cli"
         ? manifest.runtime.claudeAcp
-        : manifest.runtime.cursorAcp;
+        : selector === "cursor_cli"
+          ? manifest.runtime.cursorAcp
+          : manifest.runtime.grokAcp;
   fs.accessSync(manifest.runtime.buzzAcpBinary, fs.constants.X_OK);
   const buzzSha256 = createHash("sha256")
     .update(fs.readFileSync(manifest.runtime.buzzAcpBinary))
@@ -121,9 +108,7 @@ if (runtimeCheck) {
     !buzzHelp.stdout.includes("--no-agent-publisher-credentials") ||
     !buzzHelp.stdout.includes("--session-cwd")
   ) {
-    throw new Error(
-      "shared buzz-acp does not advertise the required external worker contract",
-    );
+    throw new Error("shared buzz-acp does not advertise the required external worker contract");
   }
   fs.accessSync(adapter.binary, fs.constants.X_OK);
   for (const directory of artifact.requiredDirectories) {
@@ -132,10 +117,7 @@ if (runtimeCheck) {
     }
   }
   if (selector === "claude_cli") {
-    const nodeValidation = validatePinnedNodeRuntime(
-      manifest.runtime.node,
-      artifact.environment,
-    );
+    const nodeValidation = validatePinnedNodeRuntime(manifest.runtime.node, artifact.environment);
     if (!nodeValidation.ok) throw new Error(nodeValidation.errors.join("\n"));
   } else if (selector === "codex_cli") {
     const nodeBinary = manifest.runtime.path
@@ -149,9 +131,7 @@ if (runtimeCheck) {
         }
       });
     if (!nodeBinary) {
-      throw new Error(
-        "rendered PATH does not contain an executable Node runtime",
-      );
+      throw new Error("rendered PATH does not contain an executable Node runtime");
     }
   }
   const adapterEntrypoint = fs.realpathSync(adapter.binary);
@@ -183,9 +163,7 @@ if (runtimeCheck) {
       signerProbe.status === 0 ||
       !signerProbe.stderr.includes("heartbeat interval must be 0 (disabled)")
     ) {
-      throw new Error(
-        `shared buzz-acp signer validation failed: ${signerProbe.stderr.trim()}`,
-      );
+      throw new Error(`shared buzz-acp signer validation failed: ${signerProbe.stderr.trim()}`);
     }
   }
   if (selector === "codex_cli") {
@@ -195,9 +173,7 @@ if (runtimeCheck) {
       env: artifact.environment,
     });
     if (adapterVersion.status !== 0) {
-      throw new Error(
-        `codex-acp --version failed: ${adapterVersion.stderr.trim()}`,
-      );
+      throw new Error(`codex-acp --version failed: ${adapterVersion.stderr.trim()}`);
     }
     if (!adapterVersion.stdout.includes(` ${adapter.version}`)) {
       throw new Error(`codex-acp version does not match ${adapter.version}`);
@@ -205,39 +181,25 @@ if (runtimeCheck) {
   } else if (selector === "claude_cli") {
     const packageRoot = dirname(dirname(adapterEntrypoint));
     const packageJson = loadJson(join(packageRoot, "package.json"));
-    if (
-      packageJson.name !== adapter.package ||
-      packageJson.version !== adapter.version
-    ) {
-      throw new Error(
-        "claude-agent-acp package metadata does not match the manifest pin",
-      );
+    if (packageJson.name !== adapter.package || packageJson.version !== adapter.version) {
+      throw new Error("claude-agent-acp package metadata does not match the manifest pin");
     }
     if (hashPackageClosure(adapter.root) !== adapter.closureSha256) {
-      throw new Error(
-        "claude-agent-acp installed package closure does not match the manifest pin",
-      );
+      throw new Error("claude-agent-acp installed package closure does not match the manifest pin");
     }
     const adapterVersion = spawnSync(adapter.binary, ["--version"], {
       encoding: "utf8",
       env: artifact.environment,
     });
-    if (
-      adapterVersion.status !== 0 ||
-      adapterVersion.stdout.trim() !== adapter.version
-    ) {
-      throw new Error(
-        `claude-agent-acp version does not match ${adapter.version}`,
-      );
+    if (adapterVersion.status !== 0 || adapterVersion.stdout.trim() !== adapter.version) {
+      throw new Error(`claude-agent-acp version does not match ${adapter.version}`);
     }
     fs.accessSync(manifest.runtime.claudeCode.binary, fs.constants.X_OK);
     const claudeSha256 = createHash("sha256")
       .update(fs.readFileSync(manifest.runtime.claudeCode.binary))
       .digest("hex");
     if (claudeSha256 !== manifest.runtime.claudeCode.binarySha256) {
-      throw new Error(
-        "Claude Code binary SHA-256 does not match the manifest pin",
-      );
+      throw new Error("Claude Code binary SHA-256 does not match the manifest pin");
     }
     const ambientCredentials = validateAmbientAnthropicCredentials(process.env);
     if (!ambientCredentials.ok) {
@@ -250,30 +212,20 @@ if (runtimeCheck) {
     delete standardClaudeEnvironment.CLAUDE_CONFIG_DIR;
     delete standardClaudeEnvironment.ANTHROPIC_API_KEY;
     delete standardClaudeEnvironment.ANTHROPIC_AUTH_TOKEN;
-    const claudeVersion = spawnSync(
-      manifest.runtime.claudeCode.binary,
-      ["--version"],
-      {
-        encoding: "utf8",
-        env: standardClaudeEnvironment,
-      },
-    );
+    const claudeVersion = spawnSync(manifest.runtime.claudeCode.binary, ["--version"], {
+      encoding: "utf8",
+      env: standardClaudeEnvironment,
+    });
     if (
       claudeVersion.status !== 0 ||
       !claudeVersion.stdout.startsWith(manifest.runtime.claudeCode.version)
     ) {
-      throw new Error(
-        `Claude Code version does not match ${manifest.runtime.claudeCode.version}`,
-      );
+      throw new Error(`Claude Code version does not match ${manifest.runtime.claudeCode.version}`);
     }
-    const authStatus = spawnSync(
-      manifest.runtime.claudeCode.binary,
-      ["auth", "status"],
-      {
-        encoding: "utf8",
-        env: standardClaudeEnvironment,
-      },
-    );
+    const authStatus = spawnSync(manifest.runtime.claudeCode.binary, ["auth", "status"], {
+      encoding: "utf8",
+      env: standardClaudeEnvironment,
+    });
     let auth;
     try {
       auth = JSON.parse(authStatus.stdout);
@@ -283,22 +235,16 @@ if (runtimeCheck) {
     if (authStatus.status !== 0) {
       throw new Error("Claude Code auth status failed");
     }
-    const authValidation = validateClaudeSubscriptionAuth(
-      auth,
-      manifest.runtime.claudeCode.auth,
-    );
+    const authValidation = validateClaudeSubscriptionAuth(auth, manifest.runtime.claudeCode.auth);
     if (!authValidation.ok) {
       throw new Error(authValidation.errors.join("\n"));
     }
-  } else {
+  } else if (selector === "cursor_cli") {
     if (hashCursorClosure(adapter.root) !== adapter.closureSha256) {
-      throw new Error(
-        "Cursor CLI installed closure does not match the manifest pin",
-      );
+      throw new Error("Cursor CLI installed closure does not match the manifest pin");
     }
     const ambientOverrides = validateAmbientCursorOverrides(process.env);
-    if (!ambientOverrides.ok)
-      throw new Error(ambientOverrides.errors.join("\n"));
+    if (!ambientOverrides.ok) throw new Error(ambientOverrides.errors.join("\n"));
     const cursorEnvironment = { ...process.env, ...artifact.environment };
     delete cursorEnvironment.CURSOR_API_KEY;
     delete cursorEnvironment.CURSOR_API_ENDPOINT;
@@ -306,10 +252,7 @@ if (runtimeCheck) {
       encoding: "utf8",
       env: cursorEnvironment,
     });
-    if (
-      cursorVersion.status !== 0 ||
-      cursorVersion.stdout.trim() !== adapter.version
-    ) {
+    if (cursorVersion.status !== 0 || cursorVersion.stdout.trim() !== adapter.version) {
       throw new Error(`Cursor CLI version does not match ${adapter.version}`);
     }
     const status = spawnSync(adapter.binary, ["status", "--format", "json"], {
@@ -331,17 +274,13 @@ if (runtimeCheck) {
     if (status.status !== 0 || about.status !== 0) {
       throw new Error("Cursor auth status failed");
     }
-    const authValidation = validateCursorSubscriptionAuth(
-      statusJson,
-      aboutJson,
-      adapter.auth,
-    );
+    const authValidation = validateCursorSubscriptionAuth(statusJson, aboutJson, adapter.auth);
     if (!authValidation.ok) throw new Error(authValidation.errors.join("\n"));
     const modelArgs = [
       "models",
       "--agent-command",
       adapter.binary,
-      ...adapter.args.flatMap((value) => ["--agent-args", value]),
+      `--agent-args=${adapter.args.join(",")}`,
       "--json",
     ];
     const modelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, modelArgs, {
@@ -359,9 +298,7 @@ if (runtimeCheck) {
       modelCatalog.status !== 0 ||
       catalog?.unstable?.currentModelId !== adapter.model.effective
     ) {
-      throw new Error(
-        "Cursor ACP effective model does not match the manifest pin",
-      );
+      throw new Error("Cursor ACP effective model does not match the manifest pin");
     }
     if (!available.some((model) => model.modelId === adapter.model.effective)) {
       throw new Error("Cursor ACP effective model is absent from its catalog");
@@ -370,6 +307,81 @@ if (runtimeCheck) {
       throw new Error(
         "Cursor ACP non-fast model is now available; remove the blocked model-choice contract",
       );
+    }
+  } else {
+    const authStat = fs.lstatSync(adapter.auth.authFile);
+    if (!authStat.isFile() || authStat.isSymbolicLink() || (authStat.mode & 0o777) !== 0o600) {
+      throw new Error("Grok auth file must be a regular non-symlink file with mode 0600");
+    }
+    if (fs.realpathSync(adapter.binary) !== adapter.realBinary) {
+      throw new Error("Grok real binary does not match the manifest pin");
+    }
+    const ambientOverrides = validateAmbientGrokOverrides(process.env);
+    if (!ambientOverrides.ok) {
+      throw new Error(ambientOverrides.errors.join("\n"));
+    }
+    const grokEnvironment = { ...process.env, ...artifact.environment };
+    for (const name of [
+      "XAI_API_KEY",
+      "GROK_CODE_XAI_API_KEY",
+      "GROK_AUTH",
+      "GROK_AUTH_PATH",
+      "GROK_HOME",
+      "GROK_AUTH_PROVIDER_COMMAND",
+      "GROK_OIDC_ISSUER",
+      "GROK_OIDC_CLIENT_ID",
+      "GROK_CLI_CHAT_PROXY_BASE_URL",
+      "XAI_API_BASE_URL",
+    ]) {
+      delete grokEnvironment[name];
+    }
+    const grokVersion = spawnSync(adapter.binary, ["--version"], {
+      encoding: "utf8",
+      env: grokEnvironment,
+    });
+    if (
+      grokVersion.status !== 0 ||
+      !grokVersion.stdout.startsWith(`grok ${adapter.version} (${adapter.build})`)
+    ) {
+      throw new Error(`Grok version does not match ${adapter.version} (${adapter.build})`);
+    }
+    const grokModels = spawnSync(adapter.binary, ["models"], {
+      encoding: "utf8",
+      env: grokEnvironment,
+    });
+    if (
+      grokModels.status !== 0 ||
+      !grokModels.stdout.includes("You are logged in with grok.com.") ||
+      !grokModels.stdout.includes(`Default model: ${adapter.model.effective}`)
+    ) {
+      throw new Error("Grok existing login or model checkpoint is unavailable");
+    }
+    const modelArgs = [
+      "models",
+      "--agent-command",
+      adapter.binary,
+      "--agent-args",
+      adapter.args.join(","),
+      "--json",
+    ];
+    const modelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, modelArgs, {
+      encoding: "utf8",
+      env: grokEnvironment,
+    });
+    let catalog;
+    try {
+      catalog = JSON.parse(modelCatalog.stdout);
+    } catch {
+      throw new Error("Grok ACP model catalog did not return JSON");
+    }
+    const available = catalog?.unstable?.availableModels ?? [];
+    const selected = available.find((model) => model.modelId === adapter.model.effective);
+    if (
+      modelCatalog.status !== 0 ||
+      catalog?.unstable?.currentModelId !== adapter.model.effective ||
+      selected?._meta?.reasoningEffort !== adapter.model.reasoningEffort
+    ) {
+      throw new Error("Grok ACP model or reasoning checkpoint drift");
     }
   }
 }
@@ -390,6 +402,13 @@ const result = {
         requestedModel: manifest.runtime.cursorAcp.model.requested,
         effectiveModel: manifest.runtime.cursorAcp.model.effective,
         modelSelectionStatus: manifest.runtime.cursorAcp.model.selectionStatus,
+      }
+    : {}),
+  ...(selector === "grok_cli"
+    ? {
+        requestedModel: manifest.runtime.grokAcp.model.requested,
+        effectiveModel: manifest.runtime.grokAcp.model.effective,
+        reasoningEffort: manifest.runtime.grokAcp.model.reasoningEffort,
       }
     : {}),
   runtimeCheck,
