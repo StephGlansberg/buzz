@@ -341,7 +341,7 @@ if (runtimeCheck) {
       "models",
       "--agent-command",
       adapter.binary,
-      ...adapter.args.flatMap((value) => ["--agent-args", value]),
+      `--agent-args=${adapter.args.join(",")}`,
       "--json",
     ];
     const modelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, modelArgs, {

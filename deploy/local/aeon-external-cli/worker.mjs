@@ -60,7 +60,7 @@ const REQUIRED_CURSOR_CLI = {
   entrypointSha256:
     "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831",
   closureSha256:
-    "9d122b76c57011bda873b34eb23e5c891a0c8b6d273dcacc1fdf9b429fe726be",
+    "400227a16df5e9f7bb4273f176cf68e41ef499f06fac5e6c9c6c3556ab2cc726",
   args: ["--trust", "acp"],
   auth: {
     mode: "existing-cursor-subscription",
