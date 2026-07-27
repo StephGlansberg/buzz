@@ -33,7 +33,7 @@
   },
   "runtime": {
     "buzzAcpBinary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp",
-    "buzzAcpSha256": "1d339abfe3702df1bb40fb58a859800e2f505ccacd593366f432321f32cd286d",
+    "buzzAcpSha256": "d1eb0a78e26125944759e68ec2d2e8318ad9c1b36df9eb576bc40af9296c9621",
     "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/claude-cli.toml",
     "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/claude-code.sk",
