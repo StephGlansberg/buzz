@@ -5,15 +5,21 @@ validates configuration only; it does not install, load, start, restart, or
 switch any live service.
 
 Each worker uses Buzz only as the conversation transport. `--no-memory` keeps
-Gateway as the sole memory and compaction owner, while `--no-base-prompt`
-prevents Buzz's generic agent/tool doctrine from replacing the canonical Aspect
-instructions. The adapter binds to a pre-created session with
-`openclaw acp --require-existing --session ...`. Existing Buzz ACP controls are
-pinned rather than inherited from changing defaults: heartbeat prompting and
-proactive count-based session rotation are off, thread/DM context is bounded to
-12 messages, presence and typing remain on, and turns use a 900-second idle timeout with a two-hour
-absolute cap. `bypassPermissions` is an explicit canary posture; it does not
-prove that a future interactive approval workflow is preserved.
+Gateway as the sole memory and compaction owner. Nexus, Fontis, and Sapientis
+retain `--no-base-prompt`; Viatica, Voxis, and Mechanon use the existing
+`--base-prompt-file` facility for a narrow per-turn publishing contract that
+requires their exact trusted `buzz_<aspect>_reply` tool. These custom prompts
+replace Buzz's generic `buzz messages send` doctrine, which is intentionally
+incompatible with `--no-agent-publisher-credentials`. Fleet may supply an
+absolute installed `basePromptPath`; no prompt content is embedded in a plist.
+The adapter binds to a pre-created session with
+`openclaw acp --require-existing --session ...`. Existing Buzz ACP controls
+are pinned rather than inherited from changing defaults: heartbeat prompting
+and proactive count-based session rotation are off, thread/DM context is
+bounded to 12 messages, presence and typing remain on, and turns use a
+900-second idle timeout with a two-hour absolute cap. `bypassPermissions` is
+an explicit canary posture; it does not prove that a future interactive
+approval workflow is preserved.
 
 `--trusted-inbound-envelope` copies one signature-verified triggering event
 into the ACP request as `_meta.buzz.inboundEvent` (`schemaVersion: 1`). The

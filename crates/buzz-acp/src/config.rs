@@ -2239,54 +2239,77 @@ mod tests {
             let agent_args = format!(
                 "acp,--session,{session},--require-existing,--token-file,/owned/token,--url,ws://127.0.0.1:18806,--provenance,meta+receipt,--no-prefix-cwd"
             );
-            let cli = CliArgs::try_parse_from([
-                "buzz-acp",
-                "--private-key",
-                &"1".repeat(64),
-                "--agent-owner",
-                architect,
-                "--agent-command",
-                "openclaw",
-                "--agent-args",
-                &agent_args,
-                "--subscribe",
-                "config",
-                "--config",
-                config_path.to_str().expect("utf8 config path"),
-                "--respond-to",
-                "owner-only",
-                "--allowed-respond-to",
-                "owner-only",
-                "--no-memory",
-                "--no-base-prompt",
-                "--dedup",
-                "queue",
-                "--multiple-event-handling",
-                "queue",
-                "--relay-observer",
-                "--trusted-inbound-envelope",
-                "--no-agent-publisher-credentials",
-                "--permission-mode",
-                "bypass-permissions",
-                "--heartbeat-interval",
-                "0",
-                "--turn-liveness-secs",
-                "10",
-                "--idle-timeout",
-                "900",
-                "--max-turn-duration",
-                "7200",
-                "--context-message-limit",
-                "12",
-                "--max-turns-per-session",
-                "0",
-                "--turn-receipts",
-                "--expected-gateway-session-key",
-                session,
-            ])
-            .expect("real Clap parser accepts rendered worker argv");
+            let private_key = "1".repeat(64);
+            let mut argv = vec![
+                "buzz-acp".to_owned(),
+                "--private-key".to_owned(),
+                private_key,
+                "--agent-owner".to_owned(),
+                architect.to_owned(),
+                "--agent-command".to_owned(),
+                "openclaw".to_owned(),
+                "--agent-args".to_owned(),
+                agent_args,
+                "--subscribe".to_owned(),
+                "config".to_owned(),
+                "--config".to_owned(),
+                config_path.to_string_lossy().into_owned(),
+                "--respond-to".to_owned(),
+                "owner-only".to_owned(),
+                "--allowed-respond-to".to_owned(),
+                "owner-only".to_owned(),
+                "--no-memory".to_owned(),
+            ];
+            if let Some(base_prompt_file) = worker["basePromptFile"].as_str() {
+                argv.push("--base-prompt-file".to_owned());
+                argv.push(root.join(base_prompt_file).to_string_lossy().into_owned());
+            } else {
+                argv.push("--no-base-prompt".to_owned());
+            }
+            argv.extend([
+                "--dedup".to_owned(),
+                "queue".to_owned(),
+                "--multiple-event-handling".to_owned(),
+                "queue".to_owned(),
+                "--relay-observer".to_owned(),
+                "--trusted-inbound-envelope".to_owned(),
+                "--no-agent-publisher-credentials".to_owned(),
+                "--permission-mode".to_owned(),
+                "bypass-permissions".to_owned(),
+                "--heartbeat-interval".to_owned(),
+                "0".to_owned(),
+                "--turn-liveness-secs".to_owned(),
+                "10".to_owned(),
+                "--idle-timeout".to_owned(),
+                "900".to_owned(),
+                "--max-turn-duration".to_owned(),
+                "7200".to_owned(),
+                "--context-message-limit".to_owned(),
+                "12".to_owned(),
+                "--max-turns-per-session".to_owned(),
+                "0".to_owned(),
+                "--turn-receipts".to_owned(),
+                "--expected-gateway-session-key".to_owned(),
+                session.to_owned(),
+            ]);
+            let cli = CliArgs::try_parse_from(argv)
+                .expect("real Clap parser accepts rendered worker argv");
             assert!(cli.no_memory);
-            assert!(cli.no_base_prompt);
+            if let Some(base_prompt_file) = worker["basePromptFile"].as_str() {
+                let expected_prompt_path = root.join(base_prompt_file);
+                assert!(!cli.no_base_prompt);
+                assert_eq!(
+                    cli.base_prompt_file.as_deref(),
+                    Some(expected_prompt_path.as_path())
+                );
+                let prompt = std::fs::read_to_string(expected_prompt_path).expect("base prompt");
+                assert!(prompt.contains(&format!("exactly one `buzz_{aspect}_reply`")));
+                assert!(prompt.contains("Plain assistant text is not published to Buzz"));
+                assert!(prompt.contains("Do not call `buzz messages send`"));
+            } else {
+                assert!(cli.no_base_prompt);
+                assert!(cli.base_prompt_file.is_none());
+            }
             assert!(cli.turn_receipts);
             assert!(cli.trusted_inbound_envelope);
             assert!(cli.no_agent_publisher_credentials);

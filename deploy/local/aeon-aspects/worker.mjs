@@ -1,5 +1,11 @@
 import fs from "node:fs";
 
+const TRUSTED_PRIVATE_OFFICE_PUBLISHERS = Object.freeze({
+  mechanon: "buzz_mechanon_reply",
+  viatica: "buzz_viatica_reply",
+  voxis: "buzz_voxis_reply",
+});
+
 export function loadJson(path) {
   return JSON.parse(fs.readFileSync(path, "utf8"));
 }
@@ -59,6 +65,17 @@ export function validateManifest(manifest, identityMap) {
     if (concilium?.channel_id === worker.privateChannelId) errors.push(`${worker.aspect}: private room is Concilium`);
     if (worker.sessionKey !== `agent:${worker.gatewayAgentId}:buzz-private`) errors.push(`${worker.aspect}: unstable session key`);
     if (!member.secret_ref) errors.push(`${worker.aspect}: missing private-key reference`);
+    const trustedPublisher = TRUSTED_PRIVATE_OFFICE_PUBLISHERS[worker.aspect];
+    const expectedPromptFile = trustedPublisher
+      ? `deploy/local/aeon-aspects/prompts/${worker.aspect}-private-office.md`
+      : undefined;
+    if (worker.basePromptFile !== expectedPromptFile) {
+      errors.push(
+        trustedPublisher
+          ? `${worker.aspect}: trusted private-office base prompt drift`
+          : `${worker.aspect}: must retain the default-off base prompt`,
+      );
+    }
   }
   warnings.push("avatar metadata is absent from identity-map.json; live profile avatar validation remains open");
   return { ok: errors.length === 0, errors, warnings };
@@ -69,6 +86,9 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
   if (!worker) throw new Error(`unknown Aspect: ${aspect}`);
   const member = identityMap.members[aspect];
   const configPath = `deploy/local/aeon-aspects/config/${aspect}.toml`;
+  const basePromptArgs = worker.basePromptFile
+    ? ["--base-prompt-file", worker.basePromptFile]
+    : ["--no-base-prompt"];
   return {
     enabled: false,
     label: `org.aeon.buzz-acp.${aspect}`,
@@ -82,7 +102,7 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
       "--agent-args", ["acp", "--session", worker.sessionKey, "--require-existing", "--token-file", tokenFile, "--url", manifest.gateway.url, "--provenance", manifest.gateway.provenance, "--no-prefix-cwd"].join(","),
       "--agents", "1", "--subscribe", "config", "--config", configPath,
       "--respond-to", "owner-only", "--allowed-respond-to", "owner-only",
-      "--no-memory", "--no-base-prompt", "--dedup", "queue", "--multiple-event-handling", "queue", "--relay-observer", "--trusted-inbound-envelope", "--no-agent-publisher-credentials",
+      "--no-memory", ...basePromptArgs, "--dedup", "queue", "--multiple-event-handling", "queue", "--relay-observer", "--trusted-inbound-envelope", "--no-agent-publisher-credentials",
       "--permission-mode", manifest.posture.permissionMode,
       "--heartbeat-interval", String(manifest.posture.heartbeatIntervalSecs),
       "--turn-liveness-secs", String(manifest.posture.turnLivenessSecs),
@@ -117,6 +137,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   const privateKeyFile = options.privateKeyFile ?? identityMap.members[aspect].secret_ref;
   const workingDirectory = options.workingDirectory ?? "/Volumes/AEON/Projects/buzz";
   const configPath = options.configPath ?? null;
+  const basePromptPath = options.basePromptPath ?? null;
   const stdoutPath = options.stdoutPath ?? null;
   const stderrPath = options.stderrPath ?? null;
   const launcherPath = options.launcherPath ?? null;
@@ -143,6 +164,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
     privateKeyFile,
     workingDirectory,
     ...(configPath !== null ? { configPath } : {}),
+    ...(basePromptPath !== null ? { basePromptPath } : {}),
     ...(stdoutPath !== null ? { stdoutPath } : {}),
     ...(stderrPath !== null ? { stderrPath } : {}),
     ...(launcherPath !== null ? { launcherPath } : {}),
@@ -177,6 +199,13 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   }
   const configIndex = rendered.args.indexOf("--config") + 1;
   rendered.args[configIndex] = configPath ?? `${workingDirectory}/${rendered.args[configIndex]}`;
+  const basePromptIndex = rendered.args.indexOf("--base-prompt-file") + 1;
+  if (basePromptIndex > 0) {
+    rendered.args[basePromptIndex] =
+      basePromptPath ?? `${workingDirectory}/${rendered.args[basePromptIndex]}`;
+  } else if (basePromptPath !== null) {
+    throw new Error(`${aspect}: basePromptPath supplied for worker without a custom base prompt`);
+  }
   // launchd may reject direct execution of provenance-marked development binaries.
   // A Fleet-owned system launcher keeps the binary and its digest explicit in argv.
   const argv = [...(launcherPath ? [launcherPath] : []), buzzAcpPath, ...rendered.args];

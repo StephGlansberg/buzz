@@ -29,7 +29,8 @@
     <string>--allowed-respond-to</string>
     <string>owner-only</string>
     <string>--no-memory</string>
-    <string>--no-base-prompt</string>
+    <string>--base-prompt-file</string>
+    <string>/Volumes/AEON/Projects/buzz/deploy/local/aeon-aspects/prompts/viatica-private-office.md</string>
     <string>--dedup</string>
     <string>queue</string>
     <string>--multiple-event-handling</string>

@@ -27,7 +27,13 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
     assert.equal(rendered.supervisor.runAtLoad, false);
     assert.equal(rendered.supervisor.restartOnFailure, false);
     assert.match(argv, /--no-memory/);
-    assert.match(argv, /--no-base-prompt/);
+    if (worker.basePromptFile) {
+      assert.match(argv, new RegExp(`--base-prompt-file ${worker.basePromptFile}`));
+      assert.doesNotMatch(argv, /--no-base-prompt/);
+    } else {
+      assert.match(argv, /--no-base-prompt/);
+      assert.doesNotMatch(argv, /--base-prompt-file/);
+    }
     assert.match(argv, /--respond-to owner-only/);
     assert.match(argv, /--allowed-respond-to owner-only/);
     assert.match(argv, /--agents 1/);
@@ -53,6 +59,37 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
   }
 });
 
+test("only the three silent private offices receive exact trusted publisher prompts", () => {
+  const expected = new Map([
+    ["mechanon", "buzz_mechanon_reply"],
+    ["viatica", "buzz_viatica_reply"],
+    ["voxis", "buzz_voxis_reply"],
+  ]);
+  for (const worker of manifest.workers) {
+    const rendered = renderWorker(manifest, identityMap, worker.aspect);
+    const promptPath = worker.basePromptFile ? join(here, "..", "..", "..", worker.basePromptFile) : null;
+    if (!expected.has(worker.aspect)) {
+      assert.equal(promptPath, null);
+      assert.match(rendered.args.join(" "), /--no-base-prompt/);
+      continue;
+    }
+    const prompt = fs.readFileSync(promptPath, "utf8");
+    const tool = expected.get(worker.aspect);
+    assert.match(prompt, new RegExp(`exactly one \`${tool}\``));
+    assert.match(prompt, /Plain assistant text is not published to Buzz/);
+    assert.match(prompt, /Do not call `buzz messages send`/);
+    assert.match(prompt, /publisher credentials are intentionally withheld/);
+    assert.equal((prompt.match(new RegExp(tool, "g")) ?? []).length, 1);
+    assert.doesNotMatch(rendered.args.join(" "), /--no-base-prompt/);
+  }
+});
+
+test("Nexus worker argv remains on the established no-base-prompt path", () => {
+  const rendered = renderWorker(manifest, identityMap, "nexus", "/owned/gateway.token");
+  assert.match(rendered.args.join(" "), /--no-base-prompt/);
+  assert.doesNotMatch(rendered.args.join(" "), /--base-prompt-file/);
+});
+
 test("six deterministic LaunchAgent previews are disabled and secret-free", () => {
   const labels = new Set();
   for (const worker of manifest.workers) {
@@ -74,6 +111,14 @@ test("six deterministic LaunchAgent previews are disabled and secret-free", () =
     assert.match(first.plist, /\/REQUIRES_FLEET\/owned-token-file/);
     assert.doesNotMatch(first.plist, /nsec1|BUZZ_PRIVATE_KEY=/);
     assert.match(first.plist, /--no-agent-publisher-credentials/);
+    if (worker.basePromptFile) {
+      assert.match(first.plist, /--base-prompt-file/);
+      assert.match(first.plist, new RegExp(`/Volumes/AEON/Projects/buzz/${worker.basePromptFile}`));
+      assert.doesNotMatch(first.plist, /--no-base-prompt/);
+    } else {
+      assert.match(first.plist, /--no-base-prompt/);
+      assert.doesNotMatch(first.plist, /--base-prompt-file/);
+    }
     assert.deepEqual(first.rollback, ["launchctl", "bootout", `gui/<uid>/${first.label}`]);
     labels.add(first.label);
   }
@@ -114,6 +159,14 @@ test("LaunchAgent rendering rejects unsafe or relative runtime paths", () => {
   assert.throws(
     () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { stdoutPath: "relative.log" }),
     /must be absolute/,
+  );
+  assert.throws(
+    () => renderDisabledLaunchAgent(manifest, identityMap, "viatica", { basePromptPath: "relative.md" }),
+    /must be absolute/,
+  );
+  assert.throws(
+    () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { basePromptPath: "/owned/nexus.md" }),
+    /worker without a custom base prompt/,
   );
   assert.throws(
     () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { agentCommandPrefixArgs: ["relative.mjs"] }),
@@ -188,6 +241,18 @@ test("Fleet can keep launchd-owned paths local while Buzz reads its canonical co
   );
   assert.match(rendered.plist, /<key>WorkingDirectory<\/key><string>\/Users\/operator<\/string>/);
   assert.match(rendered.plist, /<key>StandardOutPath<\/key><string>\/Users\/operator\/Library\/Logs\/AEON\/nexus\.buzz-acp\.log<\/string>/);
+});
+
+test("Fleet can install a trusted private-office prompt outside the working directory", () => {
+  const rendered = renderDisabledLaunchAgent(manifest, identityMap, "viatica", {
+    workingDirectory: "/Users/operator",
+    basePromptPath: "/owned/prompts/viatica-private-office.md",
+  });
+  assert.equal(
+    rendered.argv[rendered.argv.indexOf("--base-prompt-file") + 1],
+    "/owned/prompts/viatica-private-office.md",
+  );
+  assert.doesNotMatch(rendered.plist, /--no-base-prompt/);
 });
 
 test("Fleet can launch immutable OpenClaw through a local Node identity", () => {
