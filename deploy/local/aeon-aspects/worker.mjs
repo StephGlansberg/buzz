@@ -91,7 +91,7 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
   const basePromptArgs = worker.basePromptFile
     ? ["--base-prompt-file", worker.basePromptFile]
     : ["--no-base-prompt"];
-  return {
+  const rendered = {
     enabled: false,
     label: `org.aeon.buzz-acp.${aspect}`,
     command: "buzz-acp",
@@ -118,6 +118,8 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
     sessionKey: worker.sessionKey,
     supervisor: manifest.supervisor
   };
+  assertTrustedPublisherContract(rendered.args, aspect, worker.basePromptFile);
+  return rendered;
 }
 
 function xml(value) {
@@ -130,6 +132,48 @@ function xml(value) {
 
 function assertArgSafe(value, label) {
   if (/[\0\r\n,]/.test(value)) throw new Error(`${label} contains a forbidden delimiter`);
+}
+
+function countArg(argv, expected) {
+  return argv.filter((value) => value === expected).length;
+}
+
+export function assertTrustedPublisherContract(argv, aspect, expectedBasePromptFile) {
+  if (!Array.isArray(argv)) throw new Error(`${aspect}: worker argv must be an array`);
+  for (const flag of [
+    "--no-agent-publisher-credentials",
+    "--trusted-inbound-envelope",
+    "--base-prompt-file",
+    "--turn-receipts",
+  ]) {
+    const count = countArg(argv, flag);
+    if (count !== 1) {
+      throw new Error(`${aspect}: trusted publisher contract requires exactly one ${flag}; found ${count}`);
+    }
+  }
+  if (argv.includes("--no-base-prompt")) {
+    throw new Error(`${aspect}: trusted publisher contract forbids --no-base-prompt`);
+  }
+  const basePromptIndex = argv.indexOf("--base-prompt-file");
+  if (argv[basePromptIndex + 1] !== expectedBasePromptFile) {
+    throw new Error(`${aspect}: trusted publisher contract base prompt drift`);
+  }
+}
+
+export function evaluateSemanticHealth({ aspect, sessionKey, state, startup, receipt }) {
+  const failures = [];
+  if (state !== "running") failures.push("worker_not_running");
+  if (startup?.agentPoolReady !== true) failures.push("agent_pool_not_ready");
+  if (startup?.relayConnected !== true) failures.push("relay_not_connected");
+  if (startup?.privateOfficeSubscribed !== true) failures.push("private_office_not_subscribed");
+  if (!receipt?.requestEventId) failures.push("request_event_missing");
+  if (!receipt?.replyEventId) failures.push("reply_event_missing");
+  if (receipt?.replyTo !== receipt?.requestEventId) failures.push("reply_anchor_mismatch");
+  if (receipt?.sessionKey !== sessionKey) failures.push("gateway_session_mismatch");
+  if (!receipt?.runId) failures.push("fresh_run_missing");
+  if (receipt?.toolName !== `buzz_${aspect}_reply`) failures.push("trusted_reply_tool_mismatch");
+  if (receipt?.toolCallCount !== 1) failures.push("trusted_reply_tool_count_mismatch");
+  return { healthy: failures.length === 0, failures };
 }
 
 export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options = {}) {
@@ -146,7 +190,12 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   const executablePath = options.executablePath ?? null;
   const openclawConfigPath = options.openclawConfigPath ?? null;
   const openclawStateDir = options.openclawStateDir ?? null;
+  const relayUrl = options.relayUrl ?? manifest.buzz.relayUrl;
   const agentCommandPrefixArgs = options.agentCommandPrefixArgs ?? [];
+  if (!/^wss?:\/\/[^,\s]+$/.test(relayUrl)) {
+    throw new Error("relayUrl must be an absolute ws:// or wss:// URL");
+  }
+  assertArgSafe(relayUrl, "relayUrl");
   if (!Array.isArray(agentCommandPrefixArgs)) {
     throw new Error("agentCommandPrefixArgs must be an array");
   }
@@ -193,6 +242,8 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
     },
   };
   const rendered = renderWorker(manifest, launchIdentityMap, aspect, tokenFile);
+  const relayUrlIndex = rendered.args.indexOf("--relay-url") + 1;
+  rendered.args[relayUrlIndex] = relayUrl;
   const agentCommandIndex = rendered.args.indexOf("--agent-command") + 1;
   rendered.args[agentCommandIndex] = openclawPath;
   if (agentCommandPrefixArgs.length > 0) {
@@ -208,6 +259,11 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   } else if (basePromptPath !== null) {
     throw new Error(`${aspect}: basePromptPath supplied for worker without a custom base prompt`);
   }
+  assertTrustedPublisherContract(
+    rendered.args,
+    aspect,
+    rendered.args[rendered.args.indexOf("--base-prompt-file") + 1],
+  );
   // launchd may reject direct execution of provenance-marked development binaries.
   // A Fleet-owned system launcher keeps the binary and its digest explicit in argv.
   const argv = [...(launcherPath ? [launcherPath] : []), buzzAcpPath, ...rendered.args];

@@ -299,13 +299,19 @@ pub struct CliArgs {
     #[arg(
         long,
         env = "BUZZ_PRIVATE_KEY_FILE",
+        hide_env_values = true,
         conflicts_with = "private_key",
         required_unless_present = "private_key"
     )]
     pub private_key_file: Option<PathBuf>,
 
     /// Expected public key derived from `--private-key-file`.
-    #[arg(long, env = "BUZZ_EXPECTED_PUBLIC_KEY", requires = "private_key_file")]
+    #[arg(
+        long,
+        env = "BUZZ_EXPECTED_PUBLIC_KEY",
+        hide_env_values = true,
+        requires = "private_key_file"
+    )]
     pub expected_public_key: Option<String>,
 
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
@@ -553,6 +559,7 @@ pub struct CliArgs {
     #[arg(
         long,
         env = "BUZZ_ACP_EXPECTED_GATEWAY_SESSION_KEY",
+        hide_env_values = true,
         requires = "turn_receipts"
     )]
     pub expected_gateway_session_key: Option<String>,
@@ -571,6 +578,7 @@ pub struct CliArgs {
     #[arg(
         long,
         env = "BUZZ_ACP_NO_AGENT_PUBLISHER_CREDENTIALS",
+        hide_env_values = true,
         default_value_t = false
     )]
     pub no_agent_publisher_credentials: bool,
@@ -1205,6 +1213,18 @@ impl Config {
         {
             return Err(ConfigError::ConfigFile(
                 "--turn-receipts requires a valid --agent-owner or verified BUZZ_AUTH_TAG".into(),
+            ));
+        }
+        if args.no_agent_publisher_credentials
+            && (!args.trusted_inbound_envelope
+                || !args.turn_receipts
+                || args.no_base_prompt
+                || args.base_prompt_file.is_none())
+        {
+            return Err(ConfigError::ConfigFile(
+                "--no-agent-publisher-credentials requires --trusted-inbound-envelope, \
+                 --turn-receipts, and --base-prompt-file as one fail-closed publisher contract"
+                    .into(),
             ));
         }
 
@@ -3310,6 +3330,68 @@ require_exact_channel_tag = false
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+    const TEST_PUBLIC_KEY: &str =
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[test]
+    fn isolated_publisher_contract_rejects_missing_trusted_envelope() {
+        let prompt_path =
+            std::env::temp_dir().join(format!("buzz-acp-publisher-contract-{}.md", Uuid::new_v4()));
+        std::fs::write(&prompt_path, "trusted publisher prompt").expect("write prompt");
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-owner",
+            TEST_PUBLIC_KEY,
+            "--agent-command",
+            "openclaw",
+            "--relay-observer",
+            "--turn-receipts",
+            "--expected-gateway-session-key",
+            "agent:main:buzz-private",
+            "--base-prompt-file",
+            prompt_path.to_str().expect("prompt path"),
+            "--no-agent-publisher-credentials",
+        ])
+        .expect("clap should parse args");
+        let error = Config::from_args(args).expect_err("contract must fail closed");
+        std::fs::remove_file(prompt_path).expect("remove prompt");
+        assert!(error
+            .to_string()
+            .contains("one fail-closed publisher contract"));
+    }
+
+    #[test]
+    fn isolated_publisher_contract_accepts_complete_shape() {
+        let prompt_path =
+            std::env::temp_dir().join(format!("buzz-acp-publisher-contract-{}.md", Uuid::new_v4()));
+        std::fs::write(&prompt_path, "trusted publisher prompt").expect("write prompt");
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-owner",
+            TEST_PUBLIC_KEY,
+            "--agent-command",
+            "openclaw",
+            "--relay-observer",
+            "--turn-receipts",
+            "--expected-gateway-session-key",
+            "agent:main:buzz-private",
+            "--trusted-inbound-envelope",
+            "--base-prompt-file",
+            prompt_path.to_str().expect("prompt path"),
+            "--no-agent-publisher-credentials",
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+        std::fs::remove_file(prompt_path).expect("remove prompt");
+        assert!(
+            result.is_ok(),
+            "complete publisher contract should pass: {result:?}"
+        );
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

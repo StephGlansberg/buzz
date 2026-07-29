@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import fs from "node:fs";
 import {
+  assertTrustedPublisherContract,
   correlateReceipt,
+  evaluateSemanticHealth,
   loadJson,
   renderDisabledLaunchAgent,
   renderPrivateOfficePrompt,
@@ -87,6 +89,33 @@ test("one shared contract renders exact trusted publisher prompts for all six of
       }
     }
     assert.doesNotMatch(rendered.args.join(" "), /--no-base-prompt/);
+  }
+});
+
+test("credential isolation, trusted envelope, receipt, and exact prompt are indivisible", () => {
+  for (const worker of manifest.workers) {
+    const rendered = renderWorker(manifest, identityMap, worker.aspect);
+    assert.doesNotThrow(() =>
+      assertTrustedPublisherContract(rendered.args, worker.aspect, worker.basePromptFile),
+    );
+    for (const required of [
+      "--no-agent-publisher-credentials",
+      "--trusted-inbound-envelope",
+      "--base-prompt-file",
+      "--turn-receipts",
+    ]) {
+      const broken = rendered.args.filter((value) => value !== required);
+      assert.throws(
+        () => assertTrustedPublisherContract(broken, worker.aspect, worker.basePromptFile),
+        new RegExp(required.replaceAll("-", "\\-")),
+      );
+    }
+    const wrongPrompt = [...rendered.args];
+    wrongPrompt[wrongPrompt.indexOf("--base-prompt-file") + 1] = "/wrong/prompt.md";
+    assert.throws(
+      () => assertTrustedPublisherContract(wrongPrompt, worker.aspect, worker.basePromptFile),
+      /base prompt drift/,
+    );
   }
 });
 
@@ -231,6 +260,21 @@ test("Fleet can bind the immutable Node runtime without changing disabled previe
   assert.match(rendered.plist, /<key>OPENCLAW_STATE_DIR<\/key><string>\/owned\/state<\/string>/);
 });
 
+test("Fleet can parameterize the canonical WSS relay without hardcoding a private host", () => {
+  const rendered = renderDisabledLaunchAgent(manifest, identityMap, "nexus", {
+    relayUrl: "wss://buzz.example.test",
+  });
+  assert.equal(
+    rendered.argv[rendered.argv.indexOf("--relay-url") + 1],
+    "wss://buzz.example.test",
+  );
+  assert.doesNotMatch(JSON.stringify(manifest), /buzz\.example\.test/);
+  assert.throws(
+    () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { relayUrl: "https://buzz.example.test" }),
+    /absolute ws/,
+  );
+});
+
 test("Fleet can use a system launcher while retaining the exact Buzz binary", () => {
   const rendered = renderDisabledLaunchAgent(manifest, identityMap, "nexus", {
     buzzAcpPath: "/owned/bin/buzz-acp",
@@ -342,4 +386,72 @@ test("receipt correlation fails closed on zero or duplicate replies", () => {
     ] }),
     /found 2/
   );
+});
+
+test("semantic health rejects green-but-mute workers", () => {
+  const base = {
+    aspect: "nexus",
+    sessionKey: "agent:main:buzz-private",
+    state: "running",
+    startup: {
+      agentPoolReady: true,
+      relayConnected: true,
+      privateOfficeSubscribed: true,
+    },
+  };
+  const mute = evaluateSemanticHealth(base);
+  assert.equal(mute.healthy, false);
+  assert.deepEqual(mute.failures, [
+    "request_event_missing",
+    "reply_event_missing",
+    "gateway_session_mismatch",
+    "fresh_run_missing",
+    "trusted_reply_tool_mismatch",
+    "trusted_reply_tool_count_mismatch",
+  ]);
+
+  const healthy = evaluateSemanticHealth({
+    ...base,
+    receipt: {
+      requestEventId: "request-1",
+      replyEventId: "reply-1",
+      replyTo: "request-1",
+      sessionKey: "agent:main:buzz-private",
+      runId: "run-1",
+      toolName: "buzz_nexus_reply",
+      toolCallCount: 1,
+    },
+  });
+  assert.deepEqual(healthy, { healthy: true, failures: [] });
+});
+
+test("semantic health command fails closed until a functional reply path is proven", () => {
+  const evidence = {
+    aspect: "nexus",
+    sessionKey: "agent:main:buzz-private",
+    state: "running",
+    startup: {
+      agentPoolReady: true,
+      relayConnected: true,
+      privateOfficeSubscribed: true,
+    },
+  };
+  const inputPath = join(
+    process.env.TMPDIR ?? "/tmp",
+    `buzz-semantic-health-${process.pid}-${Date.now()}.json`,
+  );
+  fs.writeFileSync(inputPath, JSON.stringify(evidence));
+  try {
+    assert.throws(
+      () => execFileSync(process.execPath, [join(here, "semantic-health.mjs"), inputPath]),
+      (error) => {
+        const result = JSON.parse(error.stdout.toString());
+        assert.equal(result.ok, false);
+        assert.ok(result.checks[0].failures.includes("request_event_missing"));
+        return true;
+      },
+    );
+  } finally {
+    fs.rmSync(inputPath, { force: true });
+  }
 });

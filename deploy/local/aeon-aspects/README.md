@@ -55,12 +55,21 @@ Run the source validation without changing live state:
 node deploy/local/aeon-aspects/validate.mjs
 node deploy/local/aeon-aspects/render-private-office-prompts.mjs
 node deploy/local/aeon-aspects/render-launchagents.mjs
+node deploy/local/aeon-aspects/semantic-health.mjs /absolute/path/to/evidence.json
 ```
 
 The no-argument validator uses the checked-in synthetic identity fixture so it
 is runnable in any OSS checkout. To validate the private deployment contract,
 pass its identity map explicitly (for example,
 `node deploy/local/aeon-aspects/validate.mjs /absolute/path/identity-map.json`).
+
+`semantic-health.mjs` deliberately rejects `running` plus `agent_pool_ready` as
+insufficient. A worker is healthy only when startup evidence also proves relay
+connection and the exact private-office subscription, and one fresh functional
+turn proves request ID, exactly one trusted `buzz_<aspect>_reply` call, anchored
+reply ID, fixed Gateway session key, and fresh run ID. The command emits
+`aeon_buzz_semantic_health_v1` JSON and exits nonzero for any missing or
+mismatched field.
 
 The checked-in `launchagents/` previews are real, deterministic launchd
 definitions with `RunAtLoad=true` and `KeepAlive=true`, matching the supervised
