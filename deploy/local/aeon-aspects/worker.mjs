@@ -191,11 +191,44 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   const openclawConfigPath = options.openclawConfigPath ?? null;
   const openclawStateDir = options.openclawStateDir ?? null;
   const relayUrl = options.relayUrl ?? manifest.buzz.relayUrl;
+  const respondTo = options.respondTo ?? null;
+  const allowedRespondTo = options.allowedRespondTo ?? null;
+  const respondToAllowlist = options.respondToAllowlist ?? null;
+  const additionalEnvironment = options.additionalEnvironment ?? {};
   const agentCommandPrefixArgs = options.agentCommandPrefixArgs ?? [];
   if (!/^wss?:\/\/[^,\s]+$/.test(relayUrl)) {
     throw new Error("relayUrl must be an absolute ws:// or wss:// URL");
   }
   assertArgSafe(relayUrl, "relayUrl");
+  if ((respondTo === null) !== (allowedRespondTo === null)) {
+    throw new Error("respondTo and allowedRespondTo must be supplied together");
+  }
+  for (const [label, value] of Object.entries({
+    ...(respondTo !== null ? { respondTo } : {}),
+    ...(allowedRespondTo !== null ? { allowedRespondTo } : {}),
+  })) {
+    if (!/^[a-z-]+(?:,[a-z-]+)*$/.test(value)) {
+      throw new Error(`${label} contains an invalid response mode`);
+    }
+  }
+  if (
+    respondToAllowlist !== null &&
+    !/^[0-9a-f]{64}(?:,[0-9a-f]{64})*$/.test(respondToAllowlist)
+  ) {
+    throw new Error("respondToAllowlist must be a comma-separated lowercase pubkey list");
+  }
+  if (
+    additionalEnvironment === null ||
+    Array.isArray(additionalEnvironment) ||
+    typeof additionalEnvironment !== "object"
+  ) {
+    throw new Error("additionalEnvironment must be an object");
+  }
+  for (const [key, value] of Object.entries(additionalEnvironment)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || typeof value !== "string" || /[\0\r\n]/.test(value)) {
+      throw new Error(`additionalEnvironment.${key} is invalid`);
+    }
+  }
   if (!Array.isArray(agentCommandPrefixArgs)) {
     throw new Error("agentCommandPrefixArgs must be an array");
   }
@@ -244,6 +277,18 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   const rendered = renderWorker(manifest, launchIdentityMap, aspect, tokenFile);
   const relayUrlIndex = rendered.args.indexOf("--relay-url") + 1;
   rendered.args[relayUrlIndex] = relayUrl;
+  if (respondTo !== null) {
+    rendered.args[rendered.args.indexOf("--respond-to") + 1] = respondTo;
+    rendered.args[rendered.args.indexOf("--allowed-respond-to") + 1] = allowedRespondTo;
+    const existingAllowlist = rendered.args.indexOf("--respond-to-allowlist");
+    if (existingAllowlist >= 0) rendered.args.splice(existingAllowlist, 2);
+    if (respondToAllowlist !== null) {
+      const insertAt = rendered.args.indexOf("--allowed-respond-to") + 2;
+      rendered.args.splice(insertAt, 0, "--respond-to-allowlist", respondToAllowlist);
+    }
+  } else if (respondToAllowlist !== null) {
+    throw new Error("respondToAllowlist requires respondTo and allowedRespondTo");
+  }
   const agentCommandIndex = rendered.args.indexOf("--agent-command") + 1;
   rendered.args[agentCommandIndex] = openclawPath;
   if (agentCommandPrefixArgs.length > 0) {
@@ -272,6 +317,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   const stderr = stderrPath ?? `/Volumes/AEON/Projects/buzz-data/logs/${aspect}.buzz-acp.err.log`;
   const argsXml = argv.map((arg) => `    <string>${xml(arg)}</string>`).join("\n");
   const environment = {
+    ...additionalEnvironment,
     ...(executablePath ? { PATH: executablePath } : {}),
     ...(openclawConfigPath ? { OPENCLAW_CONFIG_PATH: openclawConfigPath } : {}),
     ...(openclawStateDir ? { OPENCLAW_STATE_DIR: openclawStateDir } : {}),

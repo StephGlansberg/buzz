@@ -275,6 +275,28 @@ test("Fleet can parameterize the canonical WSS relay without hardcoding a privat
   );
 });
 
+test("Fleet can preserve the live response policy and benign launch environment", () => {
+  const first = "c5f9e0a85da537e107fdcc60ea7ee7e1c5e2b5ac0691a30b6566b3f043a50455";
+  const second = "7924cc1dd5389c567ea4ad2b3013b71df28c7b856247365efcccbc7763bfdb7f";
+  const rendered = renderDisabledLaunchAgent(manifest, identityMap, "nexus", {
+    respondTo: "allowlist",
+    allowedRespondTo: "owner-only,allowlist",
+    respondToAllowlist: `${first},${second}`,
+    additionalEnvironment: { CI: "1", NO_COLOR: "1" },
+  });
+  assert.equal(rendered.argv[rendered.argv.indexOf("--respond-to") + 1], "allowlist");
+  assert.equal(
+    rendered.argv[rendered.argv.indexOf("--allowed-respond-to") + 1],
+    "owner-only,allowlist",
+  );
+  assert.equal(
+    rendered.argv[rendered.argv.indexOf("--respond-to-allowlist") + 1],
+    `${first},${second}`,
+  );
+  assert.match(rendered.plist, /<key>CI<\/key><string>1<\/string>/);
+  assert.match(rendered.plist, /<key>NO_COLOR<\/key><string>1<\/string>/);
+});
+
 test("Fleet can use a system launcher while retaining the exact Buzz binary", () => {
   const rendered = renderDisabledLaunchAgent(manifest, identityMap, "nexus", {
     buzzAcpPath: "/owned/bin/buzz-acp",
