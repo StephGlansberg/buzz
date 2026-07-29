@@ -31,8 +31,9 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
     const rendered = renderWorker(manifest, identityMap, worker.aspect, "/owned/gateway.token");
     const argv = rendered.args.join(" ");
     assert.equal(rendered.enabled, false);
-    assert.equal(rendered.supervisor.runAtLoad, false);
-    assert.equal(rendered.supervisor.restartOnFailure, false);
+    assert.equal(rendered.supervisor.startOnAppLaunch, true);
+    assert.equal(rendered.supervisor.runAtLoad, true);
+    assert.equal(rendered.supervisor.restartOnFailure, true);
     assert.match(argv, /--no-memory/);
     assert.match(argv, new RegExp(`--base-prompt-file ${worker.basePromptFile}`));
     assert.doesNotMatch(argv, /--no-base-prompt/);
@@ -120,8 +121,8 @@ test("six deterministic LaunchAgent previews are disabled and secret-free", () =
     const first = renderDisabledLaunchAgent(manifest, identityMap, worker.aspect);
     const second = renderDisabledLaunchAgent(manifest, identityMap, worker.aspect);
     assert.deepEqual(second, first);
-    assert.equal(first.runAtLoad, false);
-    assert.equal(first.keepAlive, false);
+    assert.equal(first.runAtLoad, true);
+    assert.equal(first.keepAlive, true);
     assert.deepEqual(first.tokenFileContract, {
       absolute: true,
       regular: true,
@@ -129,8 +130,8 @@ test("six deterministic LaunchAgent previews are disabled and secret-free", () =
       owner: "current-user",
       mode: "0600",
     });
-    assert.match(first.plist, /<key>RunAtLoad<\/key><false\/>/);
-    assert.match(first.plist, /<key>KeepAlive<\/key><false\/>/);
+    assert.match(first.plist, /<key>RunAtLoad<\/key><true\/>/);
+    assert.match(first.plist, /<key>KeepAlive<\/key><true\/>/);
     assert.match(first.plist, /\/REQUIRES_FLEET\/immutable-openclaw\/bin\/openclaw/);
     assert.match(first.plist, /\/REQUIRES_FLEET\/owned-token-file/);
     assert.doesNotMatch(first.plist, /nsec1|BUZZ_PRIVATE_KEY=/);

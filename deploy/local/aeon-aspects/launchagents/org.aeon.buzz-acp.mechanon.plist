@@ -57,8 +57,8 @@
     <string>agent:mechanon:buzz-private</string>
   </array>
   <key>WorkingDirectory</key><string>/Volumes/AEON/Projects/buzz</string>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>/Volumes/AEON/Projects/buzz-data/logs/mechanon.buzz-acp.log</string>
   <key>StandardErrorPath</key><string>/Volumes/AEON/Projects/buzz-data/logs/mechanon.buzz-acp.err.log</string>

@@ -34,9 +34,9 @@
     "maxTurnsPerSession": 0
   },
   "supervisor": {
-    "startOnAppLaunch": false,
-    "runAtLoad": false,
-    "restartOnFailure": false,
+    "startOnAppLaunch": true,
+    "runAtLoad": true,
+    "restartOnFailure": true,
     "throttleSeconds": 10
   },
   "workers": [

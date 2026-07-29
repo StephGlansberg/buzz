@@ -1,8 +1,8 @@
 # AEON Aspect workers
 
-This package defines six disabled-by-default Buzz ACP workers. It renders and
-validates configuration only; it does not install, load, start, restart, or
-switch any live service.
+This package defines six activation-gated Buzz ACP workers with supervision
+settings aligned to the live deployment. It renders and validates configuration
+only; it does not install, load, start, restart, or switch any live service.
 
 Each worker uses Buzz only as the conversation transport. `--no-memory` keeps
 Gateway as the sole memory and compaction owner. All six workers use the
@@ -63,15 +63,17 @@ pass its identity map explicitly (for example,
 `node deploy/local/aeon-aspects/validate.mjs /absolute/path/identity-map.json`).
 
 The checked-in `launchagents/` previews are real, deterministic launchd
-definitions with `RunAtLoad=false` and `KeepAlive=false`. They contain only
-owned private-key file paths and expected public keys, never key or token
-values. `/REQUIRES_FLEET/...` paths intentionally make them non-runnable until
-Fleet supplies an immutable OpenClaw binary and owned token file. `buzz-acp`
-opens its private-key file once with no-follow semantics, validates metadata on
-that same handle (absolute path, regular file, current-user owner, mode `0600`),
-and verifies that it derives the expected Aspect pubkey. The token-file contract
-requires the same path, type, ownership, and permission posture, with Fleet
-responsible for the runtime permission readback.
+definitions with `RunAtLoad=true` and `KeepAlive=true`, matching the supervised
+live posture so regeneration cannot silently disable DQ-39. They are not
+installed by this package and contain only owned private-key file paths and
+expected public keys, never key or token values. `/REQUIRES_FLEET/...` paths
+intentionally make them non-runnable until Fleet supplies an immutable
+OpenClaw binary and owned token file. `buzz-acp` opens its private-key file once
+with no-follow semantics, validates metadata on that same handle (absolute
+path, regular file, current-user owner, mode `0600`), and verifies that it
+derives the expected Aspect pubkey. The token-file contract requires the same
+path, type, ownership, and permission posture, with Fleet responsible for the
+runtime permission readback.
 
 ## Nexus resume and rollback packet
 
@@ -117,10 +119,9 @@ must remain held even if inbound ACP prompting succeeds.
 
 Socket reconnect deduplication is covered by the existing in-memory event-ID
 set and replay watermark. Exact-once behavior across a complete worker process
-restart is not proven because processed event IDs are not durable. Activation
-must keep this under `does_not_prove` until a durable inbox/outbox authority is
-selected. `restartOnFailure=false` and launchd `KeepAlive=false` intentionally
-block unattended production rather than claiming exactly-once behavior.
+restart is not proven because processed event IDs are not durable. Supervised
+restart is enabled to match live operations, but it does not itself prove
+exactly-once delivery; durable inbox/outbox authority remains separate evidence.
 
 Relay observer receipts also admit existing Architect-signed cancel and model
 control packets. `!cancel` maps to ACP cancellation, but `!rotate` only recreates

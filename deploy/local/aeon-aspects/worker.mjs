@@ -50,11 +50,11 @@ export function validateManifest(manifest, identityMap) {
   ) {
     errors.push("Gateway token file contract must require absolute regular non-symlink current-user 0600");
   }
-  if (manifest.supervisor?.runAtLoad !== false || manifest.supervisor?.startOnAppLaunch !== false) {
-    errors.push("workers must not start automatically");
+  if (manifest.supervisor?.runAtLoad !== true || manifest.supervisor?.startOnAppLaunch !== true) {
+    errors.push("workers must retain live supervised startup");
   }
-  if (manifest.supervisor?.restartOnFailure !== false) {
-    errors.push("restartOnFailure must remain false until durable request state exists");
+  if (manifest.supervisor?.restartOnFailure !== true) {
+    errors.push("workers must retain live restart supervision");
   }
   const concilium = identityMap.channels?.concilium;
   if (concilium?.channel_id !== manifest.buzz?.conciliumChannelId) errors.push("Concilium UUID drift");
@@ -230,8 +230,8 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
     aspect,
     label: rendered.label,
     enabled: false,
-    runAtLoad: false,
-    keepAlive: false,
+    runAtLoad: manifest.supervisor.runAtLoad,
+    keepAlive: manifest.supervisor.restartOnFailure,
     argv,
     privateKeyFile,
     tokenFile,
@@ -248,8 +248,8 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
 ${argsXml}
   </array>
   <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>${environmentXml}
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
+  <key>RunAtLoad</key><${manifest.supervisor.runAtLoad}/>
+  <key>KeepAlive</key><${manifest.supervisor.restartOnFailure}/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${xml(stdout)}</string>
   <key>StandardErrorPath</key><string>${xml(stderr)}</string>
