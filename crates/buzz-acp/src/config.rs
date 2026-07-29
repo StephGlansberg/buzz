@@ -487,6 +487,12 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MODEL")]
     pub model: Option<String>,
 
+    /// Title for the agent's ACP sessions, passed out-of-band in `session/new`
+    /// `_meta`. Adapters that recognize it name the session after this value;
+    /// others ignore it. Never enters the prompt.
+    #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
+    pub session_title: Option<String>,
+
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
@@ -622,6 +628,9 @@ pub struct Config {
     pub memory_enabled: bool,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
     pub model: Option<String>,
+    /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
+    /// `None` when unset or when the configured value sanitized to empty.
+    pub session_title: Option<String>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -661,6 +670,68 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+}
+
+/// Maximum length, in characters, of a session title sent to the adapter.
+const SESSION_TITLE_MAX_CHARS: usize = 80;
+
+/// Normalize a configured session title into something safe to hand an adapter.
+///
+/// Control characters are dropped, runs of whitespace collapse to a single
+/// space, and the result is trimmed and capped at
+/// [`SESSION_TITLE_MAX_CHARS`]. Returns `None` when nothing printable is left.
+///
+/// Buzz is the only guard here: Codex's own `normalize_thread_name` merely
+/// trims, so an unbounded display name would be persisted verbatim into its
+/// thread store.
+fn sanitize_session_title(raw: &str) -> Option<String> {
+    let collapsed = raw
+        .split_whitespace()
+        .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Truncate by chars, not bytes, so a multi-byte name can't be cut mid-UTF-8.
+    let title: String = collapsed
+        .chars()
+        .take(SESSION_TITLE_MAX_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// Separator between the agent name and the channel in a composed title.
+/// U+00B7 MIDDLE DOT, spaces on both sides.
+const SESSION_TITLE_SEPARATOR: &str = " · ";
+
+/// Compose a per-session title as `Agent · #channel`.
+///
+/// One agent in five channels gets five sessions; a bare agent name would show
+/// five identical rows in the adapter's thread list. Only the channel part is
+/// truncated to fit [`SESSION_TITLE_MAX_CHARS`], so the agent name always
+/// survives. Returns the bare agent name when there is no channel, the channel
+/// name is blank, or no room is left for it.
+pub(crate) fn compose_session_title(agent: &str, channel_name: Option<&str>) -> String {
+    let Some(channel) = channel_name.and_then(sanitize_session_title) else {
+        return agent.to_string();
+    };
+    // Reserve the separator and the `#` sigil alongside the agent name.
+    let reserved = agent.chars().count() + SESSION_TITLE_SEPARATOR.chars().count() + 1;
+    let channel: String = channel
+        .chars()
+        .take(SESSION_TITLE_MAX_CHARS.saturating_sub(reserved))
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    if channel.is_empty() {
+        return agent.to_string();
+    }
+    format!("{agent}{SESSION_TITLE_SEPARATOR}#{channel}")
 }
 
 /// Validate and deduplicate allowlist entries: each must be exactly 64 hex chars.
@@ -1148,6 +1219,10 @@ impl Config {
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
             model,
+            session_title: args
+                .session_title
+                .as_deref()
+                .and_then(sanitize_session_title),
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1607,6 +1682,7 @@ mod tests {
             typing_enabled: true,
             memory_enabled: true,
             model: None,
+            session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -2211,6 +2287,9 @@ mod tests {
             .expect("concilium id");
         let workers = manifest["workers"].as_array().expect("worker array");
         assert_eq!(workers.len(), 6);
+        let private_office_template =
+            std::fs::read_to_string(deploy.join("prompts/private-office.template.md"))
+                .expect("private-office prompt template");
 
         for worker in workers {
             let aspect = worker["aspect"].as_str().expect("aspect");
@@ -2260,12 +2339,11 @@ mod tests {
                 "owner-only".to_owned(),
                 "--no-memory".to_owned(),
             ];
-            if let Some(base_prompt_file) = worker["basePromptFile"].as_str() {
-                argv.push("--base-prompt-file".to_owned());
-                argv.push(root.join(base_prompt_file).to_string_lossy().into_owned());
-            } else {
-                argv.push("--no-base-prompt".to_owned());
-            }
+            let base_prompt_file = worker["basePromptFile"]
+                .as_str()
+                .expect("every Aspect has a private-office base prompt");
+            argv.push("--base-prompt-file".to_owned());
+            argv.push(root.join(base_prompt_file).to_string_lossy().into_owned());
             argv.extend([
                 "--dedup".to_owned(),
                 "queue".to_owned(),
@@ -2295,21 +2373,18 @@ mod tests {
             let cli = CliArgs::try_parse_from(argv)
                 .expect("real Clap parser accepts rendered worker argv");
             assert!(cli.no_memory);
-            if let Some(base_prompt_file) = worker["basePromptFile"].as_str() {
-                let expected_prompt_path = root.join(base_prompt_file);
-                assert!(!cli.no_base_prompt);
-                assert_eq!(
-                    cli.base_prompt_file.as_deref(),
-                    Some(expected_prompt_path.as_path())
-                );
-                let prompt = std::fs::read_to_string(expected_prompt_path).expect("base prompt");
-                assert!(prompt.contains(&format!("exactly one `buzz_{aspect}_reply`")));
-                assert!(prompt.contains("Plain assistant text is not published to Buzz"));
-                assert!(prompt.contains("Do not call `buzz messages send`"));
-            } else {
-                assert!(cli.no_base_prompt);
-                assert!(cli.base_prompt_file.is_none());
-            }
+            let expected_prompt_path = root.join(base_prompt_file);
+            assert!(!cli.no_base_prompt);
+            assert_eq!(
+                cli.base_prompt_file.as_deref(),
+                Some(expected_prompt_path.as_path())
+            );
+            let prompt = std::fs::read_to_string(expected_prompt_path).expect("base prompt");
+            let expected_prompt = private_office_template
+                .replace("{{ROOM}}", &format!("#aspect-{aspect}"))
+                .replace("{{REPLY_TOOL}}", &format!("buzz_{aspect}_reply"));
+            assert_eq!(prompt, expected_prompt);
+            assert!(!prompt.contains("buzz messages send"));
             assert!(cli.turn_receipts);
             assert!(cli.trusted_inbound_envelope);
             assert!(cli.no_agent_publisher_credentials);
@@ -3301,5 +3376,64 @@ require_exact_channel_tag = false
         const {
             assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
         }
+    }
+
+    #[test]
+    fn sanitize_session_title_collapses_whitespace_and_strips_control_chars() {
+        assert_eq!(
+            sanitize_session_title("  Fizz\t\tthe\n Bot\u{7}  "),
+            Some("Fizz the Bot".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_session_title_returns_none_when_nothing_printable_remains() {
+        assert_eq!(sanitize_session_title("   \n\t "), None);
+        assert_eq!(sanitize_session_title(""), None);
+        assert_eq!(sanitize_session_title("\u{1}\u{2}"), None);
+    }
+
+    #[test]
+    fn sanitize_session_title_caps_length_without_splitting_multibyte_chars() {
+        let raw = "\u{1f41d}".repeat(SESSION_TITLE_MAX_CHARS + 10);
+        let title = sanitize_session_title(&raw).expect("emoji title survives sanitizing");
+        assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert!(title.chars().all(|c| c == '\u{1f41d}'));
+    }
+
+    #[test]
+    fn sanitize_session_title_does_not_leave_a_trailing_space_after_the_cap() {
+        // The cap lands mid-word, so trimming must not leave a dangling space.
+        let raw = format!("{} tail", "a".repeat(SESSION_TITLE_MAX_CHARS - 1));
+        let title = sanitize_session_title(&raw).expect("title survives sanitizing");
+        assert_eq!(title, "a".repeat(SESSION_TITLE_MAX_CHARS - 1));
+    }
+
+    #[test]
+    fn compose_session_title_qualifies_the_agent_name_with_the_channel() {
+        assert_eq!(
+            compose_session_title("Fizz", Some("buzz-dev")),
+            "Fizz · #buzz-dev"
+        );
+    }
+
+    #[test]
+    fn compose_session_title_falls_back_to_bare_agent_name_without_a_channel() {
+        assert_eq!(compose_session_title("Fizz", None), "Fizz");
+        assert_eq!(compose_session_title("Fizz", Some("   ")), "Fizz");
+    }
+
+    #[test]
+    fn compose_session_title_truncates_the_channel_and_keeps_the_agent_name() {
+        let channel = "c".repeat(200);
+        let title = compose_session_title("Fizz", Some(&channel));
+        assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+        assert!(title.starts_with("Fizz · #c"));
+    }
+
+    #[test]
+    fn compose_session_title_drops_the_channel_when_the_agent_name_fills_the_cap() {
+        let agent = "a".repeat(SESSION_TITLE_MAX_CHARS);
+        assert_eq!(compose_session_title(&agent, Some("buzz-dev")), agent);
     }
 }

@@ -4,7 +4,14 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import fs from "node:fs";
-import { correlateReceipt, loadJson, renderDisabledLaunchAgent, renderWorker, validateManifest } from "./worker.mjs";
+import {
+  correlateReceipt,
+  loadJson,
+  renderDisabledLaunchAgent,
+  renderPrivateOfficePrompt,
+  renderWorker,
+  validateManifest,
+} from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const manifest = loadJson(join(here, "workers.json"));
@@ -27,13 +34,8 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
     assert.equal(rendered.supervisor.runAtLoad, false);
     assert.equal(rendered.supervisor.restartOnFailure, false);
     assert.match(argv, /--no-memory/);
-    if (worker.basePromptFile) {
-      assert.match(argv, new RegExp(`--base-prompt-file ${worker.basePromptFile}`));
-      assert.doesNotMatch(argv, /--no-base-prompt/);
-    } else {
-      assert.match(argv, /--no-base-prompt/);
-      assert.doesNotMatch(argv, /--base-prompt-file/);
-    }
+    assert.match(argv, new RegExp(`--base-prompt-file ${worker.basePromptFile}`));
+    assert.doesNotMatch(argv, /--no-base-prompt/);
     assert.match(argv, /--respond-to owner-only/);
     assert.match(argv, /--allowed-respond-to owner-only/);
     assert.match(argv, /--agents 1/);
@@ -59,35 +61,57 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
   }
 });
 
-test("only the three silent private offices receive exact trusted publisher prompts", () => {
-  const expected = new Map([
-    ["mechanon", "buzz_mechanon_reply"],
-    ["viatica", "buzz_viatica_reply"],
-    ["voxis", "buzz_voxis_reply"],
-  ]);
+test("one shared contract renders exact trusted publisher prompts for all six offices", () => {
+  const template = fs.readFileSync(join(here, "prompts", "private-office.template.md"), "utf8");
+  assert.equal((template.match(/\{\{ROOM\}\}/g) ?? []).length, 1);
+  assert.equal((template.match(/\{\{REPLY_TOOL\}\}/g) ?? []).length, 1);
+  assert.equal((template.match(/\{\{/g) ?? []).length, 2);
   for (const worker of manifest.workers) {
     const rendered = renderWorker(manifest, identityMap, worker.aspect);
-    const promptPath = worker.basePromptFile ? join(here, "..", "..", "..", worker.basePromptFile) : null;
-    if (!expected.has(worker.aspect)) {
-      assert.equal(promptPath, null);
-      assert.match(rendered.args.join(" "), /--no-base-prompt/);
-      continue;
-    }
+    const promptPath = join(here, "..", "..", "..", worker.basePromptFile);
     const prompt = fs.readFileSync(promptPath, "utf8");
-    const tool = expected.get(worker.aspect);
+    const tool = `buzz_${worker.aspect}_reply`;
+    assert.equal(prompt, renderPrivateOfficePrompt(template, worker.aspect));
+    assert.match(prompt, new RegExp(`#aspect-${worker.aspect}`));
     assert.match(prompt, new RegExp(`exactly one \`${tool}\``));
     assert.match(prompt, /Plain assistant text is not published to Buzz/);
-    assert.match(prompt, /Do not call `buzz messages send`/);
-    assert.match(prompt, /publisher credentials are intentionally withheld/);
+    assert.doesNotMatch(prompt, /buzz messages send/);
+    assert.match(prompt, /Publisher credentials are intentionally withheld/);
+    assert.match(prompt, /full existing OpenClaw tool, skill, memory, identity, and session capabilities/);
+    assert.match(prompt, /does not restrict any other tool use or capability/);
     assert.equal((prompt.match(new RegExp(tool, "g")) ?? []).length, 1);
+    for (const other of manifest.workers) {
+      if (other.aspect !== worker.aspect) {
+        assert.doesNotMatch(prompt, new RegExp(`buzz_${other.aspect}_reply`));
+      }
+    }
     assert.doesNotMatch(rendered.args.join(" "), /--no-base-prompt/);
   }
 });
 
-test("Nexus worker argv remains on the established no-base-prompt path", () => {
+test("no-argument prompt renderer emits the six checked-in generated contracts", () => {
+  const output = execFileSync(process.execPath, [join(here, "render-private-office-prompts.mjs")], {
+    cwd: here,
+    encoding: "utf8",
+  });
+  const rendered = JSON.parse(output);
+  assert.equal(rendered.schema, "aeon_private_office_prompts_v1");
+  assert.equal(Object.keys(rendered.artifacts).length, 6);
+  for (const worker of manifest.workers) {
+    assert.equal(
+      rendered.artifacts[`${worker.aspect}-private-office.md`],
+      fs.readFileSync(join(here, "prompts", `${worker.aspect}-private-office.md`), "utf8"),
+    );
+  }
+});
+
+test("Nexus uses the uniform publisher contract without changing its fixed session", () => {
   const rendered = renderWorker(manifest, identityMap, "nexus", "/owned/gateway.token");
-  assert.match(rendered.args.join(" "), /--no-base-prompt/);
-  assert.doesNotMatch(rendered.args.join(" "), /--base-prompt-file/);
+  assert.match(
+    rendered.args.join(" "),
+    /--base-prompt-file deploy\/local\/aeon-aspects\/prompts\/nexus-private-office\.md/,
+  );
+  assert.match(rendered.args.join(" "), /--session,agent:main:buzz-private,--require-existing/);
 });
 
 test("six deterministic LaunchAgent previews are disabled and secret-free", () => {
@@ -111,14 +135,9 @@ test("six deterministic LaunchAgent previews are disabled and secret-free", () =
     assert.match(first.plist, /\/REQUIRES_FLEET\/owned-token-file/);
     assert.doesNotMatch(first.plist, /nsec1|BUZZ_PRIVATE_KEY=/);
     assert.match(first.plist, /--no-agent-publisher-credentials/);
-    if (worker.basePromptFile) {
-      assert.match(first.plist, /--base-prompt-file/);
-      assert.match(first.plist, new RegExp(`/Volumes/AEON/Projects/buzz/${worker.basePromptFile}`));
-      assert.doesNotMatch(first.plist, /--no-base-prompt/);
-    } else {
-      assert.match(first.plist, /--no-base-prompt/);
-      assert.doesNotMatch(first.plist, /--base-prompt-file/);
-    }
+    assert.match(first.plist, /--base-prompt-file/);
+    assert.match(first.plist, new RegExp(`/Volumes/AEON/Projects/buzz/${worker.basePromptFile}`));
+    assert.doesNotMatch(first.plist, /--no-base-prompt/);
     assert.deepEqual(first.rollback, ["launchctl", "bootout", `gui/<uid>/${first.label}`]);
     labels.add(first.label);
   }
@@ -165,8 +184,8 @@ test("LaunchAgent rendering rejects unsafe or relative runtime paths", () => {
     /must be absolute/,
   );
   assert.throws(
-    () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { basePromptPath: "/owned/nexus.md" }),
-    /worker without a custom base prompt/,
+    () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { basePromptPath: "relative.md" }),
+    /must be absolute/,
   );
   assert.throws(
     () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { agentCommandPrefixArgs: ["relative.mjs"] }),

@@ -1,10 +1,19 @@
 import fs from "node:fs";
 
-const TRUSTED_PRIVATE_OFFICE_PUBLISHERS = Object.freeze({
-  mechanon: "buzz_mechanon_reply",
-  viatica: "buzz_viatica_reply",
-  voxis: "buzz_voxis_reply",
-});
+const PRIVATE_OFFICE_PROMPT_PREFIX = "deploy/local/aeon-aspects/prompts";
+
+export function renderPrivateOfficePrompt(template, aspect) {
+  if (!/^[a-z][a-z0-9-]*$/.test(aspect)) {
+    throw new Error(`invalid Aspect prompt slug: ${aspect}`);
+  }
+  const rendered = template
+    .replaceAll("{{ROOM}}", `#aspect-${aspect}`)
+    .replaceAll("{{REPLY_TOOL}}", `buzz_${aspect}_reply`);
+  if (rendered.includes("{{")) {
+    throw new Error(`${aspect}: unresolved private-office prompt token`);
+  }
+  return rendered;
+}
 
 export function loadJson(path) {
   return JSON.parse(fs.readFileSync(path, "utf8"));
@@ -17,7 +26,7 @@ export function validateManifest(manifest, identityMap) {
   if (manifest.workers?.length !== 6) errors.push("exactly six Aspect workers are required");
   if (manifest.buzz?.relayUrl !== "ws://localhost:3000") errors.push("Buzz relay must use localhost");
   if (manifest.posture?.memory !== false) errors.push("Buzz memory injection must be disabled");
-  if (manifest.posture?.basePrompt !== false) errors.push("Buzz base prompt must be disabled");
+  if (manifest.posture?.basePrompt !== false) errors.push("compiled generic Buzz base prompt must be disabled");
   if (manifest.posture?.respondTo !== "owner-only") errors.push("respondTo must be owner-only");
   if (manifest.posture?.agents !== 1) errors.push("each worker must have one ACP subprocess");
   if (manifest.posture?.dedup !== "queue") errors.push("dedup must be queue");
@@ -65,16 +74,9 @@ export function validateManifest(manifest, identityMap) {
     if (concilium?.channel_id === worker.privateChannelId) errors.push(`${worker.aspect}: private room is Concilium`);
     if (worker.sessionKey !== `agent:${worker.gatewayAgentId}:buzz-private`) errors.push(`${worker.aspect}: unstable session key`);
     if (!member.secret_ref) errors.push(`${worker.aspect}: missing private-key reference`);
-    const trustedPublisher = TRUSTED_PRIVATE_OFFICE_PUBLISHERS[worker.aspect];
-    const expectedPromptFile = trustedPublisher
-      ? `deploy/local/aeon-aspects/prompts/${worker.aspect}-private-office.md`
-      : undefined;
+    const expectedPromptFile = `${PRIVATE_OFFICE_PROMPT_PREFIX}/${worker.aspect}-private-office.md`;
     if (worker.basePromptFile !== expectedPromptFile) {
-      errors.push(
-        trustedPublisher
-          ? `${worker.aspect}: trusted private-office base prompt drift`
-          : `${worker.aspect}: must retain the default-off base prompt`,
-      );
+      errors.push(`${worker.aspect}: trusted private-office base prompt drift`);
     }
   }
   warnings.push("avatar metadata is absent from identity-map.json; live profile avatar validation remains open");

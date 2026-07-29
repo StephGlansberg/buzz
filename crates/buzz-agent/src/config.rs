@@ -184,6 +184,7 @@ pub fn anthropic_thinking_config(
 fn anthropic_model_supports_xhigh(model: &str) -> bool {
     model.starts_with("claude-opus-4-7")
         || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-opus-5")
         || model.starts_with("claude-sonnet-5")
         || model.starts_with("claude-fable-5")
         || model.starts_with("claude-mythos-5")
@@ -606,6 +607,7 @@ fn is_adaptive_thinking_model(model: &str) -> bool {
     model.starts_with("claude-opus-4-6")
         || model.starts_with("claude-opus-4-7")
         || model.starts_with("claude-opus-4-8")
+        || model.starts_with("claude-opus-5")
         // Sonnet 5.x (any patch/date suffix after "claude-sonnet-5").
         || model.starts_with("claude-sonnet-5")
         // Sonnet 4.6 exactly (not Sonnet 4.5 or earlier — not in the adaptive table).
@@ -726,6 +728,12 @@ pub struct Config {
     pub anthropic_api_version: String,
     /// OpenAI endpoint selection. See [`OpenAiApi`].
     pub openai_api: OpenAiApi,
+    /// Prefer mesh-llm's virtual `mesh` model when the configured/effective
+    /// OpenAI model is `auto` and the live model catalog advertises it.
+    /// Set by Buzz's relay-mesh provider via
+    /// `BUZZ_AGENT_PREFER_MESH_FOR_AUTO=1`; other providers keep their
+    /// existing `auto` semantics.
+    pub prefer_mesh_for_auto: bool,
     pub hints_enabled: bool,
     /// Thinking/reasoning effort level. `None` = use provider default (no
     /// thinking config sent). Set via `BUZZ_AGENT_THINKING_EFFORT`.
@@ -798,6 +806,7 @@ impl Config {
             base_url,
             anthropic_api_version: env_or("ANTHROPIC_API_VERSION", "2023-06-01"),
             openai_api,
+            prefer_mesh_for_auto: parse_env("BUZZ_AGENT_PREFER_MESH_FOR_AUTO", 0u8)? != 0,
             max_rounds: parse_env("BUZZ_AGENT_MAX_ROUNDS", 0)?,
             max_output_tokens: parse_env("BUZZ_AGENT_MAX_OUTPUT_TOKENS", 32_768)?,
             llm_timeout: Duration::from_secs(parse_env("BUZZ_AGENT_LLM_TIMEOUT_SECS", 240)?),
@@ -844,6 +853,7 @@ impl Config {
             system_prompt: String::new(),
             anthropic_api_version: "2023-06-01".into(),
             openai_api: OpenAiApi::Chat,
+            prefer_mesh_for_auto: false,
             max_rounds: 0,
             max_output_tokens: 1,
             llm_timeout: Duration::from_secs(30),

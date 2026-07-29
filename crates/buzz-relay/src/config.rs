@@ -58,6 +58,20 @@ pub struct Config {
     pub read_database_url: Option<String>,
     /// Redis connection URL used by the pub/sub manager.
     pub redis_url: String,
+    /// Maximum connections in the shared Redis pool. Defaults to 16.
+    ///
+    /// deadpool's own default is `CPU_COUNT * 2`, which on a 2-vCPU relay
+    /// pod is only 4 — small enough that rate-limit checks, presence, and
+    /// pub/sub publishes queue behind each other under load.
+    pub redis_pool_size: usize,
+    /// Maximum connections in the Postgres writer/reader pools. Defaults to 50.
+    ///
+    /// The `buzz-db` default of 20 was sized for a handful of pods against
+    /// `max_connections=100`. Against Aurora (~5,000 connections) that cap
+    /// is the binding constraint: a burst of concurrent handlers exhausts
+    /// the per-pod pool and requests fail on acquire timeout while the
+    /// database sits idle.
+    pub db_pool_size: u32,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
@@ -411,6 +425,18 @@ impl Config {
 
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
+        let redis_pool_size = std::env::var("BUZZ_REDIS_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(16);
+
+        let db_pool_size = std::env::var("BUZZ_DB_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(50);
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
@@ -862,6 +888,8 @@ impl Config {
             database_url,
             read_database_url,
             redis_url,
+            redis_pool_size,
+            db_pool_size,
             relay_url,
             pairing_relay_url,
             max_connections,
@@ -928,6 +956,8 @@ mod tests {
         assert!(config.bind_addr.port() > 0);
         assert!(!config.database_url.is_empty());
         assert!(!config.redis_url.is_empty());
+        assert_eq!(config.redis_pool_size, 16);
+        assert_eq!(config.db_pool_size, 50);
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
@@ -968,6 +998,56 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn redis_pool_size_env_override_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_REDIS_POOL_SIZE");
+
+        std::env::set_var("BUZZ_REDIS_POOL_SIZE", "32");
+        let overridden = Config::from_env().expect("config").redis_pool_size;
+
+        std::env::set_var("BUZZ_REDIS_POOL_SIZE", "0");
+        let zero = Config::from_env().expect("config").redis_pool_size;
+
+        std::env::set_var("BUZZ_REDIS_POOL_SIZE", "not-a-number");
+        let junk = Config::from_env().expect("config").redis_pool_size;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_REDIS_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_REDIS_POOL_SIZE");
+        }
+
+        assert_eq!(overridden, 32);
+        assert_eq!(zero, 16, "zero must fall back to the default");
+        assert_eq!(junk, 16, "unparsable value must fall back to the default");
+    }
+
+    #[test]
+    fn db_pool_size_env_override_and_invalid_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_DB_POOL_SIZE");
+
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "80");
+        let overridden = Config::from_env().expect("config").db_pool_size;
+
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "0");
+        let zero = Config::from_env().expect("config").db_pool_size;
+
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "not-a-number");
+        let junk = Config::from_env().expect("config").db_pool_size;
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_POOL_SIZE");
+        }
+
+        assert_eq!(overridden, 80);
+        assert_eq!(zero, 50, "zero must fall back to the default");
+        assert_eq!(junk, 50, "unparsable value must fall back to the default");
     }
 
     #[test]

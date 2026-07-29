@@ -2,7 +2,13 @@
 import fs from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadJson, renderDisabledLaunchAgent, renderWorker, validateManifest } from "./worker.mjs";
+import {
+  loadJson,
+  renderDisabledLaunchAgent,
+  renderPrivateOfficePrompt,
+  renderWorker,
+  validateManifest,
+} from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const manifestPath = join(here, "workers.json");
@@ -13,7 +19,13 @@ const validation = validateManifest(manifest, identityMap);
 const rendered = validation.ok ? manifest.workers.map((worker) => renderWorker(manifest, identityMap, worker.aspect)) : [];
 const launchAgents = [];
 if (validation.ok) {
+  const promptTemplate = fs.readFileSync(join(here, "prompts", "private-office.template.md"), "utf8");
   for (const worker of manifest.workers) {
+    const promptPath = join(here, "prompts", `${worker.aspect}-private-office.md`);
+    const expectedPrompt = renderPrivateOfficePrompt(promptTemplate, worker.aspect);
+    if (!fs.existsSync(promptPath) || fs.readFileSync(promptPath, "utf8") !== expectedPrompt) {
+      validation.errors.push(`${worker.aspect}: checked-in private-office prompt drift`);
+    }
     const artifact = renderDisabledLaunchAgent(manifest, identityMap, worker.aspect);
     const path = join(here, "launchagents", `${artifact.label}.plist`);
     if (!fs.existsSync(path) || fs.readFileSync(path, "utf8") !== artifact.plist) {

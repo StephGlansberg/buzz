@@ -5,11 +5,12 @@ validates configuration only; it does not install, load, start, restart, or
 switch any live service.
 
 Each worker uses Buzz only as the conversation transport. `--no-memory` keeps
-Gateway as the sole memory and compaction owner. Nexus, Fontis, and Sapientis
-retain `--no-base-prompt`; Viatica, Voxis, and Mechanon use the existing
-`--base-prompt-file` facility for a narrow per-turn publishing contract that
-requires their exact trusted `buzz_<aspect>_reply` tool. These custom prompts
-replace Buzz's generic `buzz messages send` doctrine, which is intentionally
+Gateway as the sole memory and compaction owner. All six workers use the
+existing `--base-prompt-file` facility with one shared contract rendered using
+only the private-office room and trusted `buzz_<aspect>_reply` tool names. The
+contract explicitly preserves each Aspect's full existing OpenClaw tools,
+skills, memory, identity, and fixed session. These custom prompts replace
+Buzz's generic `buzz messages send` doctrine, which is intentionally
 incompatible with `--no-agent-publisher-credentials`. Fleet may supply an
 absolute installed `basePromptPath`; no prompt content is embedded in a plist.
 The adapter binds to a pre-created session with
@@ -52,6 +53,7 @@ Run the source validation without changing live state:
 
 ```sh
 node deploy/local/aeon-aspects/validate.mjs
+node deploy/local/aeon-aspects/render-private-office-prompts.mjs
 node deploy/local/aeon-aspects/render-launchagents.mjs
 ```
 
@@ -151,7 +153,7 @@ remains an explicit blocker before broad UI rollout.
 | workflows | native Buzz workflow surface, intentionally not subscribed here | upstream approval/multi-room behavior and explicit AEON authority |
 
 The worker intentionally sets no Buzz MCP, model, system prompt, team
-instructions, or initial message. Those would duplicate or override Gateway's
-tools, skills, model, and Aspect identity. Concilium, workflows, raw audio,
-media mutations, broad A2A speech, and the other five live workers remain held
-past the Nexus text canary.
+instructions, or initial message. The narrow base prompt governs only the
+required final Buzz publication; Gateway continues to own tools, skills,
+memory, model, and Aspect identity. Concilium, workflows, raw audio, media
+mutations, and broad A2A speech remain independently gated.
