@@ -5,6 +5,7 @@ import {
   mergeFlattenTimelineReplies,
   flattenTimelineRootIds,
 } from "./flattenChannelTimeline.ts";
+import { buildChannelMainTimelineEntries } from "./channelMainTimeline.ts";
 import { shouldFlattenChannelTimeline } from "./threading.ts";
 
 test("shouldFlattenChannelTimeline is true for private rooms and DMs only", () => {
@@ -24,6 +25,17 @@ test("shouldFlattenChannelTimeline is true for private rooms and DMs only", () =
     false,
   );
   assert.equal(shouldFlattenChannelTimeline(null), false);
+});
+
+test("private timeline tolerates summaries still loading", () => {
+  const result = buildChannelMainTimelineEntries(
+    { channelType: "stream", visibility: "private" },
+    [],
+    undefined,
+  );
+
+  assert.equal(result.flattenReplies, true);
+  assert.deepEqual(result.entries, []);
 });
 
 test("mergeFlattenTimelineReplies preserves reply tags and dedupes by id", () => {
