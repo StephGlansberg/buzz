@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{error, warn};
 
@@ -16,10 +16,32 @@ use tracing::{error, warn};
 pub enum FilterError {
     #[error("expression too long ({len} bytes, max {max})")]
     ExpressionTooLong { len: usize, max: usize },
-    #[error("evaluation timed out")]
-    Timeout,
+    #[error("evaluation timed out during {stage}")]
+    Timeout { stage: FilterTimeoutStage },
     #[error("evaluation error: {0}")]
     EvalError(String),
+}
+
+/// Stage at which a filter evaluation exhausted its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterTimeoutStage {
+    /// Waiting for capacity in the bounded filter evaluator.
+    Admission,
+    /// Waiting for the blocking executor to start the admitted evaluation.
+    Start,
+    /// Evaluating the expression after the blocking job started.
+    Execution,
+}
+
+impl std::fmt::Display for FilterTimeoutStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Admission => "admission",
+            Self::Start => "start",
+            Self::Execution => "execution",
+        };
+        formatter.write_str(value)
+    }
 }
 
 /// Variables extracted from a Nostr event for use in filter expressions.
@@ -175,6 +197,13 @@ const MAX_EXPR_LEN: usize = 4096;
 /// Maximum wall-clock time allowed for a single evalexpr evaluation.
 const EVAL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Maximum time an admitted evaluation may wait for a blocking worker.
+///
+/// This is deliberately separate from [`EVAL_TIMEOUT`]. Blocking-pool queue
+/// latency is executor pressure, not expression execution time, and charging
+/// it to the expression deadline caused trivial filters to fail spuriously.
+const EVAL_START_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Maximum concurrent blocking filter evaluations.
 ///
 /// The semaphore permit is moved into each `spawn_blocking` closure so it is
@@ -220,6 +249,22 @@ pub async fn evaluate_filter(
     let eval_ctx = build_eval_context(ctx).map_err(FilterError::EvalError)?;
     let expr_owned = expr.to_owned();
 
+    run_filter_eval(move || {
+        // Use the pre-compiled AST when available; fall back to string parsing.
+        if let Some(node) = node {
+            node.eval_boolean_with_context(&eval_ctx)
+        } else {
+            evalexpr::eval_boolean_with_context(&expr_owned, &eval_ctx)
+        }
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn run_filter_eval<F>(evaluate: F) -> Result<bool, FilterError>
+where
+    F: FnOnce() -> Result<bool, String> + Send + 'static,
+{
     // Acquire an *owned* permit so it can be moved into the spawn_blocking closure.
     // The permit is held until the blocking task actually completes — not just until
     // the caller's timeout fires — so the semaphore truly bounds the number of live
@@ -232,29 +277,53 @@ pub async fn evaluate_filter(
         Arc::clone(&*FILTER_EVAL_SEMAPHORE).acquire_owned(),
     )
     .await
-    .map_err(|_| FilterError::Timeout)?
+    .map_err(|_| FilterError::Timeout {
+        stage: FilterTimeoutStage::Admission,
+    })?
     .map_err(|e| FilterError::EvalError(format!("semaphore closed: {e}")))?;
 
-    let result = tokio::time::timeout(
-        EVAL_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            // Hold the permit for the lifetime of this closure: released only
-            // when the blocking thread returns, not when the caller times out.
-            let _permit = permit;
-            // Use the pre-compiled AST when available; fall back to string parsing.
-            if let Some(node) = node {
-                node.eval_boolean_with_context(&eval_ctx)
-            } else {
-                evalexpr::eval_boolean_with_context(&expr_owned, &eval_ctx)
-            }
-        }),
-    )
-    .await
-    .map_err(|_| FilterError::Timeout)?
-    .map_err(|e| FilterError::EvalError(format!("eval task panicked: {e}")))?
-    .map_err(|e| FilterError::EvalError(e.to_string()))?;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut task = tokio::task::spawn_blocking(move || {
+        // Hold the permit for the lifetime of this closure: released only
+        // when the blocking thread returns, not when the caller times out.
+        let _permit = permit;
+        let started_at = Instant::now();
+        let _ = started_tx.send(());
+        let result = evaluate();
+        (result, started_at.elapsed())
+    });
 
-    Ok(result)
+    match tokio::time::timeout(EVAL_START_TIMEOUT, started_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return task
+                .await
+                .map_err(|error| FilterError::EvalError(format!("eval task panicked: {error}")))?
+                .0
+                .map_err(FilterError::EvalError);
+        }
+        Err(_) => {
+            task.abort();
+            return Err(FilterError::Timeout {
+                stage: FilterTimeoutStage::Start,
+            });
+        }
+    }
+
+    let (result, execution_time) = tokio::time::timeout(EVAL_TIMEOUT, &mut task)
+        .await
+        .map_err(|_| FilterError::Timeout {
+            stage: FilterTimeoutStage::Execution,
+        })?
+        .map_err(|error| FilterError::EvalError(format!("eval task panicked: {error}")))?;
+
+    if execution_time > EVAL_TIMEOUT {
+        return Err(FilterError::Timeout {
+            stage: FilterTimeoutStage::Execution,
+        });
+    }
+
+    result.map_err(FilterError::EvalError)
 }
 
 /// Build an `evalexpr::HashMapContext` from a `FilterContext`.
@@ -451,12 +520,13 @@ pub async fn match_event(
                     rule.consecutive_timeouts.store(0, Ordering::Relaxed);
                     continue;
                 }
-                Err(FilterError::Timeout) => {
+                Err(FilterError::Timeout { stage }) => {
                     let n = rule.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                     warn!(
                         rule = %rule.name,
                         rule_index = index,
                         consecutive_timeouts = n,
+                        timeout_stage = %stage,
                         "filter expression timed out; failing closed (no match for any rule)"
                     );
                     // Fail-closed: timeout → no match, not next rule.
@@ -627,6 +697,75 @@ mod tests {
             .await
             .unwrap();
         assert!(result);
+    }
+
+    #[test]
+    fn test_blocking_queue_delay_does_not_consume_expression_deadline() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+
+            let release_thread = std::thread::spawn(move || {
+                std::thread::sleep(EVAL_TIMEOUT + Duration::from_millis(150));
+                release_blocker_tx.send(()).unwrap();
+            });
+
+            let event = make_event(9, "production request");
+            let author = event.pubkey.to_hex();
+            let expression = format!(
+                r#"author == "{a}" || author == "{author}" || author == "{c}""#,
+                a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
+            let node = Arc::new(evalexpr::build_operator_tree(&expression).unwrap());
+            let channel_id = any_channel();
+            let mut rule = make_rule(
+                "private-office",
+                ChannelScope::List(vec![channel_id.to_string()]),
+                vec![9, 40002],
+                false,
+                Some(&expression),
+                None,
+            );
+            rule.compiled_filter = Some(node);
+
+            let matched = match_event(&event, channel_id, &[rule], "").await.unwrap();
+            assert_eq!(matched.prompt_tag, "private-office");
+
+            release_thread.join().unwrap();
+            blocker.await.unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn test_execution_deadline_remains_fail_closed() {
+        let error = run_filter_eval(|| {
+            std::thread::sleep(EVAL_TIMEOUT + Duration::from_millis(150));
+            Ok(true)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FilterError::Timeout {
+                stage: FilterTimeoutStage::Execution
+            }
+        ));
     }
 
     #[tokio::test]
