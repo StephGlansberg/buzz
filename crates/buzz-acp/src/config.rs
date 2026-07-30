@@ -63,12 +63,24 @@ fn read_owned_secret_file(path: &std::path::Path) -> Result<String, ConfigError>
             .map_err(std::io::Error::from)?;
         std::fs::File::from(fd)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(not(any(unix, windows)))]
     let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
 
     // Validate metadata from the same no-follow handle that supplies the key.
     // This avoids a validate-then-reopen race where the path could be swapped.
     let metadata = file.metadata()?;
+    #[cfg(windows)]
+    validate_windows_secret_handle(&file, &metadata)?;
     if !metadata.is_file() {
         return Err(ConfigError::ConfigFile(
             "--private-key-file must be a regular, non-symlink file".into(),
@@ -91,6 +103,78 @@ fn read_owned_secret_file(path: &std::path::Path) -> Result<String, ConfigError>
     let mut secret = String::new();
     file.read_to_string(&mut secret)?;
     Ok(secret.trim().to_string())
+}
+
+#[cfg(windows)]
+fn validate_windows_secret_handle(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Result<(), ConfigError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_permissions::constants::{SeObjectType, SecurityInformation};
+    use windows_permissions::{utilities, wrappers};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ConfigError::ConfigFile(
+            "--private-key-file must not be a Windows reparse point".into(),
+        ));
+    }
+
+    let descriptor = wrappers::GetSecurityInfo(
+        file,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Owner | SecurityInformation::Dacl,
+    )?;
+    let current_user = utilities::current_process_sid()?;
+    validate_windows_secret_descriptor(&descriptor, &current_user)
+}
+
+#[cfg(windows)]
+fn validate_windows_secret_descriptor(
+    descriptor: &windows_permissions::SecurityDescriptor,
+    current_user: &windows_permissions::Sid,
+) -> Result<(), ConfigError> {
+    use windows_permissions::constants::AceType;
+    use windows_permissions::{LocalBox, Sid};
+
+    if descriptor.owner() != Some(current_user) {
+        return Err(ConfigError::ConfigFile(
+            "--private-key-file must be owned by the current Windows user".into(),
+        ));
+    }
+    let dacl = descriptor.dacl().ok_or_else(|| {
+        ConfigError::ConfigFile("--private-key-file must have a restrictive Windows DACL".into())
+    })?;
+    let system: LocalBox<Sid> = "S-1-5-18".parse()?;
+    let administrators: LocalBox<Sid> = "S-1-5-32-544".parse()?;
+
+    for index in 0..dacl.len() {
+        let ace = dacl.get_ace(index).ok_or_else(|| {
+            ConfigError::ConfigFile(
+                "--private-key-file has an unreadable Windows DACL entry".into(),
+            )
+        })?;
+        let is_allow = matches!(
+            ace.ace_type(),
+            AceType::ACCESS_ALLOWED_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+                | AceType::ACCESS_ALLOWED_OBJECT_ACE_TYPE
+        );
+        if !is_allow {
+            continue;
+        }
+        let trusted = ace.sid().is_some_and(|sid| {
+            sid == current_user || sid == system.as_ref() || sid == administrators.as_ref()
+        });
+        if !trusted {
+            return Err(ConfigError::ConfigFile(
+                "--private-key-file Windows DACL grants access outside the current user, SYSTEM, or Administrators".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -1886,6 +1970,121 @@ mod tests {
         std::fs::remove_file(link).unwrap();
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_key_descriptor_requires_current_owner_and_restrictive_dacl() {
+        use windows_permissions::{utilities, LocalBox, SecurityDescriptor, Sid};
+
+        let current_user = utilities::current_process_sid().expect("current process SID");
+        let current_user_text = current_user.to_string();
+        let restrictive: LocalBox<SecurityDescriptor> = format!(
+            "O:{current_user_text}D:P(A;;FA;;;{current_user_text})(A;;FA;;;SY)(A;;FA;;;BA)"
+        )
+        .parse()
+        .expect("restrictive descriptor");
+        validate_windows_secret_descriptor(&restrictive, &current_user)
+            .expect("current user, SYSTEM, and Administrators are trusted");
+
+        let permissive: LocalBox<SecurityDescriptor> =
+            format!("O:{current_user_text}D:P(A;;FA;;;{current_user_text})(A;;FR;;;WD)")
+                .parse()
+                .expect("permissive descriptor");
+        assert!(matches!(
+            validate_windows_secret_descriptor(&permissive, &current_user),
+            Err(ConfigError::ConfigFile(message))
+                if message.contains("grants access outside")
+        ));
+
+        let another_owner: LocalBox<Sid> = "S-1-5-21-1-2-3-1001".parse().expect("test owner SID");
+        assert!(matches!(
+            validate_windows_secret_descriptor(&restrictive, &another_owner),
+            Err(ConfigError::ConfigFile(message))
+                if message.contains("owned by the current Windows user")
+        ));
+
+        let null_dacl: LocalBox<SecurityDescriptor> = format!("O:{current_user_text}")
+            .parse()
+            .expect("descriptor without DACL");
+        assert!(matches!(
+            validate_windows_secret_descriptor(&null_dacl, &current_user),
+            Err(ConfigError::ConfigFile(message))
+                if message.contains("restrictive Windows DACL")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_key_reads_from_the_validated_non_reparse_handle() {
+        use std::os::windows::fs::symlink_file;
+        use windows_permissions::constants::{SeObjectType, SecurityInformation};
+        use windows_permissions::{utilities, wrappers, LocalBox, SecurityDescriptor};
+
+        let dir = std::env::temp_dir().join(format!("buzz-acp-key-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("test directory");
+        let path = dir.join("aspect.sk");
+        let secret = "1".repeat(64);
+        std::fs::write(&path, &secret).expect("test key");
+
+        let current_user = utilities::current_process_sid().expect("current process SID");
+        let current_user_text = current_user.to_string();
+        let restrictive: LocalBox<SecurityDescriptor> =
+            format!("D:P(A;;FA;;;{current_user_text})(A;;FA;;;SY)(A;;FA;;;BA)")
+                .parse()
+                .expect("restrictive descriptor");
+        wrappers::SetNamedSecurityInfo(
+            &path,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl,
+            None,
+            None,
+            restrictive.dacl(),
+            None,
+        )
+        .expect("apply restrictive DACL");
+        assert_eq!(
+            read_owned_secret_file(&path).expect("validated key handle"),
+            secret
+        );
+
+        let permissive: LocalBox<SecurityDescriptor> =
+            format!("D:P(A;;FA;;;{current_user_text})(A;;FR;;;WD)")
+                .parse()
+                .expect("permissive descriptor");
+        wrappers::SetNamedSecurityInfo(
+            &path,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl,
+            None,
+            None,
+            permissive.dacl(),
+            None,
+        )
+        .expect("apply permissive DACL");
+        assert!(read_owned_secret_file(&path).is_err());
+
+        wrappers::SetNamedSecurityInfo(
+            &path,
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Dacl,
+            None,
+            None,
+            restrictive.dacl(),
+            None,
+        )
+        .expect("restore restrictive DACL");
+        let link = dir.join("aspect-link.sk");
+        if symlink_file(&path, &link).is_ok() {
+            assert!(matches!(
+                read_owned_secret_file(&link),
+                Err(ConfigError::ConfigFile(message))
+                    if message.contains("reparse point")
+            ));
+            std::fs::remove_file(&link).expect("remove link");
+        }
+        std::fs::remove_file(path).expect("remove key");
+        std::fs::remove_dir(dir).expect("remove directory");
     }
 
     #[test]

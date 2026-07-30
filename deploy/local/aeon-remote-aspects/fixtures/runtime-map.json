@@ -1,0 +1,24 @@
+{
+  "windowsUserSid": "S-1-5-21-1-2-3-1001",
+  "relayUrl": "wss://architects-mac-mini.tail757661.ts.net",
+  "workers": {
+    "fama": {
+      "buzzAcpPath": "C:\\AEON\\Buzz\\buzz-acp.exe",
+      "openclawPath": "C:\\AEON\\FAMA\\openclaw.exe",
+      "workingDirectory": "C:\\AEON\\FAMA",
+      "gatewayUrl": "ws://127.0.0.1:18821",
+      "gatewayTokenFile": "C:\\Users\\Operator\\AppData\\Local\\AEON\\secrets\\fama-gateway.token",
+      "configPath": "C:\\Users\\Operator\\AppData\\Local\\AEON\\buzz\\fama.toml",
+      "basePromptPath": "C:\\Users\\Operator\\AppData\\Local\\AEON\\buzz\\fama-private-office.md"
+    },
+    "opulentis": {
+      "buzzAcpPath": "C:\\AEON\\Buzz\\buzz-acp.exe",
+      "openclawPath": "C:\\AEON\\Opulentis\\openclaw.exe",
+      "workingDirectory": "C:\\AEON\\Opulentis",
+      "gatewayUrl": "ws://127.0.0.1:18820",
+      "gatewayTokenFile": "C:\\Users\\Operator\\AppData\\Local\\AEON\\secrets\\opulentis-gateway.token",
+      "configPath": "C:\\Users\\Operator\\AppData\\Local\\AEON\\buzz\\opulentis.toml",
+      "basePromptPath": "C:\\Users\\Operator\\AppData\\Local\\AEON\\buzz\\opulentis-private-office.md"
+    }
+  }
+}

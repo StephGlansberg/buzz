@@ -76,6 +76,12 @@ evalexpr = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["fs", "signal", "user"] }
 
+[target.'cfg(windows)'.dependencies]
+# Safe handle-based wrappers for owner/DACL inspection. The target file is
+# opened by std with FILE_FLAG_OPEN_REPARSE_POINT before this owner is used.
+windows-permissions = "0.2.4"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 httparse = "1"

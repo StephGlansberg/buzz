@@ -1,0 +1,80 @@
+{
+  "schema": "aeon_buzz_acp_remote_windows_workers_v1",
+  "enabled": false,
+  "identityMap": "operator-supplied",
+  "runtimeMap": "operator-supplied",
+  "buzz": {
+    "relayContract": {
+      "scheme": "wss",
+      "configured": false,
+      "liveVerified": false
+    },
+    "architectPubkey": "73ac8798fd9cedcc5d24645d7ed49332d94a28f2c937f4c1b638f92bf6e8e91f"
+  },
+  "posture": {
+    "agents": 1,
+    "respondTo": "owner-only",
+    "allowedRespondTo": ["owner-only"],
+    "memory": true,
+    "customBasePrompt": true,
+    "dedup": "queue",
+    "multipleEventHandling": "queue",
+    "presence": true,
+    "typing": true,
+    "relayObserver": true,
+    "trustedInboundEnvelope": true,
+    "publisherCredentials": false,
+    "permissionMode": "dontAsk",
+    "heartbeatIntervalSecs": 0,
+    "turnLivenessSecs": 10,
+    "idleTimeoutSecs": 900,
+    "maxTurnDurationSecs": 7200,
+    "contextMessageLimit": 12,
+    "maxTurnsPerSession": 0,
+    "turnReceipts": true,
+    "externalMutationAuthority": false
+  },
+  "secretFileContract": {
+    "absolute": true,
+    "regular": true,
+    "reparsePoint": false,
+    "owner": "current-user-sid",
+    "daclAllow": ["current-user-sid", "SYSTEM", "Administrators"],
+    "expectedPublicKey": true
+  },
+  "activationGate": {
+    "activationAllowed": false,
+    "publicSocialMutation": "unknown",
+    "capitalMutation": "unknown",
+    "requiredEvidenceSchema": "aeon_buzz_remote_windows_policy_evidence_v1",
+    "requiredDecision": "absent_or_refused"
+  },
+  "supervisor": {
+    "type": "windows-task-scheduler",
+    "enabled": false,
+    "logonTrigger": true,
+    "multipleInstances": "IgnoreNew",
+    "restartInterval": "PT10S",
+    "restartCount": 3
+  },
+  "windowsBaseline": {
+    "fama": {
+      "gatewayUrl": "ws://127.0.0.1:18821",
+      "schedulerRoot": "\\FAMA\\"
+    },
+    "opulentis": {
+      "gatewayUrl": "ws://127.0.0.1:18820",
+      "schedulerRoot": "\\Opulentis\\"
+    }
+  },
+  "workers": [
+    {
+      "aspect": "fama",
+      "displayName": "FAMA"
+    },
+    {
+      "aspect": "opulentis",
+      "displayName": "Opulentis"
+    }
+  ]
+}

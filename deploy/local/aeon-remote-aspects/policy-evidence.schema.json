@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AEON Buzz remote Windows policy evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "workers"],
+  "properties": {
+    "schema": {
+      "const": "aeon_buzz_remote_windows_policy_evidence_v1"
+    },
+    "workers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fama", "opulentis"],
+      "properties": {
+        "fama": {
+          "$ref": "#/$defs/seat"
+        },
+        "opulentis": {
+          "$ref": "#/$defs/seat"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "seat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_key",
+        "tools_effective_path",
+        "tools_effective_sha256",
+        "public_social_mutation",
+        "capital_mutation",
+        "reviewed_by",
+        "reviewed_at"
+      ],
+      "properties": {
+        "session_key": {
+          "type": "string",
+          "pattern": "^agent:[a-z][a-z0-9-]*:buzz-private$"
+        },
+        "tools_effective_path": {
+          "type": "string",
+          "minLength": 3
+        },
+        "tools_effective_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "public_social_mutation": {
+          "const": "absent_or_refused"
+        },
+        "capital_mutation": {
+          "const": "absent_or_refused"
+        },
+        "reviewed_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}
