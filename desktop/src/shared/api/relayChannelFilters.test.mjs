@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildChannelAuxDeletionFilter,
   buildChannelAuxFilter,
+  buildChannelCanvasLiveFilter,
   buildChannelReactionAuxFilter,
   buildChannelStructuralAuxFilter,
 } from "./relayChannelFilters.ts";
@@ -13,6 +14,14 @@ const IDS = [
   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 ];
+
+test("canvas live filter is channel-scoped and replays only the latest canvas", () => {
+  assert.deepEqual(buildChannelCanvasLiveFilter(CHANNEL), {
+    kinds: [40100],
+    "#h": [CHANNEL],
+    limit: 1,
+  });
+});
 
 // Regression: reaction (kind:7) and reaction-removal (kind:5) events carry only
 // an `e` tag, no channel `h` tag. An `#h`-scoped aux query never matches them,
