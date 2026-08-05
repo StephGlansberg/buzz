@@ -462,7 +462,7 @@ export const ChannelPane = React.memo(function ChannelPane({
       buildChannelMainTimelineEntries(
         activeChannel,
         visibleMessages,
-        threadSummaries,
+        threadSummaries ?? new Map(),
         profiles,
       ),
     [activeChannel, profiles, threadSummaries, visibleMessages],
