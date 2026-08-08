@@ -40,6 +40,7 @@ const REQUIRED_CLAUDE_AUTH = {
 };
 const ANTHROPIC_CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 const CURSOR_OVERRIDE_ENV = ["CURSOR_API_KEY", "CURSOR_API_ENDPOINT"];
+const REQUIRED_RELAY_URL = "wss://architects-mac-mini.tail757661.ts.net";
 const REQUIRED_SHARED_ROOMS = ["ops", "concilium"];
 const REQUIRED_OFFICE_ROOMS = [
   "aspect_nexus",
@@ -118,6 +119,8 @@ const WORKER_CONTRACTS = {
     adapterPackage: "@agentclientprotocol/codex-acp",
     adapterVersion: REQUIRED_CODEX_ACP_VERSION,
     label: "org.aeon.buzz-acp.codex-cli",
+    privateRooms: ["seat_codex_cli"],
+    sessionCwd: "/Volumes/AEON/tmp/aeon-worktrees/buzz-seat-codex-cli",
   },
   claude_cli: {
     principal: "claude_code",
@@ -125,6 +128,8 @@ const WORKER_CONTRACTS = {
     adapterPackage: "@agentclientprotocol/claude-agent-acp",
     adapterVersion: REQUIRED_CLAUDE_ACP_VERSION,
     label: "org.aeon.buzz-acp.claude-cli",
+    privateRooms: [],
+    sessionCwd: "/Volumes/AEON/Projects/aeon-v6",
   },
   cursor_cli: {
     principal: "cursor_cli",
@@ -132,6 +137,8 @@ const WORKER_CONTRACTS = {
     adapterPackage: "cursor-agent",
     adapterVersion: REQUIRED_CURSOR_CLI_VERSION,
     label: "org.aeon.buzz-acp.cursor-cli",
+    privateRooms: ["seat_cursor_cli"],
+    sessionCwd: "/Volumes/AEON/tmp/aeon-worktrees/buzz-seat-cursor-cli",
     native: true,
   },
   grok_cli: {
@@ -140,12 +147,58 @@ const WORKER_CONTRACTS = {
     adapterPackage: "grok-build",
     adapterVersion: REQUIRED_GROK_CLI.version,
     label: "org.aeon.buzz-acp.grok-cli",
+    privateRooms: ["seat_grok_cli"],
+    sessionCwd: "/Volumes/AEON/tmp/aeon-worktrees/buzz-seat-grok-cli",
     native: true,
   },
 };
 
 export function loadJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+export function withSeatOfficeChannels(identityMap, checkedIdentityMap) {
+  const merged = structuredClone(identityMap);
+  const roomNames = [...new Set(Object.values(WORKER_CONTRACTS).flatMap((item) => item.privateRooms))];
+  for (const roomName of roomNames) {
+    const checked = checkedIdentityMap.channels?.[roomName];
+    if (!checked) throw new Error(`checked identity map is missing ${roomName}`);
+    const existing = merged.channels?.[roomName];
+    if (
+      existing &&
+      (existing.channel_id !== checked.channel_id ||
+        existing.name !== checked.name ||
+        JSON.stringify(existing.members) !== JSON.stringify(checked.members))
+    ) {
+      throw new Error(`${roomName} conflicts with the checked seat-office contract`);
+    }
+    for (const memberId of checked.members) {
+      if (!merged.members?.[memberId]) {
+        throw new Error(`${roomName}: canonical identity map is missing ${memberId}`);
+      }
+    }
+    merged.channels ??= {};
+    merged.channels[roomName] = existing ?? structuredClone(checked);
+  }
+  return merged;
+}
+
+export function validateInstalledProjection(pairs) {
+  const errors = [];
+  for (const { label, expected, installedPath } of pairs) {
+    let installed;
+    try {
+      installed = fs.readFileSync(installedPath);
+    } catch {
+      errors.push(`${label} is not installed at ${installedPath}`);
+      continue;
+    }
+    const expectedBytes = Buffer.isBuffer(expected) ? expected : Buffer.from(expected);
+    if (!installed.equals(expectedBytes)) {
+      errors.push(`${label} installed bytes differ from generated source`);
+    }
+  }
+  return { ok: errors.length === 0, errors };
 }
 
 function isAbsoluteSafePath(value) {
@@ -318,7 +371,11 @@ function workerSelector(manifest) {
 }
 
 export function exactRoomIds(manifest, identityMap) {
-  return [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
+  return [
+    ...manifest.buzz.sharedRooms,
+    ...manifest.buzz.officeRooms,
+    ...manifest.buzz.privateRooms,
+  ].map(
     (roomName) => identityMap.channels?.[roomName]?.channel_id,
   );
 }
@@ -346,15 +403,20 @@ export function validateSubscriptionProjection(configText, manifest, identityMap
   if (/'''|"""/.test(configText)) {
     errors.push("subscription projection must not contain multiline strings");
   }
+  const expectedRuleNames = [
+    "aeon-shared-control",
+    "aeon-aspect-offices",
+    ...(manifest.buzz.privateRooms.length > 0 ? ["seat-office"] : []),
+  ];
   if (
     preambleLines.length !== 0 ||
-    tableHeaders.length !== 2 ||
+    tableHeaders.length !== expectedRuleNames.length ||
     tableHeaders.some((header) => !validRuleHeader(header))
   ) {
-    errors.push("subscription projection must not contain content outside the two canonical rules");
+    errors.push("subscription projection must contain only the canonical rules");
   }
-  if (ruleSections.length !== 2) {
-    errors.push("subscription projection must contain exactly two rules");
+  if (ruleSections.length !== expectedRuleNames.length) {
+    errors.push(`subscription projection must contain exactly ${expectedRuleNames.length} rules`);
   }
 
   for (const rule of ruleSections) {
@@ -375,10 +437,6 @@ export function validateSubscriptionProjection(configText, manifest, identityMap
     }
 
     const mentionMatches = [...rule.matchAll(/^\s*require_mention\s*=\s*(true|false)\s*$/gm)];
-    if (mentionMatches.length !== 1 || mentionMatches[0][1] !== "true") {
-      errors.push("each subscription rule must require a mention");
-    }
-
     const remainingLines = rule
       .replace(channelArrayPattern, "")
       .split(/\r?\n/)
@@ -391,7 +449,7 @@ export function validateSubscriptionProjection(configText, manifest, identityMap
       /^kinds\s*=\s*\[\s*9\s*,\s*40002\s*\]$/.test(line),
     ).length;
     const mentionCount = remainingLines.filter((line) =>
-      /^require_mention\s*=\s*true$/.test(line),
+      /^require_mention\s*=\s*(true|false)$/.test(line),
     ).length;
     if (nameCount !== 1 || kindsCount !== 1 || mentionCount !== 1 || remainingLines.length !== 3) {
       errors.push(
@@ -403,18 +461,28 @@ export function validateSubscriptionProjection(configText, manifest, identityMap
           .find((line) => line.startsWith("name"))
           .match(/^name\s*=\s*"([a-z0-9-]+)"$/)[1],
       );
+      const ruleName = ruleNames.at(-1);
+      const expectedMention = ruleName === "seat-office" ? "false" : "true";
+      if (mentionMatches.length !== 1 || mentionMatches[0][1] !== expectedMention) {
+        errors.push(`${ruleName} must set require_mention = ${expectedMention}`);
+      }
     }
   }
 
-  if (
-    JSON.stringify(ruleNames) !== JSON.stringify(["aeon-shared-control", "aeon-aspect-offices"])
-  ) {
-    errors.push("subscription rules must be the canonical shared-control and Aspect-office rules");
+  if (JSON.stringify(ruleNames) !== JSON.stringify(expectedRuleNames)) {
+    errors.push("subscription rules must use canonical order and names");
   }
 
   const expectedChannelArrays = [
     manifest.buzz.sharedRooms.map((roomName) => identityMap.channels?.[roomName]?.channel_id),
     manifest.buzz.officeRooms.map((roomName) => identityMap.channels?.[roomName]?.channel_id),
+    ...(manifest.buzz.privateRooms.length > 0
+      ? [
+          manifest.buzz.privateRooms.map(
+            (roomName) => identityMap.channels?.[roomName]?.channel_id,
+          ),
+        ]
+      : []),
   ];
   const expectedRoomIds = expectedChannelArrays.flat();
   const actualRoomIds = channelArrays.flat();
@@ -422,7 +490,7 @@ export function validateSubscriptionProjection(configText, manifest, identityMap
     expectedRoomIds.some((id) => typeof id !== "string") ||
     JSON.stringify(channelArrays) !== JSON.stringify(expectedChannelArrays)
   ) {
-    errors.push("subscription projection must contain exactly the eight canonical rooms");
+    errors.push("subscription projection must contain exactly the canonical rooms");
   }
 
   return {
@@ -438,11 +506,12 @@ export function validateManifest(manifest, identityMap) {
   const selector = workerSelector(manifest);
   const member = identityMap.members?.[principal];
   const contract = WORKER_CONTRACTS[selector];
+  const runtime = manifest.runtime;
 
   if (manifest.schema !== "aeon_buzz_external_cli_worker_v1") {
     errors.push("unsupported external CLI worker schema");
   }
-  if (manifest.enabled !== false) errors.push("external CLI worker must be disabled by default");
+  if (manifest.enabled !== true) errors.push("external CLI worker must be enabled in source");
   if (!contract) {
     errors.push("worker selector must be codex_cli, claude_cli, cursor_cli, or grok_cli");
   }
@@ -498,12 +567,24 @@ export function validateManifest(manifest, identityMap) {
     }
   }
   if (manifest.buzz?.owner !== "architect") errors.push("Architect must own the worker");
-  if (manifest.buzz?.relayUrl !== "ws://localhost:3000") errors.push("relay must remain loopback");
+  if (manifest.buzz?.relayUrl !== REQUIRED_RELAY_URL) {
+    errors.push(`relay must be ${REQUIRED_RELAY_URL}`);
+  }
   if (JSON.stringify(manifest.buzz?.sharedRooms) !== JSON.stringify(REQUIRED_SHARED_ROOMS)) {
     errors.push("shared rooms must be exactly ops and concilium");
   }
   if (JSON.stringify(manifest.buzz?.officeRooms) !== JSON.stringify(REQUIRED_OFFICE_ROOMS)) {
     errors.push("office rooms must be exactly the six canonical Aspect offices");
+  }
+  if (JSON.stringify(manifest.buzz?.privateRooms) !== JSON.stringify(contract?.privateRooms)) {
+    errors.push(`${principal} private seat office drift`);
+  }
+  if (runtime?.sessionCwd !== contract?.sessionCwd) {
+    errors.push(`${principal} fixed session cwd drift`);
+  }
+  const expectedLaunchAgentPath = `/Users/architect/Library/LaunchAgents/${contract?.label}.plist`;
+  if (runtime?.launchAgentPath !== expectedLaunchAgentPath) {
+    errors.push(`${principal} installed LaunchAgent path drift`);
   }
   const roomIds = exactRoomIds(manifest, identityMap);
   if (roomIds.some((roomId) => typeof roomId !== "string"))
@@ -512,12 +593,12 @@ export function validateManifest(manifest, identityMap) {
   for (const roomName of [
     ...(manifest.buzz?.sharedRooms ?? []),
     ...(manifest.buzz?.officeRooms ?? []),
+    ...(manifest.buzz?.privateRooms ?? []),
   ]) {
     const members = identityMap.channels?.[roomName]?.members ?? [];
     if (!members.includes(principal)) errors.push(`${roomName}: ${principal} is not a member`);
   }
 
-  const runtime = manifest.runtime;
   const adapter = contract ? runtime?.[contract.adapterKey] : undefined;
   if (contract && adapter?.package !== contract.adapterPackage) {
     errors.push(`${principal} ACP package owner drift`);
@@ -570,6 +651,8 @@ export function validateManifest(manifest, identityMap) {
           logDir: runtime?.logDir,
           signerPath: runtime?.signerPath,
           supervisorWorkingDirectory: runtime?.supervisorWorkingDirectory,
+          sessionCwd: runtime?.sessionCwd,
+          launchAgentPath: runtime?.launchAgentPath,
         }
       : {}),
     ...(selector === "claude_cli" ? { adapterRoot: adapter?.root } : {}),
@@ -704,6 +787,12 @@ export function validateManifest(manifest, identityMap) {
       errors.push(`${name}: workspace must be a bounded AEON project path`);
     }
   }
+  if (runtime?.sessionCwd !== workspaces?.allowed?.[workspaces?.default] && selector === "claude_cli") {
+    errors.push("Claude session cwd must use its fixed bounded default workspace");
+  }
+  if (!runtime?.sessionCwd?.startsWith("/Volumes/AEON/")) {
+    errors.push("session cwd must be a bounded AEON path");
+  }
 
   const posture = manifest.posture;
   if (posture?.subscribe !== "config") errors.push("worker must use config subscriptions");
@@ -744,8 +833,12 @@ export function validateManifest(manifest, identityMap) {
   }
   if (posture?.heartbeatIntervalSecs !== 0)
     errors.push("autonomous heartbeat prompts must remain off");
-  if (manifest.supervisor?.runAtLoad !== false || manifest.supervisor?.keepAlive !== false) {
-    errors.push("live activation must remain off");
+  if (
+    manifest.supervisor?.runAtLoad !== true ||
+    manifest.supervisor?.keepAlive !== true ||
+    manifest.supervisor?.throttleSeconds !== 300
+  ) {
+    errors.push("launchd supervision must use RunAtLoad, KeepAlive, and 300s throttle");
   }
 
   return { ok: errors.length === 0, errors };
@@ -755,8 +848,10 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
   const validation = validateManifest(manifest, identityMap);
   if (!validation.ok) throw new Error(validation.errors.join("\n"));
 
-  const workspace = manifest.workspaces.allowed[workspaceName];
-  if (!workspace) throw new Error(`workspace is not allowed: ${workspaceName}`);
+  if (workspaceName !== manifest.workspaces.default) {
+    throw new Error(`worker uses fixed session cwd: ${manifest.runtime.sessionCwd}`);
+  }
+  const workspace = manifest.runtime.sessionCwd;
   const selector = workerSelector(manifest);
   const principal = identityMap.members[manifest.worker.principal];
   const contract = WORKER_CONTRACTS[selector];
@@ -848,7 +943,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
         ? cursorScrubPrefix
         : grokScrubPrefix;
   return {
-    enabled: false,
+    enabled: true,
     label: manifest.worker.label,
     workspaceName,
     workingDirectory: manifest.runtime.supervisorWorkingDirectory,
@@ -887,7 +982,7 @@ function xml(value) {
     .replaceAll('"', "&quot;");
 }
 
-export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) {
+export function renderLaunchAgent(manifest, identityMap, workspaceName) {
   const worker = renderWorker(manifest, identityMap, workspaceName);
   const argvXml = [worker.command, ...worker.args]
     .map((value) => `    <string>${xml(value)}</string>`)
@@ -917,8 +1012,9 @@ export function renderDisabledLaunchAgent(manifest, identityMap, workspaceName) 
         worker.sessionCwd,
       ]),
     ],
-    runAtLoad: false,
-    keepAlive: false,
+    runAtLoad: true,
+    keepAlive: true,
+    throttleInterval: manifest.supervisor.throttleSeconds,
     rollback: ["launchctl", "bootout", `gui/<uid>/${worker.label}`],
     plist: `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -934,8 +1030,9 @@ ${argvXml}
   <dict>
 ${envXml}
   </dict>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>${manifest.supervisor.throttleSeconds}</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${logRoot}/${logName}.log</string>
   <key>StandardErrorPath</key><string>${logRoot}/${logName}.err.log</string>

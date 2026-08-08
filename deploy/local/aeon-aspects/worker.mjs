@@ -6,9 +6,17 @@ export function renderPrivateOfficePrompt(template, aspect) {
   if (!/^[a-z][a-z0-9-]*$/.test(aspect)) {
     throw new Error(`invalid Aspect prompt slug: ${aspect}`);
   }
+  const dispatchGuidance =
+    aspect === "nexus"
+      ? "For an operational dispatch, name exactly one seat. A plaintext @label is not addressing proof. Check current capacity before choosing, use the canonical exact-recipient dispatch surface or that seat's private office, and require a reply or status update."
+      : "";
   const rendered = template
     .replaceAll("{{ROOM}}", `#aspect-${aspect}`)
-    .replaceAll("{{REPLY_TOOL}}", `buzz_${aspect}_reply`);
+    .replaceAll("{{REPLY_TOOL}}", `buzz_${aspect}_reply`)
+    .replaceAll(
+      "\n\n{{DISPATCH_GUIDANCE}}\n",
+      dispatchGuidance ? `\n\n${dispatchGuidance}\n` : "\n",
+    );
   if (rendered.includes("{{")) {
     throw new Error(`${aspect}: unresolved private-office prompt token`);
   }

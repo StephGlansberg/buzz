@@ -21,16 +21,18 @@ import {
   hashCursorClosure,
   hashPackageClosure,
   loadJson,
-  renderDisabledLaunchAgent,
+  renderLaunchAgent,
   renderWorker,
   validateAmbientAnthropicCredentials,
   validateAmbientCursorOverrides,
   validateAmbientGrokOverrides,
   validateClaudeSubscriptionAuth,
   validateCursorSubscriptionAuth,
+  validateInstalledProjection,
   validateManifest,
   validatePinnedNodeRuntime,
   validateSubscriptionProjection,
+  withSeatOfficeChannels,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -40,6 +42,14 @@ const cursorManifest = loadJson(join(here, "manifest.cursor_cli.json"));
 const grokManifest = loadJson(join(here, "manifest.grok_cli.json"));
 const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
 const codexConfig = readFileSync(join(here, "config", "codex_cli.toml"), "utf8");
+
+function expectedRoomIds(workerManifest) {
+  return [
+    ...workerManifest.buzz.sharedRooms,
+    ...workerManifest.buzz.officeRooms,
+    ...workerManifest.buzz.privateRooms,
+  ].map((roomName) => identityMap.channels[roomName].channel_id);
+}
 
 test("manifest binds external codex_cli identity without changing Aspect semantics", () => {
   const result = validateManifest(manifest, identityMap);
@@ -108,7 +118,7 @@ test("grok_cli selector binds a distinct external Grok identity", () => {
   );
 });
 
-test("Codex launch argv binds publisher credentials, identity, and all eight rooms", () => {
+test("Codex launch argv binds publisher credentials, identity, and canonical rooms", () => {
   const worker = renderWorker(manifest, identityMap);
   assert.equal(
     worker.environment.PATH.split(":")[0],
@@ -131,12 +141,10 @@ test("Codex launch argv binds publisher credentials, identity, and all eight roo
   assert.equal(worker.args[worker.args.indexOf("--config") + 1], manifest.runtime.configPath);
   assert.deepEqual(
     worker.subscriptionRoomIds,
-    [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms].map(
-      (roomName) => identityMap.channels[roomName].channel_id,
-    ),
+    expectedRoomIds(manifest),
   );
-  assert.equal(worker.subscriptionRoomIds.length, 8);
-  assert.equal(new Set(worker.subscriptionRoomIds).size, 8);
+  assert.equal(worker.subscriptionRoomIds.length, 9);
+  assert.equal(new Set(worker.subscriptionRoomIds).size, 9);
   assert.equal(worker.environment.BUZZ_PRIVATE_KEY, undefined);
   assert.equal(worker.environment.BUZZ_RELAY_URL, undefined);
 });
@@ -146,15 +154,28 @@ test("subscription validator requires the exact source-projected room set", () =
     [...manifest.buzz.sharedRooms, ...manifest.buzz.officeRooms],
     REQUIRED_ROOM_NAMES,
   );
+  assert.deepEqual(manifest.buzz.privateRooms, ["seat_codex_cli"]);
   const result = validateSubscriptionProjection(codexConfig, manifest, identityMap);
   assert.equal(result.ok, true);
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.roomIds, renderWorker(manifest, identityMap).subscriptionRoomIds);
+  assert.match(codexConfig, /name = "seat-office"[\s\S]*require_mention = false/);
+
+  const mentionGatedPrivateOffice = codexConfig.replace(
+    /(name = "seat-office"[\s\S]*?)require_mention = false/,
+    "$1require_mention = true",
+  );
+  assert.match(
+    validateSubscriptionProjection(mentionGatedPrivateOffice, manifest, identityMap).errors.join(
+      "\n",
+    ),
+    /seat-office must set require_mention = false/,
+  );
 
   const duplicateRoom = codexConfig.replace(result.roomIds.at(-1), result.roomIds[0]);
   assert.match(
     validateSubscriptionProjection(duplicateRoom, manifest, identityMap).errors.join("\n"),
-    /exactly the eight canonical rooms/,
+    /exactly the canonical rooms/,
   );
 
   const extraRoom = codexConfig.replace(
@@ -163,7 +184,7 @@ test("subscription validator requires the exact source-projected room set", () =
   );
   assert.match(
     validateSubscriptionProjection(extraRoom, manifest, identityMap).errors.join("\n"),
-    /exactly the eight canonical rooms/,
+    /exactly the canonical rooms/,
   );
 
   const channelBlocks = [...codexConfig.matchAll(/^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/gm)].map(
@@ -175,7 +196,7 @@ test("subscription validator requires the exact source-projected room set", () =
     .replace("__FIRST_CHANNEL_ARRAY__", channelBlocks[1]);
   assert.match(
     validateSubscriptionProjection(swappedArrays, manifest, identityMap).errors.join("\n"),
-    /exactly the eight canonical rooms/,
+    /exactly the canonical rooms/,
   );
 
   const officeDrift = structuredClone(manifest);
@@ -193,14 +214,14 @@ require_mention = false
 `;
   assert.match(
     validateSubscriptionProjection(extraRule, manifest, identityMap).errors.join("\n"),
-    /exactly two rules/,
+    /exactly 3 rules/,
   );
 
   const misplacedMention = `require_mention = true
 ${codexConfig.replace("require_mention = true", "")}`;
   assert.match(
     validateSubscriptionProjection(misplacedMention, manifest, identityMap).errors.join("\n"),
-    /each subscription rule must require a mention/,
+    /canonical rules/,
   );
 
   const firstChannels = codexConfig.match(/^\s*channels\s*=\s*(\[[\s\S]*?^\s*\])/m)[0];
@@ -218,7 +239,7 @@ ${codexConfig.replace("require_mention = true", "")}`;
   );
   assert.match(
     validateSubscriptionProjection(commentedTableBoundary, manifest, identityMap).errors.join("\n"),
-    /each subscription rule must require a mention/,
+    /canonical rules/,
   );
 
   const multilineBypass = codexConfig
@@ -235,25 +256,64 @@ ${codexConfig.replace("require_mention = true", "")}`;
   );
   assert.match(
     validateSubscriptionProjection(duplicateName, manifest, identityMap).errors.join("\n"),
-    /canonical shared-control and Aspect-office rules/,
+    /canonical order and names/,
   );
 
   const malformedHeader = codexConfig.replace("[[rules]]", "[[rules]]garbage");
   assert.match(
     validateSubscriptionProjection(malformedHeader, manifest, identityMap).errors.join("\n"),
-    /exactly two rules/,
+    /exactly 3 rules/,
   );
 
   const unknownPreamble = `unexpected = true\n${codexConfig}`;
   assert.match(
     validateSubscriptionProjection(unknownPreamble, manifest, identityMap).errors.join("\n"),
-    /must not contain content outside the two canonical rules/,
+    /contain only the canonical rules/,
   );
 
   const unknownTable = `${codexConfig}\n[unexpected]\nvalue = true\n`;
   assert.match(
     validateSubscriptionProjection(unknownTable, manifest, identityMap).errors.join("\n"),
-    /must not contain content outside the two canonical rules/,
+    /contain only the canonical rules/,
+  );
+});
+
+test("all external CLI configs project each manifest's exact subscriptions", () => {
+  for (const [selector, workerManifest] of [
+    ["codex_cli", manifest],
+    ["claude_cli", claudeManifest],
+    ["cursor_cli", cursorManifest],
+    ["grok_cli", grokManifest],
+  ]) {
+    const config = readFileSync(join(here, "config", `${selector}.toml`), "utf8");
+    const result = validateSubscriptionProjection(config, workerManifest, identityMap);
+    assert.deepEqual(result.errors, [], selector);
+    assert.deepEqual(result.roomIds, expectedRoomIds(workerManifest), selector);
+  }
+});
+
+test("checked seat offices augment canonical identity input without widening conflicts", () => {
+  const canonical = structuredClone(identityMap);
+  delete canonical.channels.seat_codex_cli;
+  delete canonical.channels.seat_cursor_cli;
+  delete canonical.channels.seat_grok_cli;
+  const merged = withSeatOfficeChannels(canonical, identityMap);
+  for (const roomName of ["seat_codex_cli", "seat_cursor_cli", "seat_grok_cli"]) {
+    assert.deepEqual(merged.channels[roomName], identityMap.channels[roomName]);
+  }
+  assert.deepEqual(validateManifest(manifest, merged).errors, []);
+  assert.deepEqual(validateManifest(cursorManifest, merged).errors, []);
+  assert.deepEqual(validateManifest(grokManifest, merged).errors, []);
+  assert.deepEqual(claudeManifest.buzz.privateRooms, []);
+
+  const conflicting = structuredClone(canonical);
+  conflicting.channels.seat_codex_cli = {
+    ...identityMap.channels.seat_codex_cli,
+    channel_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+  };
+  assert.throws(
+    () => withSeatOfficeChannels(conflicting, identityMap),
+    /conflicts with the checked seat-office contract/,
   );
 });
 
@@ -344,7 +404,7 @@ test("renderer pins one native Cursor ACP subprocess with a proven operational m
   assert.deepEqual(
     worker.args.filter((value) => value.startsWith("--agent-args=")),
     [
-      `--agent-args=--use-system-ca,${cursorManifest.runtime.bootstrapPath},/Volumes/AEON/Projects/aeon-v6,${adapter.root}/index.js,--trust,acp`,
+      `--agent-args=--use-system-ca,${cursorManifest.runtime.bootstrapPath},${cursorManifest.runtime.sessionCwd},${adapter.root}/index.js,--trust,acp`,
     ],
   );
   assert.equal(worker.args.includes("--agent-args"), false);
@@ -372,7 +432,7 @@ test("renderer pins one native Cursor ACP subprocess with a proven operational m
   assert.equal(adapter.model.selectionStatus, "upstream_limited_to_fast_wire_variant");
   assert.equal(
     worker.args[worker.args.indexOf("--session-cwd") + 1],
-    "/Volumes/AEON/Projects/aeon-v6",
+    cursorManifest.runtime.sessionCwd,
   );
   assert.equal(worker.args[worker.args.indexOf("--permission-mode") + 1], "bypass-permissions");
   assert.equal(worker.environment.CURSOR_API_KEY, undefined);
@@ -398,7 +458,7 @@ test("Codex and Claude omit --agent-args when adapters have no child args", () =
 test("renderer pins one native Grok ACP subprocess with full coding authority", () => {
   const worker = renderWorker(grokManifest, identityMap);
   assert.equal(worker.command, "/usr/bin/env");
-  assert.equal(worker.sessionCwd, "/Volumes/AEON/Projects/aeon-v6");
+  assert.equal(worker.sessionCwd, grokManifest.runtime.sessionCwd);
   assert.equal(worker.environment.HOME, "/Users/architect");
   assert.equal(worker.environment.PATH.startsWith("/Users/architect/.grok/bin:"), true);
   assert.equal(worker.environment.PATH.includes("/Users/architect/.local/bin"), true);
@@ -422,7 +482,7 @@ test("renderer pins one native Grok ACP subprocess with full coding authority", 
   assert.equal(worker.expectedPublicKey, identityMap.members.grok_cli.pubkey_hex);
   assert.deepEqual(
     worker.subscriptionRoomIds,
-    renderWorker(manifest, identityMap).subscriptionRoomIds,
+    expectedRoomIds(grokManifest),
   );
 });
 
@@ -526,59 +586,30 @@ test("renderer rejects colliding authorities and Aspects absent from their offic
   );
 });
 
-test("workspace selection is bounded to the manifest allowlist", () => {
-  const codexWorker = renderWorker(manifest, identityMap, "buzz");
-  assert.equal(
-    codexWorker.workingDirectory,
-    "/Users/architect/Library/Application Support/AEON/aeon-v6",
-  );
-  assert.equal(codexWorker.sessionCwd, "/Volumes/AEON/Projects/buzz");
-  assert.equal(
-    codexWorker.args[codexWorker.args.indexOf("--session-cwd") + 1],
-    "/Volumes/AEON/Projects/buzz",
-  );
-  assert.throws(() => renderWorker(manifest, identityMap, "/tmp/escape"), /not allowed/);
-  const claudeWorker = renderWorker(claudeManifest, identityMap, "codex");
-  assert.equal(
-    claudeWorker.workingDirectory,
-    "/Users/architect/Library/Application Support/AEON/aeon-v6",
-  );
-  assert.equal(claudeWorker.sessionCwd, "/Volumes/AEON/Projects/codex");
-  assert.equal(
-    claudeWorker.args[claudeWorker.args.indexOf("--session-cwd") + 1],
-    "/Volumes/AEON/Projects/codex",
-  );
-  const cursorWorker = renderWorker(cursorManifest, identityMap, "buzz");
-  assert.equal(
-    cursorWorker.workingDirectory,
-    "/Users/architect/Library/Application Support/AEON/aeon-v6",
-  );
-  assert.equal(cursorWorker.sessionCwd, "/Volumes/AEON/Projects/buzz");
-  assert.equal(
-    cursorWorker.args.find((value) => value.startsWith("--agent-args=")),
-    `--agent-args=--use-system-ca,${cursorManifest.runtime.bootstrapPath},/Volumes/AEON/Projects/buzz,${cursorManifest.runtime.cursorAcp.root}/index.js,--trust,acp`,
-  );
-  assert.equal(
-    cursorWorker.args[cursorWorker.args.indexOf("--session-cwd") + 1],
-    "/Volumes/AEON/Projects/buzz",
-  );
-  const grokWorker = renderWorker(grokManifest, identityMap, "aeon-v6");
-  assert.equal(
-    grokWorker.workingDirectory,
-    "/Users/architect/Library/Application Support/AEON/aeon-v6",
-  );
-  assert.equal(
-    grokWorker.args.find((value) => value.startsWith("--agent-args=")),
-    `--agent-args=${grokManifest.runtime.grokAcp.args.join(",")}`,
-  );
+test("each worker uses one fixed bounded session cwd", () => {
+  for (const workerManifest of [manifest, claudeManifest, cursorManifest, grokManifest]) {
+    const worker = renderWorker(workerManifest, identityMap);
+    assert.equal(worker.sessionCwd, workerManifest.runtime.sessionCwd);
+    assert.equal(
+      worker.args[worker.args.indexOf("--session-cwd") + 1],
+      workerManifest.runtime.sessionCwd,
+    );
+    assert.match(worker.sessionCwd, /^\/Volumes\/AEON\//);
+    assert.throws(
+      () => renderWorker(workerManifest, identityMap, "buzz"),
+      /uses fixed session cwd/,
+    );
+  }
 });
 
-test("launchd artifact remains inert and secret-free", () => {
-  const artifact = renderDisabledLaunchAgent(manifest, identityMap);
-  assert.equal(artifact.runAtLoad, false);
-  assert.equal(artifact.keepAlive, false);
-  assert.match(artifact.plist, /<key>RunAtLoad<\/key><false\/>/);
-  assert.match(artifact.plist, /<key>KeepAlive<\/key><false\/>/);
+test("launchd artifact is supervised and secret-free", () => {
+  const artifact = renderLaunchAgent(manifest, identityMap);
+  assert.equal(artifact.runAtLoad, true);
+  assert.equal(artifact.keepAlive, true);
+  assert.equal(artifact.throttleInterval, 300);
+  assert.match(artifact.plist, /<key>RunAtLoad<\/key><true\/>/);
+  assert.match(artifact.plist, /<key>KeepAlive<\/key><true\/>/);
+  assert.match(artifact.plist, /<key>ThrottleInterval<\/key><integer>300<\/integer>/);
   assert.match(artifact.plist, /INITIAL_AGENT_MODE<\/key><string>agent-full-access/);
   assert.doesNotMatch(artifact.plist, /BUZZ_PRIVATE_KEY|nsec1/);
   assert.deepEqual(artifact.requiredDirectories, [
@@ -586,15 +617,16 @@ test("launchd artifact remains inert and secret-free", () => {
     "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets",
     "/Users/architect/Library/Application Support/AEON/aeon-v6",
-    "/Volumes/AEON/Projects/aeon-v6",
+    manifest.runtime.sessionCwd,
   ]);
 });
 
-test("Claude launchd artifact is separate, inert, and secret-free", () => {
-  const artifact = renderDisabledLaunchAgent(claudeManifest, identityMap);
+test("Claude launchd artifact is separate, supervised, and secret-free", () => {
+  const artifact = renderLaunchAgent(claudeManifest, identityMap);
   assert.equal(artifact.label, "org.aeon.buzz-acp.claude-cli");
-  assert.equal(artifact.runAtLoad, false);
-  assert.equal(artifact.keepAlive, false);
+  assert.equal(artifact.runAtLoad, true);
+  assert.equal(artifact.keepAlive, true);
+  assert.equal(artifact.throttleInterval, 300);
   assert.match(artifact.plist, /CLAUDE_CODE_EXECUTABLE/);
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_API_KEY<\/string>/);
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>ANTHROPIC_AUTH_TOKEN<\/string>/);
@@ -635,11 +667,12 @@ test("Claude launchd artifact is separate, inert, and secret-free", () => {
   );
 });
 
-test("Cursor launchd artifact is separate, inert, and secret-free", () => {
-  const artifact = renderDisabledLaunchAgent(cursorManifest, identityMap);
+test("Cursor launchd artifact is separate, supervised, and secret-free", () => {
+  const artifact = renderLaunchAgent(cursorManifest, identityMap);
   assert.equal(artifact.label, "org.aeon.buzz-acp.cursor-cli");
-  assert.equal(artifact.runAtLoad, false);
-  assert.equal(artifact.keepAlive, false);
+  assert.equal(artifact.runAtLoad, true);
+  assert.equal(artifact.keepAlive, true);
+  assert.equal(artifact.throttleInterval, 300);
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>CURSOR_API_KEY<\/string>/);
   assert.match(artifact.plist, /<string>-u<\/string>\s+<string>CURSOR_API_ENDPOINT<\/string>/);
   assert.doesNotMatch(artifact.plist, /<key>CURSOR_API_KEY|<key>CURSOR_API_ENDPOINT|nsec1/);
@@ -654,7 +687,7 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
   assert.match(artifact.plist, /cursor-acp-bootstrap\.cjs/);
   assert.match(
     artifact.plist,
-    /--agent-args=--use-system-ca,\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/buzz\/cursor-acp-bootstrap\.cjs,\/Volumes\/AEON\/Projects\/aeon-v6,\/Users\/architect\/\.local\/share\/cursor-agent\/versions\/2026\.07\.23-e383d2b\/index\.js,--trust,acp/,
+    /--agent-args=--use-system-ca,\/Users\/architect\/Library\/Application Support\/AEON\/aeon-v6\/buzz\/cursor-acp-bootstrap\.cjs,\/Volumes\/AEON\/tmp\/aeon-worktrees\/buzz-seat-cursor-cli,\/Users\/architect\/\.local\/share\/cursor-agent\/versions\/2026\.07\.23-e383d2b\/index\.js,--trust,acp/,
   );
   assert.match(
     artifact.plist,
@@ -665,7 +698,7 @@ test("Cursor launchd artifact is separate, inert, and secret-free", () => {
     "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets",
     "/Users/architect/Library/Application Support/AEON/aeon-v6",
-    "/Volumes/AEON/Projects/aeon-v6",
+    cursorManifest.runtime.sessionCwd,
   ]);
 });
 
@@ -677,11 +710,12 @@ test("Cursor ACP bootstrap is isolated from the other CLI seats", () => {
   }
 });
 
-test("Grok launchd artifact is separate, inert, and scrubs auth overrides", () => {
-  const artifact = renderDisabledLaunchAgent(grokManifest, identityMap);
+test("Grok launchd artifact is separate, supervised, and scrubs auth overrides", () => {
+  const artifact = renderLaunchAgent(grokManifest, identityMap);
   assert.equal(artifact.label, "org.aeon.buzz-acp.grok-cli");
-  assert.equal(artifact.runAtLoad, false);
-  assert.equal(artifact.keepAlive, false);
+  assert.equal(artifact.runAtLoad, true);
+  assert.equal(artifact.keepAlive, true);
+  assert.equal(artifact.throttleInterval, 300);
   for (const name of ["XAI_API_KEY", "GROK_AUTH", "GROK_HOME", "XAI_API_BASE_URL"]) {
     assert.match(artifact.plist, new RegExp(`<string>-u<\\/string>\\s+<string>${name}<\\/string>`));
   }
@@ -692,7 +726,7 @@ test("Grok launchd artifact is separate, inert, and scrubs auth overrides", () =
   );
 });
 
-test("Claude and Cursor/Grok launch projections retain their current behavior", () => {
+test("each CLI launch projection binds its canonical rooms and authority", () => {
   const claude = renderWorker(claudeManifest, identityMap);
   assert.deepEqual(
     {
@@ -708,7 +742,7 @@ test("Claude and Cursor/Grok launch projections retain their current behavior", 
       principal: identityMap.members.claude_code.pubkey_hex,
       permissionMode: "bypass-permissions",
       publisherFlagCount: 1,
-      rooms: renderWorker(manifest, identityMap).subscriptionRoomIds,
+      rooms: expectedRoomIds(claudeManifest),
     },
   );
 
@@ -729,14 +763,26 @@ test("Claude and Cursor/Grok launch projections retain their current behavior", 
       model: "grok-4.5[effort=high,fast=true]",
       permissionMode: "bypass-permissions",
       publisherFlagCount: 1,
-      rooms: renderWorker(manifest, identityMap).subscriptionRoomIds,
+      rooms: expectedRoomIds(cursorManifest),
     },
+  );
+
+  const grok = renderWorker(grokManifest, identityMap);
+  assert.deepEqual(grok.subscriptionRoomIds, expectedRoomIds(grokManifest));
+  assert.deepEqual(claudeManifest.buzz.privateRooms, []);
+  assert.equal(
+    claude.subscriptionRoomIds.some((roomId) =>
+      ["seat_codex_cli", "seat_cursor_cli", "seat_grok_cli"].some(
+        (roomName) => identityMap.channels[roomName].channel_id === roomId,
+      ),
+    ),
+    false,
   );
 });
 
 test("Codex plist, validator summary, and validator log expose no secrets", () => {
   const sentinelSecret = "nsec1-validator-secret-sentinel";
-  const artifact = renderDisabledLaunchAgent(manifest, identityMap);
+  const artifact = renderLaunchAgent(manifest, identityMap);
   const validation = spawnSync(
     process.execPath,
     [join(here, "validate.mjs"), "--worker", "codex_cli"],
@@ -751,8 +797,9 @@ test("Codex plist, validator summary, and validator log expose no secrets", () =
   assert.equal(validation.status, 0, validation.stderr);
   const summary = JSON.parse(validation.stdout);
   assert.equal(summary.principal, "codex_cli");
+  assert.equal(summary.enabled, true);
   assert.equal(summary.agentMode, "agent-full-access");
-  assert.equal(summary.roomCount, 8);
+  assert.equal(summary.roomCount, 9);
   assert.equal(summary.publisherCredentials, "managed");
 
   for (const output of [artifact.plist, validation.stdout, validation.stderr]) {
@@ -930,16 +977,45 @@ test("Codex rejects shared harness path and digest drift under the safe supervis
     /shared buzz-acp checkpoint drift/,
   );
 
-  const artifact = renderDisabledLaunchAgent(manifest, identityMap, "codex");
+  const artifact = renderLaunchAgent(manifest, identityMap);
   assert.equal(
     artifact.workingDirectory,
     "/Users/architect/Library/Application Support/AEON/aeon-v6",
   );
-  assert.equal(artifact.sessionCwd, "/Volumes/AEON/Projects/codex");
+  assert.equal(artifact.sessionCwd, manifest.runtime.sessionCwd);
   assert.equal(
     artifact.args[artifact.args.indexOf("--session-cwd") + 1],
-    "/Volumes/AEON/Projects/codex",
+    manifest.runtime.sessionCwd,
   );
+});
+
+test("installed projection validation requires exact generated bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "external-cli-installed-projection-"));
+  try {
+    const installedPath = join(root, "worker.toml");
+    writeFileSync(installedPath, "canonical\n");
+    assert.deepEqual(
+      validateInstalledProjection([
+        { label: "worker config", expected: Buffer.from("canonical\n"), installedPath },
+      ]),
+      { ok: true, errors: [] },
+    );
+    assert.deepEqual(
+      validateInstalledProjection([
+        { label: "worker config", expected: "drifted\n", installedPath },
+        { label: "launch agent", expected: "plist", installedPath: join(root, "missing.plist") },
+      ]),
+      {
+        ok: false,
+        errors: [
+          "worker config installed bytes differ from generated source",
+          `launch agent is not installed at ${join(root, "missing.plist")}`,
+        ],
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Claude package closure digest detects adapter and dependency changes", () => {

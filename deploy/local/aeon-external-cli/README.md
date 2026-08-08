@@ -1,6 +1,6 @@
 # AEON external CLI workers
 
-This package renders separate disabled-by-default `buzz-acp` workers for the
+This package renders separate supervised `buzz-acp` workers for the
 external `codex_cli`, `claude_code`, `cursor_cli`, and `grok_cli` principals. The Claude
 deploy selector, launchd label, and runtime namespace remain `claude_cli`; its
 signed Buzz identity and Concilium seat remain the established `claude_code`.
@@ -10,9 +10,14 @@ observer events, `!cancel`, `!rotate`, and the managed Buzz CLI publisher. Each
 ACP adapter owns coding tools in the selected workspace.
 
 Each worker accepts mentioned messages from Architect or any of the six
-canonical Aspects in `#concilium` and their configured Aspect offices. The
-workers also observe `#ops`; its narrower operational membership remains
-unchanged.
+canonical Aspects in `#concilium` and all six Aspect offices. Codex, Cursor,
+and Grok also subscribe to their exact private seat office without requiring a
+mention. Claude has no private-office subscription until the canonical roster
+provides an exact-recipient Claude office. The workers also observe `#ops`; its
+narrower operational membership remains unchanged.
+The renderer augments canonical identity input with the three checked
+seat-office entries in `fixtures/identity-map.json`; it rejects a conflicting
+canonical entry and never invents or widens membership.
 External CLI seats cannot direct each other. Each worker starts one pinned ACP
 process.
 
@@ -46,8 +51,8 @@ non-`0755` modes, hash drift, and version drift. The service does not use the
 Data-volume Node copy, whose filesystem watcher cannot reliably watch the
 selected workspace on `/Volumes`.
 The Claude supervisor itself starts from the Data-volume runtime root, so
-launchd and Node never resolve the process cwd through `/Volumes`. The selected
-manifest workspace is passed separately as `--session-cwd`; `buzz-acp`
+launchd and Node never resolve the process cwd through `/Volumes`. The fixed
+manifest session cwd is passed separately as `--session-cwd`; `buzz-acp`
 validates that explicit path is absolute and is an existing directory, then
 uses it for ACP `session/new`. Workers that omit `--session-cwd` retain the
 current process working directory.
@@ -70,7 +75,7 @@ The Cursor worker reuses the same renderer and starts the official
 `/Users/architect/.local/bin/cursor-agent` at exact version
 `2026.07.23-e383d2b` with native ACP arguments
 `--trust acp`. It uses the same
-rooms, bounded workspace selector, managed signer isolation, Data-volume
+rooms, fixed bounded session cwd, managed signer isolation, Data-volume
 supervisor cwd, explicit `--session-cwd`, canonical Aspect inbound authority,
 and `bypass-permissions` posture as the Claude worker. The manifest pins the
 resolved launcher SHA-256 and a deterministic closure SHA-256 over the complete
@@ -115,22 +120,18 @@ node deploy/local/aeon-external-cli/validate.mjs --worker claude_cli
 node deploy/local/aeon-external-cli/validate.mjs --worker cursor_cli
 node deploy/local/aeon-external-cli/validate.mjs --worker grok_cli
 node deploy/local/aeon-external-cli/render-launchagent.mjs \
-  --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   > /tmp/org.aeon.buzz-acp.codex-cli.plist
 node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --worker claude_cli \
-  --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   > /tmp/org.aeon.buzz-acp.claude-cli.plist
 node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --worker cursor_cli \
-  --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   > /tmp/org.aeon.buzz-acp.cursor-cli.plist
 node deploy/local/aeon-external-cli/render-launchagent.mjs \
   --worker grok_cli \
-  --workspace aeon-v6 \
   --identity-map /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   > /tmp/org.aeon.buzz-acp.grok-cli.plist
 ```
@@ -209,6 +210,14 @@ install -m 0444 \
 install -m 0600 \
   /Volumes/AEON/Projects/buzz-data/keys/grok_cli.sk \
   '/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/grok-cli.sk'
+install -m 0644 /tmp/org.aeon.buzz-acp.codex-cli.plist \
+  /Users/architect/Library/LaunchAgents/org.aeon.buzz-acp.codex-cli.plist
+install -m 0644 /tmp/org.aeon.buzz-acp.claude-cli.plist \
+  /Users/architect/Library/LaunchAgents/org.aeon.buzz-acp.claude-cli.plist
+install -m 0644 /tmp/org.aeon.buzz-acp.cursor-cli.plist \
+  /Users/architect/Library/LaunchAgents/org.aeon.buzz-acp.cursor-cli.plist
+install -m 0644 /tmp/org.aeon.buzz-acp.grok-cli.plist \
+  /Users/architect/Library/LaunchAgents/org.aeon.buzz-acp.grok-cli.plist
 node deploy/local/aeon-external-cli/validate.mjs \
   /Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json \
   --runtime
@@ -233,19 +242,11 @@ Data-volume copy and canonical `claude_code` pubkey through the shared
 requires a current-user-owned regular file with exact mode `0600`, and rejects
 any key that does not derive the canonical pubkey.
 
-Activation is intentionally absent: the generated plist has
-`RunAtLoad=false` and `KeepAlive=false`. A later operator action must install
-and bootstrap that plist.
+Runtime preflight requires the installed config, prompt/bootstrap artifacts,
+and LaunchAgent plist to be byte-identical to their source projections. Render
+and install all four plists before running the `--runtime` checks above.
 
-The supported workspace selector is a manifest key, never an arbitrary path:
-
-```sh
-node deploy/local/aeon-external-cli/render-launchagent.mjs --workspace buzz
-node deploy/local/aeon-external-cli/render-launchagent.mjs --workspace codex
-node deploy/local/aeon-external-cli/render-launchagent.mjs --worker claude_cli --workspace buzz
-node deploy/local/aeon-external-cli/render-launchagent.mjs --worker claude_cli --workspace codex
-node deploy/local/aeon-external-cli/render-launchagent.mjs --worker cursor_cli --workspace buzz
-node deploy/local/aeon-external-cli/render-launchagent.mjs --worker cursor_cli --workspace codex
-node deploy/local/aeon-external-cli/render-launchagent.mjs --worker grok_cli --workspace buzz
-node deploy/local/aeon-external-cli/render-launchagent.mjs --worker grok_cli --workspace codex
-```
+The generated plists set `RunAtLoad=true`, `KeepAlive=true`, and
+`ThrottleInterval=300`. Installing files does not mutate launchd state; the
+operator separately boots out the old labels and bootstraps these paths after
+all runtime checks pass.

@@ -62,7 +62,7 @@
       "gateway_agent_id": null,
       "aspect_slug": null,
       "concilium_seat": "claude_code",
-      "pubkey_hex": "13f60f1a6b19e9f2472f16fd9d4cab9de7327cb12146d92282c34ad11b6e0a91",
+      "pubkey_hex": "c5f9e0a85da537e107fdcc60ea7ee7e1c5e2b5ac0691a30b6566b3f043a50455",
       "secret_ref": "/Volumes/AEON/Projects/buzz-data/keys/claude_code.sk"
     },
     "cursor_cli": {
@@ -78,7 +78,7 @@
       "gateway_agent_id": null,
       "aspect_slug": null,
       "concilium_seat": "grok_cli",
-      "pubkey_hex": "b95398604cefa35a0da4568961c296b908806d53a3caf0f07f2b3a93ae3bc087",
+      "pubkey_hex": "87c1777e5d86af9d4cbd705c8041438918cc9d17409f0d933eebae51c4de81bf",
       "secret_ref": "/Volumes/AEON/Projects/buzz-data/keys/grok_cli.sk"
     }
   },
@@ -142,6 +142,21 @@
       "name": "aspect-voxis",
       "channel_id": "d00b15e9-0dbe-4f35-895e-b6d36faa299e",
       "members": ["architect", "voxis", "codex_cli", "claude_code", "cursor_cli", "grok_cli"]
+    },
+    "seat_codex_cli": {
+      "name": "seat-codex-cli",
+      "channel_id": "2f917501-9342-4316-9ee8-413efca07865",
+      "members": ["mechanon", "codex_cli", "claude_code"]
+    },
+    "seat_cursor_cli": {
+      "name": "seat-cursor-cli",
+      "channel_id": "0aa5ce7a-64fd-452e-bd25-dd041efe17e8",
+      "members": ["mechanon", "cursor_cli", "claude_code"]
+    },
+    "seat_grok_cli": {
+      "name": "seat-grok-cli",
+      "channel_id": "0c37851c-2338-4a2f-b49d-50e13ebd46b2",
+      "members": ["mechanon", "grok_cli", "claude_code"]
     }
   }
 }

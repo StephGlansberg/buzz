@@ -4,9 +4,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadJson,
-  renderDisabledLaunchAgent,
+  renderLaunchAgent,
   validateManifest,
   validateSubscriptionProjection,
+  withSeatOfficeChannels,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -24,7 +25,10 @@ if (!["codex_cli", "claude_cli", "cursor_cli", "grok_cli"].includes(worker)) {
   process.exit(1);
 }
 const manifest = loadJson(join(here, manifestName));
-const identityMap = loadJson(identityPath);
+const identityMap = withSeatOfficeChannels(
+  loadJson(identityPath),
+  loadJson(join(here, "fixtures", "identity-map.json")),
+);
 const validation = validateManifest(manifest, identityMap);
 if (!validation.ok) {
   console.error(validation.errors.join("\n"));
@@ -38,4 +42,4 @@ if (!subscriptionValidation.ok) {
   process.exit(1);
 }
 
-process.stdout.write(renderDisabledLaunchAgent(manifest, identityMap, workspace).plist);
+process.stdout.write(renderLaunchAgent(manifest, identityMap, workspace).plist);

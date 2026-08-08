@@ -8,15 +8,17 @@ import {
   hashPackageClosure,
   hashCursorClosure,
   loadJson,
-  renderDisabledLaunchAgent,
+  renderLaunchAgent,
   validateAmbientAnthropicCredentials,
   validateAmbientCursorOverrides,
   validateAmbientGrokOverrides,
   validateClaudeSubscriptionAuth,
   validateCursorSubscriptionAuth,
   validateManifest,
+  validateInstalledProjection,
   validatePinnedNodeRuntime,
   validateSubscriptionProjection,
+  withSeatOfficeChannels,
 } from "./worker.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -37,7 +39,10 @@ if (!["codex_cli", "claude_cli", "cursor_cli", "grok_cli"].includes(worker)) {
 }
 const manifestName = worker === "codex_cli" ? "manifest.json" : `manifest.${worker}.json`;
 const manifest = loadJson(join(here, manifestName));
-const identityMap = loadJson(identityPath);
+const identityMap = withSeatOfficeChannels(
+  loadJson(identityPath),
+  loadJson(join(here, "fixtures", "identity-map.json")),
+);
 const validation = validateManifest(manifest, identityMap);
 if (!validation.ok) {
   console.error(validation.errors.join("\n"));
@@ -70,7 +75,7 @@ if (!subscriptionValidation.ok) {
   process.exit(1);
 }
 
-const artifact = renderDisabledLaunchAgent(manifest, identityMap);
+const artifact = renderLaunchAgent(manifest, identityMap);
 if (artifact.plist.includes("BUZZ_PRIVATE_KEY") || artifact.plist.includes("nsec1")) {
   console.error("rendered artifact contains signer material");
   process.exit(1);
@@ -101,6 +106,40 @@ if (
 
 const runtimeCheck = process.argv.includes("--runtime");
 if (runtimeCheck) {
+  const installedPairs = [
+    {
+      label: `${selector} subscription config`,
+      expected: fs.readFileSync(join(here, "config", `${selector}.toml`)),
+      installedPath: manifest.runtime.configPath,
+    },
+    {
+      label: `${selector} LaunchAgent`,
+      expected: artifact.plist,
+      installedPath: manifest.runtime.launchAgentPath,
+    },
+  ];
+  if (manifest.runtime.systemPromptPath) {
+    installedPairs.push({
+      label: `${selector} system prompt`,
+      expected: fs.readFileSync(join(here, "config", `${selector}_system.md`)),
+      installedPath: manifest.runtime.systemPromptPath,
+    });
+  }
+  if (selector === "cursor_cli") {
+    installedPairs.push({
+      label: "Cursor ACP bootstrap",
+      expected: fs.readFileSync(join(here, "config", "cursor_acp_bootstrap.cjs")),
+      installedPath: manifest.runtime.bootstrapPath,
+    });
+  }
+  const installedValidation = validateInstalledProjection(installedPairs);
+  if (!installedValidation.ok) {
+    throw new Error(installedValidation.errors.join("\n"));
+  }
+  const sessionCwdStat = fs.lstatSync(manifest.runtime.sessionCwd);
+  if (!sessionCwdStat.isDirectory() || sessionCwdStat.isSymbolicLink()) {
+    throw new Error(`fixed session cwd is not an existing non-symlink directory: ${manifest.runtime.sessionCwd}`);
+  }
   const adapter =
     selector === "codex_cli"
       ? manifest.runtime.codexAcp
@@ -324,21 +363,19 @@ if (runtimeCheck) {
     if (!catalogModelIds.has(adapter.model.requested)) {
       throw new Error("Cursor requested model alias is absent from its native catalog");
     }
+    const renderedAgentArgs = artifact.args.find((arg) => arg.startsWith("--agent-args="));
+    if (!renderedAgentArgs) {
+      throw new Error("Cursor launch projection is missing ACP child arguments");
+    }
     const acpModelArgs = [
       "models",
       "--agent-command",
       `${adapter.root}/node`,
-      `--agent-args=${[
-        "--use-system-ca",
-        manifest.runtime.bootstrapPath,
-        manifest.workspaces.allowed[manifest.workspaces.default],
-        `${adapter.root}/index.js`,
-        ...adapter.args,
-      ].join(",")}`,
+      renderedAgentArgs,
       "--json",
     ];
     const acpModelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, acpModelArgs, {
-      cwd: manifest.runtime.supervisorWorkingDirectory,
+      cwd: manifest.runtime.sessionCwd,
       encoding: "utf8",
       env: cursorEnvironment,
     });
@@ -402,15 +439,19 @@ if (runtimeCheck) {
     ) {
       throw new Error("Grok existing login or model checkpoint is unavailable");
     }
+    const renderedAgentArgs = artifact.args.find((arg) => arg.startsWith("--agent-args="));
+    if (!renderedAgentArgs) {
+      throw new Error("Grok launch projection is missing ACP child arguments");
+    }
     const modelArgs = [
       "models",
       "--agent-command",
       adapter.binary,
-      "--agent-args",
-      adapter.args.join(","),
+      renderedAgentArgs,
       "--json",
     ];
     const modelCatalog = spawnSync(manifest.runtime.buzzAcpBinary, modelArgs, {
+      cwd: manifest.runtime.sessionCwd,
       encoding: "utf8",
       env: grokEnvironment,
     });
@@ -434,7 +475,7 @@ if (runtimeCheck) {
 
 const result = {
   ok: true,
-  enabled: false,
+  enabled: manifest.enabled,
   principal: manifest.worker.principal,
   ...(selector !== manifest.worker.principal ? { worker: selector } : {}),
   workspace: artifact.sessionCwd,

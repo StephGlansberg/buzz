@@ -68,7 +68,7 @@ test("one shared contract renders exact trusted publisher prompts for all six of
   const template = fs.readFileSync(join(here, "prompts", "private-office.template.md"), "utf8");
   assert.equal((template.match(/\{\{ROOM\}\}/g) ?? []).length, 1);
   assert.equal((template.match(/\{\{REPLY_TOOL\}\}/g) ?? []).length, 1);
-  assert.equal((template.match(/\{\{/g) ?? []).length, 2);
+  assert.equal((template.match(/\{\{/g) ?? []).length, 3);
   for (const worker of manifest.workers) {
     const rendered = renderWorker(manifest, identityMap, worker.aspect);
     const promptPath = join(here, "..", "..", "..", worker.basePromptFile);
@@ -82,6 +82,15 @@ test("one shared contract renders exact trusted publisher prompts for all six of
     assert.match(prompt, /Publisher credentials are intentionally withheld/);
     assert.match(prompt, /full existing OpenClaw tool, skill, memory, identity, and session capabilities/);
     assert.match(prompt, /does not restrict any other tool use or capability/);
+    if (worker.aspect === "nexus") {
+      assert.match(prompt, /name exactly one seat/);
+      assert.match(prompt, /plaintext @label is not addressing proof/);
+      assert.match(prompt, /Check current capacity before choosing/);
+      assert.match(prompt, /canonical exact-recipient dispatch surface or that seat's private office/);
+      assert.match(prompt, /require a reply or status update/);
+    } else {
+      assert.doesNotMatch(prompt, /operational dispatch/);
+    }
     assert.equal((prompt.match(new RegExp(tool, "g")) ?? []).length, 1);
     for (const other of manifest.workers) {
       if (other.aspect !== worker.aspect) {

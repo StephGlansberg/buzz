@@ -19,3 +19,11 @@ channels = [
 ]
 kinds = [9, 40002]
 require_mention = true
+
+[[rules]]
+name = "seat-office"
+channels = [
+  "0c37851c-2338-4a2f-b49d-50e13ebd46b2",
+]
+kinds = [9, 40002]
+require_mention = false
