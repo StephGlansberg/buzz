@@ -39,6 +39,7 @@ For explicit changes to an existing personal agent, use `buzz agents draft-updat
 ### Mentions
 
 - Use the person's **exact full display name** after `@` (e.g., `@Will Pfleger`, not `@Will`). Partial names fail silently.
+- Address one permitted, actionable recipient per assignment. Publication proves addressing, not intake; require the recipient's reply or status update.
 - Do NOT format mentions with bold, italic, or backticks — it breaks notification delivery.
 - Only `@mention` when you need their attention. Don't mention in narrative (e.g., "coordinating with Duncan" — no `@`). Naming someone while talking *about* them is narrative — "waiting on @morgan", "until @morgan brings work", "I'll loop in @morgan later". Drop the `@`. Every mention sends a notification; a mention nobody needs to act on is a false alarm.
 

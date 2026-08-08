@@ -3616,6 +3616,14 @@ mod agent_draft_prompt_tests {
         assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
         assert!(prompt.contains("buzz messages send ... --content -"));
     }
+
+    #[test]
+    fn shared_base_prompt_requires_one_actionable_recipient_and_intake_proof() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("one permitted, actionable recipient per assignment"));
+        assert!(prompt.contains("Publication proves addressing, not intake"));
+        assert!(prompt.contains("require the recipient's reply or status update"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {
