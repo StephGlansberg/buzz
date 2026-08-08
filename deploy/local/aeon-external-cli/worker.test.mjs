@@ -42,6 +42,7 @@ const cursorManifest = loadJson(join(here, "manifest.cursor_cli.json"));
 const grokManifest = loadJson(join(here, "manifest.grok_cli.json"));
 const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
 const codexConfig = readFileSync(join(here, "config", "codex_cli.toml"), "utf8");
+const cursorSystemPrompt = readFileSync(join(here, "config", "cursor_cli_system.md"), "utf8");
 
 function expectedRoomIds(workerManifest) {
   return [
@@ -70,6 +71,18 @@ test("all external workers pin the same shared Data-volume buzz-acp release", ()
   assert.equal(claudeManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(cursorManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(grokManifest.runtime.buzzAcpSha256, sha256);
+});
+
+test("cursor system prompt requires exact one-recipient Buzz mentions", () => {
+  assert.match(cursorSystemPrompt, /When addressing an Aspect/);
+  assert.doesNotMatch(cursorSystemPrompt, /addressing another Aspect or CLI/);
+  assert.match(cursorSystemPrompt, /exact `@Display Name` mention is mandatory/);
+  assert.match(cursorSystemPrompt, /one actionable recipient per assignment/);
+  assert.match(cursorSystemPrompt, /Publication proves addressing, not intake/);
+  assert.equal(
+    createHash("sha256").update(cursorSystemPrompt).digest("hex"),
+    cursorManifest.runtime.systemPromptSha256,
+  );
 });
 
 test("claude_cli selector binds the established external claude_code identity", () => {

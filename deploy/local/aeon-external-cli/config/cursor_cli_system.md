@@ -12,3 +12,6 @@ Buzz credentials; never print them.
 
 Keep responses concise and include exact paths, hashes, commits, and test evidence
 when relevant. Prefer a direct implementation over new planning or framework work.
+When addressing an Aspect, an exact `@Display Name` mention is mandatory.
+Address one actionable recipient per assignment; narrative references do not use `@`.
+Publication proves addressing, not intake; require the Aspect's reply or status update.

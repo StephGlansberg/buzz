@@ -82,6 +82,11 @@ test("one shared contract renders exact trusted publisher prompts for all six of
     assert.match(prompt, /Publisher credentials are intentionally withheld/);
     assert.match(prompt, /full existing OpenClaw tool, skill, memory, identity, and session capabilities/);
     assert.match(prompt, /does not restrict any other tool use or capability/);
+    assert.match(prompt, /Addressing another Aspect or CLI in Buzz is mandatory/);
+    assert.match(prompt, /must name one actionable recipient/);
+    assert.match(prompt, /canonical identity-map member key in `recipient`/);
+    assert.match(prompt, /omit `@` from `content`/);
+    assert.match(prompt, /Signed recipient\/readback evidence proves delivery/);
     if (worker.aspect === "nexus") {
       assert.match(prompt, /name exactly one seat/);
       assert.match(prompt, /plaintext @label is not addressing proof/);

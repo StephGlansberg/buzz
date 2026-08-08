@@ -39,7 +39,7 @@
     "bootstrapPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-acp-bootstrap.cjs",
     "bootstrapSha256": "b3f4e90e675bd0e8f0827b618203c33b9904cbd01becd2b80fc868d75b8797e8",
     "systemPromptPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/cursor-cli-system.md",
-    "systemPromptSha256": "9cd520bc01584eb8e7eefa9e132a7b98c40766e6b978af5c629ebc8e3e091482",
+    "systemPromptSha256": "7585c0fe368ce19e65bbcef9b4b901f38ab2b05ca429c87fba0b4dd10841d093",
     "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
     "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/cursor-cli.sk",
     "supervisorWorkingDirectory": "/Users/architect/Library/Application Support/AEON/aeon-v6",
