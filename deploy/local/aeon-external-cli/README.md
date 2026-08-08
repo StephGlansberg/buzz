@@ -38,7 +38,7 @@ Both services reuse the canonical shared
 `/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp`;
 neither worker installs or maintains a private harness executable. Both
 manifests pin the release at SHA-256
-`1d260060a0b790645a0455d23c7a82ac7836193108673a76f44423c5d81be9be`.
+`7eb5af6ae16e24e198bfce5e057ad3c1f4d1833c3a32fdd6d2813710f18ca8f3`.
 The pinned harness supports
 `--session-cwd` and requires the explicit `--agent-publisher-credentials`
 grant, so the renderer cannot silently depend on legacy default forwarding.

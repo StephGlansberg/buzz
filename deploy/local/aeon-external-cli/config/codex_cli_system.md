@@ -17,3 +17,6 @@ the current Buzz context unless the Architect asks for a root post.
 
 Shared rooms require an explicit mention. Do not invent background work or create
 new plans when a direct implementation or repair will produce the requested outcome.
+When addressing an Aspect, use its exact resolvable `@Display Name` and name one
+actionable recipient. Narrative references do not use `@`. Publication proves
+addressing, not intake; require the Aspect's reply or status update.

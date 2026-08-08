@@ -42,6 +42,7 @@ const cursorManifest = loadJson(join(here, "manifest.cursor_cli.json"));
 const grokManifest = loadJson(join(here, "manifest.grok_cli.json"));
 const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
 const codexConfig = readFileSync(join(here, "config", "codex_cli.toml"), "utf8");
+const codexSystemPrompt = readFileSync(join(here, "config", "codex_cli_system.md"), "utf8");
 const cursorSystemPrompt = readFileSync(join(here, "config", "cursor_cli_system.md"), "utf8");
 
 function expectedRoomIds(workerManifest) {
@@ -62,7 +63,7 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
 
 test("all external workers pin the same shared Data-volume buzz-acp release", () => {
   const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
-  const sha256 = "1d260060a0b790645a0455d23c7a82ac7836193108673a76f44423c5d81be9be";
+  const sha256 = "7eb5af6ae16e24e198bfce5e057ad3c1f4d1833c3a32fdd6d2813710f18ca8f3";
   assert.equal(manifest.runtime.buzzAcpBinary, binary);
   assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
   assert.equal(cursorManifest.runtime.buzzAcpBinary, binary);
@@ -71,6 +72,17 @@ test("all external workers pin the same shared Data-volume buzz-acp release", ()
   assert.equal(claudeManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(cursorManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(grokManifest.runtime.buzzAcpSha256, sha256);
+});
+
+test("codex system prompt requires exact one-recipient Buzz mentions", () => {
+  assert.match(codexSystemPrompt, /When addressing an Aspect/);
+  assert.match(codexSystemPrompt, /exact resolvable `@Display Name`/);
+  assert.match(codexSystemPrompt, /name one\s+actionable recipient/);
+  assert.match(codexSystemPrompt, /Publication proves\s+addressing, not intake/);
+  assert.equal(
+    createHash("sha256").update(codexSystemPrompt).digest("hex"),
+    manifest.runtime.systemPromptSha256,
+  );
 });
 
 test("cursor system prompt requires exact one-recipient Buzz mentions", () => {
