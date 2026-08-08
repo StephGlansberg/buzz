@@ -213,6 +213,10 @@ pub struct AcpClient {
     goose_usage: UsageTracker,
 }
 
+fn harness_bound_agent_env(key: &str) -> bool {
+    matches!(key, "BUZZ_RELAY_URL" | "BUZZ_PRIVATE_KEY")
+}
+
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
 /// collisions.  When both sides have an object for the same key, the merge recurses so
 /// unrelated nested keys from `base` are preserved.
@@ -465,6 +469,17 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+        // Buzz signing authority is opt-in through `extra_env`; never inherit
+        // credentials from the harness process into an arbitrary ACP child.
+        for key in [
+            "BUZZ_RELAY_URL",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_ACP_PRIVATE_KEY",
+            "BUZZ_PRIVATE_KEY_FILE",
+            "BUZZ_EXPECTED_PUBLIC_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
@@ -495,7 +510,7 @@ impl AcpClient {
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
         for &(key, value) in crate::config::default_agent_env(command) {
-            if std::env::var_os(key).is_none() {
+            if harness_bound_agent_env(key) || std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }
@@ -505,7 +520,7 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var_os(key).is_none() {
+            if harness_bound_agent_env(key) || std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }
@@ -596,10 +611,23 @@ impl AcpClient {
     /// arm can choose [`ACP_STEER_METHOD`] for adapters that implement it.
     /// Parsed here rather than at each call site so no caller can forget it.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
+        self.initialize_with_timeout(Self::REQUEST_TIMEOUT).await
+    }
+
+    /// Initialize with a caller-owned deadline.
+    ///
+    /// Supervisors use a longer bound for cold agent processes; probes retain
+    /// the normal request deadline through [`Self::initialize`].
+    pub async fn initialize_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
-        let result = self.send_request("initialize", params).await?;
+        let result = self
+            .send_request_with_timeout("initialize", params, timeout)
+            .await?;
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
@@ -1069,14 +1097,22 @@ impl AcpClient {
     /// Assigns the next available id, writes the NDJSON line to stdin,
     /// then calls [`read_until_response`](Self::read_until_response).
     ///
-    /// The write phase is bounded by `WRITE_TIMEOUT` (30s) and the read phase
-    /// by `REQUEST_TIMEOUT` (60s), so worst-case wall clock is ~90s. Non-prompt
-    /// RPCs like `initialize` and `session/new` should complete in seconds;
-    /// if they don't, the agent is likely stuck and we must not block forever.
+    /// The caller-owned timeout bounds the write and read phases together, so a
+    /// slow write cannot grant the response read a fresh deadline.
     async fn send_request(
         &mut self,
         method: &str,
         params: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
     ) -> Result<serde_json::Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1093,13 +1129,17 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
             Err(_) => return Err(AcpError::Timeout(timeout)),
         }
 
-        match tokio::time::timeout(timeout, self.read_until_response(id)).await {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AcpError::Timeout(timeout));
+        }
+        match tokio::time::timeout(remaining, self.read_until_response(id)).await {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
         }
@@ -2883,6 +2923,25 @@ mod tests {
         AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
             .await
             .expect("failed to spawn test script")
+    }
+
+    #[tokio::test]
+    async fn initialize_with_timeout_honors_supervisor_owned_deadline() {
+        let script = r#"
+            read -t 2 _init
+            sleep 1
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+        "#;
+        let mut client = spawn_script(script).await;
+        let timeout = std::time::Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let error = client
+            .initialize_with_timeout(timeout)
+            .await
+            .expect_err("slow cold-start probe must honor its caller deadline");
+        assert!(matches!(error, AcpError::Timeout(value) if value == timeout));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        client.shutdown().await;
     }
 
     /// Spawn a probe script whose file name carries a runtime identity (e.g.
