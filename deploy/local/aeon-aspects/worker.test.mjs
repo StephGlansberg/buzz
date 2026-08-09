@@ -401,19 +401,30 @@ test("receipt correlation joins one request, one anchored reply, session, and ru
       triggeringEventIds: ["request-1"],
       replyEvents: [{ eventId: "reply-1", replyTo: "request-1" }],
       sessionKey: "agent:main:buzz-private",
-      runId: "run-1"
+      runId: "run-1",
+      observedAtUnixMs: 1_800_000_000_000,
     }),
     {
+      status: "closed",
+      schemaVersion: 1,
       requestEventId: "request-1",
       replyEventId: "reply-1",
+      replyAnchor: "request-1",
       gatewaySessionKey: "agent:main:buzz-private",
-      runId: "run-1"
+      expectedGatewaySessionKey: "agent:main:buzz-private",
+      runId: "run-1",
+      observedAtUnixMs: 1_800_000_000_000,
     }
   );
 });
 
 test("receipt correlation fails closed on zero or duplicate replies", () => {
-  const base = { triggeringEventIds: ["request-1"], sessionKey: "session", runId: "run" };
+  const base = {
+    triggeringEventIds: ["request-1"],
+    sessionKey: "session",
+    runId: "run",
+    observedAtUnixMs: 1_800_000_000_000,
+  };
   assert.throws(() => correlateReceipt({ ...base, replyEvents: [] }), /found 0/);
   assert.throws(
     () => correlateReceipt({ ...base, replyEvents: [
@@ -425,6 +436,7 @@ test("receipt correlation fails closed on zero or duplicate replies", () => {
 });
 
 test("semantic health rejects green-but-mute workers", () => {
+  const nowMs = 1_800_000_000_000;
   const base = {
     aspect: "nexus",
     sessionKey: "agent:main:buzz-private",
@@ -433,15 +445,19 @@ test("semantic health rejects green-but-mute workers", () => {
       agentPoolReady: true,
       relayConnected: true,
       privateOfficeSubscribed: true,
+      workerStartedAtUnixMs: nowMs - 60_000,
     },
   };
-  const mute = evaluateSemanticHealth(base);
+  const mute = evaluateSemanticHealth(base, { nowMs });
   assert.equal(mute.healthy, false);
   assert.deepEqual(mute.failures, [
     "request_event_missing",
     "reply_event_missing",
+    "receipt_not_closed",
     "gateway_session_mismatch",
+    "expected_gateway_session_mismatch",
     "fresh_run_missing",
+    "receipt_freshness_evidence_missing",
     "trusted_reply_tool_mismatch",
     "trusted_reply_tool_count_mismatch",
   ]);
@@ -449,16 +465,78 @@ test("semantic health rejects green-but-mute workers", () => {
   const healthy = evaluateSemanticHealth({
     ...base,
     receipt: {
+      status: "closed",
+      schemaVersion: 1,
       requestEventId: "request-1",
       replyEventId: "reply-1",
-      replyTo: "request-1",
-      sessionKey: "agent:main:buzz-private",
+      replyAnchor: "request-1",
+      gatewaySessionKey: "agent:main:buzz-private",
+      expectedGatewaySessionKey: "agent:main:buzz-private",
+      runId: "run-1",
+      observedAtUnixMs: nowMs - 1_000,
+      toolName: "buzz_nexus_reply",
+      toolCallCount: 1,
+    },
+  }, { nowMs });
+  assert.deepEqual(healthy, { healthy: true, failures: [] });
+});
+
+test("semantic health rejects receipts older than the worker or freshness window", () => {
+  const nowMs = 1_800_000_000_000;
+  const base = {
+    aspect: "nexus",
+    sessionKey: "agent:main:buzz-private",
+    state: "running",
+    startup: {
+      agentPoolReady: true,
+      relayConnected: true,
+      privateOfficeSubscribed: true,
+      workerStartedAtUnixMs: nowMs - 60_000,
+    },
+    receipt: {
+      status: "closed",
+      schemaVersion: 1,
+      requestEventId: "request-1",
+      replyEventId: "reply-1",
+      replyAnchor: "request-1",
+      gatewaySessionKey: "agent:main:buzz-private",
+      expectedGatewaySessionKey: "agent:main:buzz-private",
       runId: "run-1",
       toolName: "buzz_nexus_reply",
       toolCallCount: 1,
     },
-  });
-  assert.deepEqual(healthy, { healthy: true, failures: [] });
+  };
+  assert.deepEqual(
+    evaluateSemanticHealth(
+      { ...base, receipt: { ...base.receipt, observedAtUnixMs: nowMs - 120_000 } },
+      { nowMs },
+    ),
+    { healthy: false, failures: ["receipt_not_fresh_for_worker"] },
+  );
+  assert.deepEqual(
+    evaluateSemanticHealth(
+      {
+        ...base,
+        receipt: {
+          ...base.receipt,
+          observedAtUnixMs: base.startup.workerStartedAtUnixMs,
+        },
+      },
+      { nowMs },
+    ),
+    { healthy: false, failures: ["receipt_not_fresh_for_worker"] },
+  );
+  assert.deepEqual(
+    evaluateSemanticHealth(
+      {
+        ...base,
+        startup: { ...base.startup, workerStartedAtUnixMs: nowMs - 20 * 60_000 },
+        receipt: { ...base.receipt, observedAtUnixMs: nowMs - 11 * 60_000 },
+      },
+      { nowMs },
+    ),
+    { healthy: false, failures: ["receipt_not_fresh_for_worker"] },
+  );
 });
 
 test("semantic health command fails closed until a functional reply path is proven", () => {

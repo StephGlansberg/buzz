@@ -1507,11 +1507,81 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
                 )));
             }
         }
+        if rule.admit_invited_ephemeral
+            && !matches!(rule.channels, crate::filter::ChannelScope::List(_))
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral requires channels to be a UUID list",
+                rule.name
+            )));
+        }
+        if rule.admit_invited_ephemeral
+            && matches!(&rule.channels, crate::filter::ChannelScope::List(ids) if !ids.is_empty())
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral requires an empty channel list",
+                rule.name
+            )));
+        }
+        if rule.admit_invited_ephemeral && !rule.require_mention {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral requires require_mention=true",
+                rule.name
+            )));
+        }
+        if rule.admit_invited_ephemeral && !rule.require_exact_channel_tag {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral requires require_exact_channel_tag=true",
+                rule.name
+            )));
+        }
+        if rule.admit_invited_ephemeral && rule.kinds.is_empty() {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral requires durable event kinds",
+                rule.name
+            )));
+        }
+        if rule.admit_invited_ephemeral
+            && rule
+                .kinds
+                .iter()
+                .any(|kind| buzz_core::kind::is_ephemeral(*kind))
+        {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral rejects ephemeral event kinds",
+                rule.name
+            )));
+        }
         // Deserialization leaves consecutive_timeouts at its zero default; reset explicitly.
         rule.consecutive_timeouts = Arc::new(AtomicU32::new(0));
     }
 
     Ok(config.rules)
+}
+
+/// Add a metadata-verified ephemeral channel to every opt-in rule.
+pub fn admit_invited_ephemeral_channel(rules: &mut [SubscriptionRule], channel_id: Uuid) -> bool {
+    let channel = channel_id.to_string();
+    let mut admitted = false;
+    for rule in rules.iter_mut().filter(|rule| rule.admit_invited_ephemeral) {
+        if let crate::filter::ChannelScope::List(ids) = &mut rule.channels {
+            if !ids.contains(&channel) {
+                ids.push(channel.clone());
+                admitted = true;
+            }
+        }
+    }
+    admitted
+}
+
+/// Remove a departed or expired ephemeral channel from opt-in rules.
+pub fn remove_invited_ephemeral_channel(rules: &mut [SubscriptionRule], channel_id: Uuid) {
+    let channel = channel_id.to_string();
+    for rule in rules.iter_mut().filter(|rule| rule.admit_invited_ephemeral) {
+        if let crate::filter::ChannelScope::List(ids) = &mut rule.channels {
+            ids.retain(|id| id != &channel);
+        }
+    }
 }
 
 /// Resolve per-channel NIP-01 filters from config + discovered channels.
@@ -1777,6 +1847,8 @@ mod tests {
         SubscriptionRule {
             name: name.into(),
             channels,
+            admit_invited_ephemeral: false,
+            require_exact_channel_tag: false,
             kinds,
             require_mention: mention,
             filter: None,
@@ -2184,6 +2256,146 @@ mod tests {
 
         let result = resolve_channel_filters(&config, &[ch], &rules);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn invited_ephemeral_rule_admits_and_removes_verified_channel() {
+        let private = Uuid::new_v4();
+        let huddle = Uuid::new_v4();
+        let private_rule = make_rule(
+            "private-office",
+            ChannelScope::List(vec![private.to_string()]),
+            vec![9],
+            false,
+        );
+        let mut huddle_rule =
+            make_rule("invited-huddle", ChannelScope::List(vec![]), vec![9], true);
+        huddle_rule.admit_invited_ephemeral = true;
+        huddle_rule.require_exact_channel_tag = true;
+        let mut rules = vec![private_rule, huddle_rule];
+
+        assert!(admit_invited_ephemeral_channel(&mut rules, huddle));
+        assert!(!admit_invited_ephemeral_channel(&mut rules, huddle));
+        let config = test_config(SubscribeMode::Config);
+        let filters = resolve_channel_filters(&config, &[private, huddle], &rules);
+        assert!(!filters[&private].require_mention);
+        assert!(filters[&huddle].require_mention);
+
+        remove_invited_ephemeral_channel(&mut rules, huddle);
+        let filters = resolve_channel_filters(&config, &[private, huddle], &rules);
+        assert!(filters.contains_key(&private));
+        assert!(!filters.contains_key(&huddle));
+    }
+
+    #[test]
+    fn aeon_six_worker_configs_load_real_huddle_contract() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("repo root");
+        let deploy = root.join("deploy/local/aeon-aspects");
+        for aspect in [
+            "nexus",
+            "mechanon",
+            "fontis",
+            "sapientis",
+            "viatica",
+            "voxis",
+        ] {
+            let rules = load_rules(&deploy.join("config").join(format!("{aspect}.toml")))
+                .expect("load production Aspect rules");
+            assert_eq!(rules.len(), 2, "{aspect}");
+            assert!(!rules[0].admit_invited_ephemeral, "{aspect}");
+            assert!(rules[0].require_exact_channel_tag, "{aspect}");
+            assert!(!rules[0].require_mention, "{aspect}");
+            assert!(rules[1].admit_invited_ephemeral, "{aspect}");
+            assert!(rules[1].require_exact_channel_tag, "{aspect}");
+            assert!(rules[1].require_mention, "{aspect}");
+        }
+    }
+
+    #[test]
+    fn invited_ephemeral_rule_requires_fail_closed_shape() {
+        let dir =
+            std::env::temp_dir().join(format!("buzz-acp-invited-rule-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("rules.toml");
+        std::fs::create_dir_all(&dir).expect("create temp config dir");
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+name = "invited-huddle"
+channels = []
+admit_invited_ephemeral = true
+require_mention = true
+require_exact_channel_tag = false
+"#,
+        )
+        .expect("write temp config");
+        let error = load_rules(&path).expect_err("unsafe huddle rule must fail");
+        assert!(error
+            .to_string()
+            .contains("requires require_exact_channel_tag=true"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invited_ephemeral_rule_rejects_preconfigured_channels() {
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-invited-static-rule-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = dir.join("rules.toml");
+        std::fs::create_dir_all(&dir).expect("create temp config dir");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[[rules]]
+name = "invited-huddle"
+channels = ["{}"]
+admit_invited_ephemeral = true
+require_mention = true
+require_exact_channel_tag = true
+"#,
+                Uuid::new_v4()
+            ),
+        )
+        .expect("write temp config");
+        let error = load_rules(&path).expect_err("static huddle scope must fail");
+        assert!(error.to_string().contains("requires an empty channel list"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invited_ephemeral_rule_requires_only_durable_kinds() {
+        for (kinds, expected) in [
+            ("", "requires durable event kinds"),
+            ("kinds = [20001]", "rejects ephemeral event kinds"),
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("buzz-acp-invited-kinds-{}", uuid::Uuid::new_v4()));
+            let path = dir.join("rules.toml");
+            std::fs::create_dir_all(&dir).expect("create temp config dir");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[[rules]]
+name = "invited-huddle"
+channels = []
+admit_invited_ephemeral = true
+require_mention = true
+require_exact_channel_tag = true
+{kinds}
+"#,
+                ),
+            )
+            .expect("write temp config");
+            let error = load_rules(&path).expect_err("unsafe huddle kinds must fail");
+            assert!(error.to_string().contains(expected));
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     #[test]

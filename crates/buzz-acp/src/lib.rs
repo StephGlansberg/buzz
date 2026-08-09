@@ -380,6 +380,208 @@ async fn check_sibling_via_profile(
     false
 }
 
+#[derive(Clone, Copy)]
+struct EphemeralLease {
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ttl_seconds: u64,
+    metadata_created_at: u64,
+    last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl EphemeralLease {
+    fn pending(ttl_seconds: u64, metadata_created_at: u64) -> Self {
+        Self {
+            deadline: None,
+            ttl_seconds,
+            metadata_created_at,
+            last_activity_at: None,
+        }
+    }
+
+    fn activate(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: u64,
+        metadata_created_at: u64,
+    ) -> bool {
+        let Some(deadline) = refreshed_ephemeral_deadline(now, ttl_seconds) else {
+            return false;
+        };
+        self.deadline = Some(deadline);
+        self.ttl_seconds = ttl_seconds;
+        self.metadata_created_at = metadata_created_at;
+        self.last_activity_at = Some(now);
+        true
+    }
+
+    fn reconcile_metadata(&mut self, ttl_seconds: u64, metadata_created_at: u64) -> bool {
+        if metadata_created_at < self.metadata_created_at {
+            return true;
+        }
+        if self.deadline.is_some()
+            && (ttl_seconds != self.ttl_seconds || metadata_created_at > self.metadata_created_at)
+        {
+            let Some(metadata_time) = i64::try_from(metadata_created_at)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            else {
+                return false;
+            };
+            let base = self
+                .last_activity_at
+                .map_or(metadata_time, |activity| activity.max(metadata_time));
+            let Some(deadline) = refreshed_ephemeral_deadline(base, ttl_seconds) else {
+                return false;
+            };
+            self.deadline = Some(deadline);
+        }
+        self.ttl_seconds = ttl_seconds;
+        self.metadata_created_at = metadata_created_at;
+        true
+    }
+
+    fn authorize_event(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+        event_created_at: u64,
+        ttl_seconds: u64,
+        metadata_created_at: u64,
+        is_subscription_catch_up: bool,
+    ) -> bool {
+        if !self.reconcile_metadata(ttl_seconds, metadata_created_at) {
+            return false;
+        }
+        if is_subscription_catch_up {
+            let Some(activity_at) = i64::try_from(event_created_at)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .filter(|activity_at| *activity_at <= now)
+            else {
+                return false;
+            };
+            let Some(metadata_at) = i64::try_from(self.metadata_created_at)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .filter(|metadata_at| *metadata_at <= now)
+            else {
+                return false;
+            };
+            let activity_at = self
+                .last_activity_at
+                .unwrap_or(activity_at)
+                .max(activity_at)
+                .max(metadata_at);
+            // Before EOSE, exact replay provenance is unknowable. Use the signed
+            // event time as activity so catch-up can recover current work but can
+            // never extend a lease as though the event arrived at `now`.
+            self.activate(activity_at, self.ttl_seconds, self.metadata_created_at)
+                && self.deadline.is_some_and(|deadline| deadline > now)
+        } else {
+            self.activate(now, self.ttl_seconds, self.metadata_created_at)
+        }
+    }
+}
+
+fn eligible_ephemeral_contract(
+    current: &Result<Option<relay::ChannelInfo>, relay::RelayError>,
+) -> Result<Option<(u64, u64)>, &relay::RelayError> {
+    match current {
+        Ok(Some(info)) => Ok(info.ephemeral_ttl_seconds().zip(info.metadata_created_at)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn refreshed_ephemeral_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_seconds: u64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ttl_seconds = i64::try_from(ttl_seconds).ok()?;
+    now.checked_add_signed(chrono::Duration::try_seconds(ttl_seconds)?)
+}
+
+#[cfg(test)]
+mod ephemeral_eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn transient_metadata_failure_stays_distinct_from_confirmed_ineligibility() {
+        let unavailable = Err(relay::RelayError::Timeout);
+        assert!(matches!(
+            eligible_ephemeral_contract(&unavailable),
+            Err(relay::RelayError::Timeout)
+        ));
+
+        let ineligible = Ok(None);
+        assert!(matches!(eligible_ephemeral_contract(&ineligible), Ok(None)));
+    }
+
+    #[test]
+    fn activity_refresh_uses_ttl_duration_after_metadata_deadline_ages_out() {
+        let now = chrono::Utc::now();
+        let info = relay::ChannelInfo {
+            name: "huddle".into(),
+            channel_type: "private".into(),
+            ttl_seconds: Some(3600),
+            has_ttl_deadline: true,
+            metadata_created_at: Some(1),
+            metadata_event_id: Some("a".repeat(64)),
+        };
+        assert_eq!(info.ephemeral_ttl_seconds(), Some(3600));
+        assert!(refreshed_ephemeral_deadline(now, 3600).is_some_and(|value| value > now));
+    }
+
+    #[test]
+    fn newer_metadata_reconciles_a_shortened_ttl_against_latest_activity_or_update() {
+        let activity = chrono::DateTime::from_timestamp(200, 0).expect("activity time");
+        let mut lease = EphemeralLease::pending(3600, 100);
+        assert!(lease.activate(activity, 3600, 100));
+        assert!(lease.reconcile_metadata(60, 300));
+        assert_eq!(lease.deadline, chrono::DateTime::from_timestamp(360, 0));
+        assert_eq!(lease.ttl_seconds, 60);
+        assert_eq!(lease.metadata_created_at, 300);
+    }
+
+    #[test]
+    fn catch_up_uses_signed_event_time_instead_of_receipt_time() {
+        let now = chrono::DateTime::from_timestamp(500, 0).expect("current time");
+        let mut pending = EphemeralLease::pending(60, 100);
+        assert!(pending.authorize_event(now, 450, 60, 100, true));
+        assert_eq!(pending.deadline, chrono::DateTime::from_timestamp(510, 0));
+        assert!(pending.authorize_event(now, 490, 60, 100, true));
+        assert_eq!(pending.deadline, chrono::DateTime::from_timestamp(550, 0));
+        assert!(pending.authorize_event(now, 450, 60, 100, true));
+        assert_eq!(pending.deadline, chrono::DateTime::from_timestamp(550, 0));
+
+        let mut stale = EphemeralLease::pending(60, 100);
+        assert!(!stale.authorize_event(now, 400, 60, 100, true));
+        assert_eq!(stale.deadline, chrono::DateTime::from_timestamp(460, 0));
+
+        let mut future = EphemeralLease::pending(60, 100);
+        assert!(!future.authorize_event(now, 501, 60, 100, true));
+        assert_eq!(future.deadline, None);
+    }
+
+    #[test]
+    fn fresh_event_activates_a_pending_ephemeral_lease() {
+        let now = chrono::DateTime::from_timestamp(500, 0).expect("current time");
+        let mut lease = EphemeralLease::pending(60, 100);
+        assert!(lease.authorize_event(now, 500, 60, 100, false));
+        assert_eq!(lease.deadline, chrono::DateTime::from_timestamp(560, 0));
+    }
+
+    #[test]
+    fn stale_metadata_cannot_restore_an_older_longer_ttl() {
+        let now = chrono::DateTime::from_timestamp(500, 0).expect("current time");
+        let mut lease = EphemeralLease::pending(60, 300);
+
+        assert!(lease.authorize_event(now, 500, 3600, 100, false));
+        assert_eq!(lease.deadline, chrono::DateTime::from_timestamp(560, 0));
+        assert_eq!(lease.ttl_seconds, 60);
+        assert_eq!(lease.metadata_created_at, 300);
+    }
+}
+
 /// Observer frames are published at a global rate of AT MOST ONE relay frame
 /// per tick — not one per channel, and not one per drain. Everything that
 /// accumulates between ticks waits in [`ObserverPublishQueue`] as events and
@@ -1738,11 +1940,13 @@ async fn tokio_main() -> Result<()> {
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
-    let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
+    let mut rules: Vec<SubscriptionRule> = match config.subscribe_mode {
         SubscribeMode::Mentions => {
             vec![SubscriptionRule {
                 name: "mentions".into(),
                 channels: filter::ChannelScope::All("all".into()),
+                admit_invited_ephemeral: false,
+                require_exact_channel_tag: false,
                 kinds: config.kinds_override.clone().unwrap_or_else(|| {
                     vec![
                         KIND_STREAM_MESSAGE,
@@ -1761,6 +1965,8 @@ async fn tokio_main() -> Result<()> {
             vec![SubscriptionRule {
                 name: "all".into(),
                 channels: filter::ChannelScope::All("all".into()),
+                admit_invited_ephemeral: false,
+                require_exact_channel_tag: false,
                 kinds: config.kinds_override.clone().unwrap_or_default(),
                 require_mention: false,
                 filter: None,
@@ -1774,6 +1980,29 @@ async fn tokio_main() -> Result<()> {
             config::load_rules(&config.config_path)?
         }
     };
+
+    // `None` is subscribed-but-suspended. A live durable event is the
+    // authoritative activity signal that promotes it to `Some(deadline)`;
+    // kind-39000's original absolute deadline is not reused after startup.
+    let mut admitted_ephemeral_deadlines: HashMap<Uuid, EphemeralLease> = HashMap::new();
+    for (channel_id, info) in &channel_info_map {
+        if let Some((ttl_seconds, metadata_created_at)) = info
+            .ephemeral_ttl_seconds()
+            .zip(info.metadata_created_at)
+            .filter(|_| config::admit_invited_ephemeral_channel(&mut rules, *channel_id))
+        {
+            admitted_ephemeral_deadlines.insert(
+                *channel_id,
+                EphemeralLease::pending(ttl_seconds, metadata_created_at),
+            );
+            tracing::debug!(
+                %channel_id,
+                metadata_created_at = ?info.metadata_created_at,
+                metadata_event_id = ?info.metadata_event_id,
+                "admitted canonical private TTL channel"
+            );
+        }
+    }
 
     let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
     if channel_filters.is_empty() {
@@ -1907,6 +2136,11 @@ async fn tokio_main() -> Result<()> {
     } else {
         None
     };
+    let mut ephemeral_revalidation = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
+    ephemeral_revalidation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -2304,32 +2538,81 @@ async fn tokio_main() -> Result<()> {
 
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
-                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
-                                            tracing::warn!("failed to subscribe to new channel {ch}: {e}");
-                                        } else {
-                                            subscribed_channel_ids.insert(ch);
-                                        }
                                     } else {
-                                        tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
+                                        let mut filter = config::resolve_dynamic_channel_filter(
+                                            &config, ch, &rules,
+                                        );
+                                        if filter.is_none() {
+                                            match relay.fetch_channel_info(ch).await {
+                                                Ok(Some(info)) => {
+                                                    if let Some((ttl_seconds, metadata_created_at)) = info
+                                                        .ephemeral_ttl_seconds()
+                                                        .zip(info.metadata_created_at)
+                                                        .filter(|_| config::admit_invited_ephemeral_channel(&mut rules, ch))
+                                                    {
+                                                        admitted_ephemeral_deadlines.insert(
+                                                            ch,
+                                                            EphemeralLease::pending(ttl_seconds, metadata_created_at),
+                                                        );
+                                                        filter = config::resolve_dynamic_channel_filter(
+                                                            &config, ch, &rules,
+                                                        );
+                                                    }
+                                                }
+                                                Ok(_) => {}
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        channel_id = %ch,
+                                                        %error,
+                                                        "membership metadata lookup failed — deferring admission"
+                                                    );
+                                                    let event_id = buzz_event.event.id.to_hex();
+                                                    seen_membership_current.remove(&event_id);
+                                                    seen_membership_previous.remove(&event_id);
+                                                    if membership_newest_ts.get(&ch) == Some(&ts) {
+                                                        membership_newest_ts.remove(&ch);
+                                                    }
+                                                    relay.defer_event(
+                                                        buzz_event,
+                                                        Duration::from_secs(1),
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if let Some(filter) = filter {
+                                            tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
+                                            if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
+                                                tracing::warn!("failed to subscribe to new channel {ch}: {e}");
+                                            } else {
+                                                subscribed_channel_ids.insert(ch);
+                                            }
+                                        } else {
+                                            tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
+                                        }
                                     }
                                 } else {
+                                    config::remove_invited_ephemeral_channel(&mut rules, ch);
+                                    admitted_ephemeral_deadlines.remove(&ch);
+                                    relay.drop_deferred_events(ch);
                                     subscribed_channel_ids.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
-                                    if let Err(e) = relay.unsubscribe_channel(ch).await {
-                                        tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
-                                    }
-                                    // Drain queued events and invalidate sessions for the
-                                    // removed channel. Events already in-flight will
-                                    // complete normally (the relay may reject actions if
-                                    // the agent lost access).
+                                    // Membership is an authorization boundary: cancel any
+                                    // in-flight turn before awaiting relay command capacity.
+                                    let _ = signal_in_flight_task(
+                                        &mut pool,
+                                        ch,
+                                        ControlSignal::Cancel,
+                                    );
                                     let drained_ids = queue.drain_channel(ch);
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
                                         0
                                     };
+                                    if let Err(e) = relay.unsubscribe_channel(ch).await {
+                                        tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
+                                    }
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
@@ -2364,6 +2647,88 @@ async fn tokio_main() -> Result<()> {
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
+                            }
+
+                            // Dynamic-room authorization is revalidated before every
+                            // behavior, including owner control commands. The periodic
+                            // timer is cleanup, never an authorization grace window.
+                            if let Some(previous_lease) = admitted_ephemeral_deadlines
+                                .remove(&buzz_event.channel_id)
+                            {
+                                let now = chrono::Utc::now();
+                                let current = relay.fetch_channel_info(buzz_event.channel_id).await;
+                                match eligible_ephemeral_contract(&current) {
+                                    Ok(Some((ttl_seconds, metadata_created_at))) => {
+                                        let mut current_lease = previous_lease;
+                                        if !current_lease.authorize_event(
+                                            now,
+                                            buzz_event.event.created_at.as_secs(),
+                                            ttl_seconds,
+                                            metadata_created_at,
+                                            buzz_event.is_subscription_catch_up,
+                                        ) {
+                                            admitted_ephemeral_deadlines.insert(
+                                                buzz_event.channel_id,
+                                                previous_lease,
+                                            );
+                                            tracing::warn!(channel_id = %buzz_event.channel_id, is_subscription_catch_up = buzz_event.is_subscription_catch_up, "ephemeral event cannot establish current authorization — denying event");
+                                            continue;
+                                        }
+                                        // The relay refreshes its database deadline when it
+                                        // durably stores this event. Mirror that activity-based
+                                        // lease locally instead of trusting the older metadata
+                                        // event's original absolute deadline.
+                                        admitted_ephemeral_deadlines
+                                            .insert(buzz_event.channel_id, current_lease);
+                                        removed_channels.remove(&buzz_event.channel_id);
+                                    }
+                                    Err(error) => {
+                                        // Deny this event but retain the admission record so
+                                        // periodic revalidation can recover after a transient
+                                        // metadata outage without membership churn or restart.
+                                        admitted_ephemeral_deadlines
+                                            .insert(buzz_event.channel_id, previous_lease);
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            %error,
+                                            "ephemeral metadata dispatch check failed — deferring event pending retry"
+                                        );
+                                        relay.defer_event(buzz_event, Duration::from_secs(1));
+                                        continue;
+                                    }
+                                    Ok(None) => {
+                                        config::remove_invited_ephemeral_channel(
+                                            &mut rules,
+                                            buzz_event.channel_id,
+                                        );
+                                        relay.drop_deferred_events(buzz_event.channel_id);
+                                        subscribed_channel_ids.remove(&buzz_event.channel_id);
+                                        let _ = signal_in_flight_task(
+                                            &mut pool,
+                                            buzz_event.channel_id,
+                                            ControlSignal::Cancel,
+                                        );
+                                        if let Err(error) = relay
+                                            .unsubscribe_channel(buzz_event.channel_id)
+                                            .await
+                                        {
+                                            tracing::warn!(channel_id = %buzz_event.channel_id, %error, "failed to unsubscribe revoked ephemeral channel");
+                                        }
+                                        let drained_ids = queue.drain_channel(buzz_event.channel_id);
+                                        if pool_ready {
+                                            pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                        }
+                                        removed_channels.insert(buzz_event.channel_id);
+                                        typing_channels.remove(&buzz_event.channel_id);
+                                        if !drained_ids.is_empty() {
+                                            let rest = ctx.rest_client.clone();
+                                            tokio::spawn(async move {
+                                                pool::clear_reactions(rest, drained_ids).await;
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                }
                             }
 
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
@@ -2700,6 +3065,98 @@ async fn tokio_main() -> Result<()> {
                                 tracing::debug!("typing indicator dropped for {ch}: {e}");
                             }
                         }
+                    }
+                    None
+                }
+                _ = ephemeral_revalidation.tick() => {
+                    let _ = result_rx;
+                    let now = chrono::Utc::now();
+                    let channel_leases = admitted_ephemeral_deadlines
+                        .iter()
+                        .map(|(channel_id, lease)| (*channel_id, *lease))
+                        .collect::<Vec<_>>();
+                    // Run the one-second, one-attempt lookups concurrently so
+                    // periodic authorization work has a constant wall-clock
+                    // bound instead of N huddles serializing the dispatch loop.
+                    let relay_ref = &relay;
+                    let metadata_checks = futures_util::future::join_all(
+                        channel_leases.into_iter().map(|(channel_id, lease)| async move {
+                            (
+                                channel_id,
+                                lease,
+                                relay_ref.fetch_channel_info(channel_id).await,
+                            )
+                        }),
+                    )
+                    .await;
+                    let mut cleanup = Vec::new();
+                    for (channel_id, mut lease, current) in metadata_checks {
+                        match eligible_ephemeral_contract(&current) {
+                            Ok(Some((ttl_seconds, metadata_created_at))) => {
+                                if !lease.reconcile_metadata(ttl_seconds, metadata_created_at)
+                                    || lease.deadline.is_some_and(|value| value <= now)
+                                {
+                                    cleanup.push((channel_id, false));
+                                } else {
+                                    admitted_ephemeral_deadlines.insert(channel_id, lease);
+                                }
+                            }
+                            Ok(None) => cleanup.push((channel_id, true)),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %channel_id,
+                                    %error,
+                                    "ephemeral metadata revalidation failed — retaining denied channel for retry"
+                                );
+                            }
+                        }
+                    }
+                    for (channel_id, permanently_ineligible) in cleanup {
+                        if permanently_ineligible {
+                            admitted_ephemeral_deadlines.remove(&channel_id);
+                            config::remove_invited_ephemeral_channel(&mut rules, channel_id);
+                            relay.drop_deferred_events(channel_id);
+                            subscribed_channel_ids.remove(&channel_id);
+                        } else {
+                            // Drop all execution authority at lease expiry but keep
+                            // the subscription as a recovery sensor. A later durable
+                            // event proves the relay renewed its database lease and
+                            // promotes this channel from suspended to active again.
+                            if let Some(lease) = admitted_ephemeral_deadlines.get_mut(&channel_id) {
+                                lease.deadline = None;
+                                lease.last_activity_at = None;
+                            }
+                        }
+                        let _ = signal_in_flight_task(
+                            &mut pool,
+                            channel_id,
+                            ControlSignal::Cancel,
+                        );
+                        let drained_ids = queue.drain_channel(channel_id);
+                        let invalidated = if pool_ready {
+                            pool.invalidate_channel_sessions(channel_id)
+                        } else {
+                            0
+                        };
+                        if permanently_ineligible {
+                            if let Err(error) = relay.unsubscribe_channel(channel_id).await {
+                                tracing::warn!(%channel_id, %error, "failed to unsubscribe revoked ephemeral channel");
+                            }
+                        }
+                        removed_channels.insert(channel_id);
+                        typing_channels.remove(&channel_id);
+                        if !drained_ids.is_empty() {
+                            let rest = ctx.rest_client.clone();
+                            tokio::spawn(async move {
+                                pool::clear_reactions(rest, drained_ids).await;
+                            });
+                        }
+                        tracing::info!(
+                            %channel_id,
+                            invalidated,
+                            permanently_ineligible,
+                            "ephemeral channel authorization cleaned up"
+                        );
                     }
                     None
                 }
@@ -5126,6 +5583,10 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             ),
             (
@@ -5133,6 +5594,10 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             ),
         ]);
@@ -5149,6 +5614,10 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                ttl_seconds: None,
+                has_ttl_deadline: false,
+                metadata_created_at: None,
+                metadata_event_id: None,
             },
         )]);
         assert!(

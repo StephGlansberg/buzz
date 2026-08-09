@@ -869,6 +869,7 @@ fn closed_receipt_payload(
     acp_session_id: &str,
     turn_id: &str,
 ) -> serde_json::Value {
+    let observed_at_unix_ms = chrono::Utc::now().timestamp_millis();
     let failure = |reason: &str| {
         serde_json::json!({
             "status": "failed",
@@ -914,6 +915,7 @@ fn closed_receipt_payload(
         "runId": run_id,
         "acpSessionId": acp_session_id,
         "turnId": turn_id,
+        "observedAtUnixMs": observed_at_unix_ms,
     })
 }
 
@@ -4417,6 +4419,9 @@ mod tests {
         assert_eq!(payload["replyAnchor"], "a".repeat(64));
         assert_eq!(payload["gatewaySessionKey"], "agent:main:buzz-private");
         assert_eq!(payload["runId"], "run-1");
+        assert!(payload["observedAtUnixMs"]
+            .as_i64()
+            .is_some_and(|value| value > 0));
     }
 
     #[test]

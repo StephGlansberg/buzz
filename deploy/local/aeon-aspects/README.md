@@ -69,7 +69,10 @@ connection and the exact private-office subscription, and one fresh functional
 turn proves request ID, exactly one trusted `buzz_<aspect>_reply` call, anchored
 reply ID, fixed Gateway session key, and fresh run ID. The command emits
 `aeon_buzz_semantic_health_v1` JSON and exits nonzero for any missing or
-mismatched field.
+mismatched field. Freshness is fail-closed: evidence must include the current
+worker's `workerStartedAtUnixMs` and the runtime receipt's
+`observedAtUnixMs`; the receipt must postdate that worker start and be no more
+than ten minutes old.
 
 The checked-in `launchagents/` previews are real, deterministic launchd
 definitions with `RunAtLoad=true` and `KeepAlive=true`, matching the supervised

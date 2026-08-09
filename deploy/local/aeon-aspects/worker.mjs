@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 const PRIVATE_OFFICE_PROMPT_PREFIX = "deploy/local/aeon-aspects/prompts";
+const SEMANTIC_RECEIPT_MAX_AGE_MS = 10 * 60 * 1000;
 
 export function renderPrivateOfficePrompt(template, aspect) {
   if (!/^[a-z][a-z0-9-]*$/.test(aspect)) {
@@ -168,7 +169,10 @@ export function assertTrustedPublisherContract(argv, aspect, expectedBasePromptF
   }
 }
 
-export function evaluateSemanticHealth({ aspect, sessionKey, state, startup, receipt }) {
+export function evaluateSemanticHealth(
+  { aspect, sessionKey, state, startup, receipt },
+  { nowMs = Date.now() } = {},
+) {
   const failures = [];
   if (state !== "running") failures.push("worker_not_running");
   if (startup?.agentPoolReady !== true) failures.push("agent_pool_not_ready");
@@ -176,9 +180,26 @@ export function evaluateSemanticHealth({ aspect, sessionKey, state, startup, rec
   if (startup?.privateOfficeSubscribed !== true) failures.push("private_office_not_subscribed");
   if (!receipt?.requestEventId) failures.push("request_event_missing");
   if (!receipt?.replyEventId) failures.push("reply_event_missing");
-  if (receipt?.replyTo !== receipt?.requestEventId) failures.push("reply_anchor_mismatch");
-  if (receipt?.sessionKey !== sessionKey) failures.push("gateway_session_mismatch");
+  if (receipt?.status !== "closed" || receipt?.schemaVersion !== 1) {
+    failures.push("receipt_not_closed");
+  }
+  if (receipt?.replyAnchor !== receipt?.requestEventId) failures.push("reply_anchor_mismatch");
+  if (receipt?.gatewaySessionKey !== sessionKey) failures.push("gateway_session_mismatch");
+  if (receipt?.expectedGatewaySessionKey !== sessionKey) {
+    failures.push("expected_gateway_session_mismatch");
+  }
   if (!receipt?.runId) failures.push("fresh_run_missing");
+  const observedAt = receipt?.observedAtUnixMs;
+  const workerStartedAt = startup?.workerStartedAtUnixMs;
+  if (!Number.isInteger(observedAt) || !Number.isInteger(workerStartedAt)) {
+    failures.push("receipt_freshness_evidence_missing");
+  } else if (
+    observedAt <= workerStartedAt ||
+    observedAt > nowMs ||
+    nowMs - observedAt > SEMANTIC_RECEIPT_MAX_AGE_MS
+  ) {
+    failures.push("receipt_not_fresh_for_worker");
+  }
   if (receipt?.toolName !== `buzz_${aspect}_reply`) failures.push("trusted_reply_tool_mismatch");
   if (receipt?.toolCallCount !== 1) failures.push("trusted_reply_tool_count_mismatch");
   return { healthy: failures.length === 0, failures };
@@ -369,11 +390,22 @@ ${argsXml}
   };
 }
 
-export function correlateReceipt({ triggeringEventIds, replyEvents, sessionKey, runId }) {
+export function correlateReceipt({ triggeringEventIds, replyEvents, sessionKey, runId, observedAtUnixMs }) {
   if (!Array.isArray(triggeringEventIds) || triggeringEventIds.length !== 1) throw new Error("receipt requires exactly one request event");
   const requestEventId = triggeringEventIds[0];
   const matches = replyEvents.filter((event) => event.replyTo === requestEventId);
   if (matches.length !== 1) throw new Error(`receipt requires exactly one anchored reply; found ${matches.length}`);
   if (!sessionKey || !runId) throw new Error("receipt requires Gateway session key and run id");
-  return { requestEventId, replyEventId: matches[0].eventId, gatewaySessionKey: sessionKey, runId };
+  if (!Number.isInteger(observedAtUnixMs)) throw new Error("receipt requires observation time");
+  return {
+    status: "closed",
+    schemaVersion: 1,
+    requestEventId,
+    replyEventId: matches[0].eventId,
+    replyAnchor: requestEventId,
+    gatewaySessionKey: sessionKey,
+    expectedGatewaySessionKey: sessionKey,
+    runId,
+    observedAtUnixMs,
+  };
 }

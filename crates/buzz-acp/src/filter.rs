@@ -85,6 +85,13 @@ pub struct SubscriptionRule {
     pub name: String,
     /// Which channels this rule applies to.
     pub channels: ChannelScope,
+    /// Admit channels that the agent is invited to when their metadata carries
+    /// a positive TTL. Buzz huddles use TTL-scoped private channels.
+    #[serde(default)]
+    pub admit_invited_ephemeral: bool,
+    /// Require exactly one `h` tag equal to the resolved channel UUID.
+    #[serde(default)]
+    pub require_exact_channel_tag: bool,
     /// Nostr event kinds to match. Empty = wildcard (all kinds).
     #[serde(default)]
     pub kinds: Vec<u32>,
@@ -118,6 +125,8 @@ impl Default for SubscriptionRule {
         Self {
             name: String::new(),
             channels: ChannelScope::All("all".into()),
+            admit_invited_ephemeral: false,
+            require_exact_channel_tag: false,
             kinds: Vec::new(),
             require_mention: false,
             filter: None,
@@ -133,6 +142,8 @@ impl Clone for SubscriptionRule {
         Self {
             name: self.name.clone(),
             channels: self.channels.clone(),
+            admit_invited_ephemeral: self.admit_invited_ephemeral,
+            require_exact_channel_tag: self.require_exact_channel_tag,
             kinds: self.kinds.clone(),
             require_mention: self.require_mention,
             filter: self.filter.clone(),
@@ -379,6 +390,20 @@ pub async fn match_event(
             continue;
         }
 
+        if rule.require_exact_channel_tag {
+            let channel = channel_id.to_string();
+            let h_tags = event
+                .tags
+                .iter()
+                .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("h"))
+                .collect::<Vec<_>>();
+            let exact_channel = h_tags.len() == 1
+                && h_tags[0].as_slice().get(1).map(String::as_str) == Some(channel.as_str());
+            if !exact_channel {
+                continue;
+            }
+        }
+
         // 2. Kind filter (empty = wildcard).
         if !rule.kinds.is_empty() && !rule.kinds.contains(&(event.kind.as_u16() as u32)) {
             continue;
@@ -499,6 +524,8 @@ mod tests {
         SubscriptionRule {
             name: name.into(),
             channels,
+            admit_invited_ephemeral: false,
+            require_exact_channel_tag: false,
             kinds,
             require_mention: mention,
             filter: filter.map(|s| s.into()),
@@ -679,6 +706,44 @@ mod tests {
 
         let result = match_event(&event, channel_id, &rules, "").await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_channel_tag_requires_one_matching_h_tag() {
+        let channel_id = any_channel();
+        let other_channel = any_channel();
+        let keys = Keys::generate();
+        let exact_h = Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag");
+        let other_h = Tag::parse(["h", other_channel.to_string().as_str()]).expect("other h tag");
+        let exact = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([exact_h.clone()])
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let duplicate = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([exact_h, other_h.clone()])
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let wrong = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([other_h])
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let mut rule = make_rule(
+            "exact-room",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        assert!(match_event(&exact, channel_id, &[rule.clone()], "")
+            .await
+            .is_some());
+        assert!(match_event(&duplicate, channel_id, &[rule.clone()], "")
+            .await
+            .is_none());
+        assert!(match_event(&wrong, channel_id, &[rule], "").await.is_none());
     }
 
     #[test]
