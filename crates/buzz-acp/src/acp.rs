@@ -1224,8 +1224,18 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Default timeout for non-prompt RPCs (initialize, session/new, etc.).
+    /// Default timeout for ordinary non-prompt RPCs.
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// `session/new` may include adapter-owned skill refresh and model discovery.
+    const SESSION_NEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+    fn request_timeout(method: &str) -> std::time::Duration {
+        match method {
+            "session/new" => Self::SESSION_NEW_TIMEOUT,
+            _ => Self::REQUEST_TIMEOUT,
+        }
+    }
 
     /// Send a JSON-RPC request and wait for the matching response.
     ///
@@ -1239,7 +1249,7 @@ impl AcpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, AcpError> {
-        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+        self.send_request_with_timeout(method, params, Self::request_timeout(method))
             .await
     }
 
@@ -3242,6 +3252,22 @@ mod tests {
         assert!(
             msg.contains("Hard turn timeout"),
             "HardTimeout display: {msg}"
+        );
+    }
+
+    #[test]
+    fn session_new_uses_extended_request_timeout() {
+        assert_eq!(
+            AcpClient::request_timeout("session/new"),
+            std::time::Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn ordinary_request_retains_default_timeout() {
+        assert_eq!(
+            AcpClient::request_timeout("authenticate"),
+            std::time::Duration::from_secs(60)
         );
     }
 
