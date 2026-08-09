@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use clap::ValueEnum;
-use nostr::Keys;
+use nostr::{Keys, PublicKey};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
@@ -576,6 +576,32 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RELAY_OBSERVER", default_value_t = false)]
     pub relay_observer: bool,
 
+    /// Close successful OpenClaw turns with request/reply/session/run evidence.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_TURN_RECEIPTS",
+        default_value_t = false,
+        requires = "relay_observer"
+    )]
+    pub turn_receipts: bool,
+
+    /// Fixed Gateway session key that observed ACP lineage must match.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_EXPECTED_GATEWAY_SESSION_KEY",
+        hide_env_values = true,
+        requires = "turn_receipts"
+    )]
+    pub expected_gateway_session_key: Option<String>,
+
+    /// Attach one signature-verified triggering Buzz event to ACP request metadata.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_TRUSTED_INBOUND_ENVELOPE",
+        default_value_t = false
+    )]
+    pub trusted_inbound_envelope: bool,
+
     /// Exit after this many seconds with no dispatched events and no turn in flight.
     /// 0 disables inactivity self-termination.
     #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY", default_value_t = 0)]
@@ -659,6 +685,12 @@ pub struct Config {
     pub has_generated_codex_config: bool,
     /// Whether to publish encrypted observer frames through the relay.
     pub relay_observer: bool,
+    /// Whether successful turns require closed request/reply/session/run evidence.
+    pub turn_receipts: bool,
+    /// Expected stable Gateway session key for receipt verification.
+    pub expected_gateway_session_key: Option<String>,
+    /// Whether to attach a verified, non-model inbound event envelope to ACP prompts.
+    pub trusted_inbound_envelope: bool,
     /// Seconds without dispatched events before an idle harness exits. 0 = disabled.
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
@@ -1220,6 +1252,50 @@ impl Config {
             };
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
+        if args.turn_receipts
+            && normalize_agent_command_identity(&agent_command).as_str() != "openclaw"
+        {
+            return Err(ConfigError::ConfigFile(
+                "--turn-receipts currently requires --agent-command=openclaw".into(),
+            ));
+        }
+        if args.turn_receipts
+            && args
+                .expected_gateway_session_key
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(ConfigError::ConfigFile(
+                "--turn-receipts requires a non-empty --expected-gateway-session-key".into(),
+            ));
+        }
+        if args.turn_receipts
+            && !receipt_owner_resolves(
+                &keys,
+                args.agent_owner.as_deref(),
+                std::env::var("BUZZ_AUTH_TAG").ok().as_deref(),
+            )
+        {
+            return Err(ConfigError::ConfigFile(
+                "--turn-receipts requires a valid --agent-owner or verified BUZZ_AUTH_TAG".into(),
+            ));
+        }
+        let aeon_publisher_contract_requested = args.trusted_inbound_envelope
+            || args.turn_receipts
+            || args.expected_gateway_session_key.is_some();
+        if args.no_agent_publisher_credentials
+            && aeon_publisher_contract_requested
+            && (!args.trusted_inbound_envelope
+                || !args.turn_receipts
+                || args.no_base_prompt
+                || args.base_prompt_file.is_none())
+        {
+            return Err(ConfigError::ConfigFile(
+                "--no-agent-publisher-credentials requires --trusted-inbound-envelope, \
+                 --turn-receipts, and --base-prompt-file as one fail-closed publisher contract"
+                    .into(),
+            ));
+        }
 
         let config = Config {
             keys,
@@ -1268,6 +1344,9 @@ impl Config {
             persona_env_vars,
             has_generated_codex_config,
             relay_observer: args.relay_observer,
+            turn_receipts: args.turn_receipts,
+            expected_gateway_session_key: args.expected_gateway_session_key,
+            trusted_inbound_envelope: args.trusted_inbound_envelope,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
@@ -1338,6 +1417,22 @@ impl Config {
         }
         env
     }
+}
+
+fn receipt_owner_resolves(
+    keys: &Keys,
+    explicit_owner: Option<&str>,
+    auth_tag: Option<&str>,
+) -> bool {
+    let verified_auth_owner = auth_tag
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| buzz_sdk::nip_oa::verify_auth_tag(value, &keys.public_key()).is_ok());
+    let valid_explicit_owner = explicit_owner
+        .map(str::trim)
+        .filter(|value| value.len() == 64)
+        .is_some_and(|value| PublicKey::from_hex(value).is_ok());
+    verified_auth_owner || valid_explicit_owner
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1660,6 +1755,9 @@ mod tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            turn_receipts: false,
+            expected_gateway_session_key: None,
+            trusted_inbound_envelope: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             agent_owner: None,
@@ -2925,6 +3023,80 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[derive(serde::Deserialize)]
+    struct RenderedWorkerArgs {
+        name: String,
+        plist: String,
+        argv: Vec<String>,
+    }
+
+    #[test]
+    fn rendered_aeon_worker_plists_use_only_real_parser_flags() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("repo root");
+        let script = r#"
+import fs from "node:fs";
+import { renderDisabledLaunchAgent } from "./deploy/local/aeon-aspects/worker.mjs";
+import { renderLaunchAgent } from "./deploy/local/aeon-external-cli/worker.mjs";
+
+const read = (path) => JSON.parse(fs.readFileSync(path, "utf8"));
+const aspectManifest = read("deploy/local/aeon-aspects/workers.json");
+const aspectIdentity = read("deploy/local/aeon-aspects/fixtures/identity-map.json");
+const workers = aspectManifest.workers.map(({ aspect }) => {
+  const artifact = renderDisabledLaunchAgent(aspectManifest, aspectIdentity, aspect, {
+    buzzAcpPath: "/opt/aeon/buzz-acp",
+  });
+  return { name: aspect, plist: artifact.plist, argv: ["buzz-acp", ...artifact.argv.slice(1)] };
+});
+
+const frontierIdentity = read("deploy/local/aeon-external-cli/fixtures/identity-map.json");
+for (const path of [
+  "manifest.json",
+  "manifest.claude_cli.json",
+  "manifest.grok_cli.json",
+  "manifest.cursor_cli.json",
+]) {
+  const manifest = read(`deploy/local/aeon-external-cli/${path}`);
+  const artifact = renderLaunchAgent(manifest, frontierIdentity, manifest.workspaces.default);
+  const all = [artifact.command, ...artifact.args];
+  const binary = all.indexOf(manifest.runtime.buzzAcpBinary);
+  if (binary < 0) throw new Error(`${path}: rendered plist omits buzz-acp`);
+  workers.push({
+    name: manifest.worker.principal,
+    plist: artifact.plist,
+    argv: ["buzz-acp", ...all.slice(binary + 1)],
+  });
+}
+process.stdout.write(JSON.stringify(workers));
+"#;
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "-e", script])
+            .current_dir(root)
+            .output()
+            .expect("run worker renderers");
+        assert!(
+            output.status.success(),
+            "worker render failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let workers: Vec<RenderedWorkerArgs> =
+            serde_json::from_slice(&output.stdout).expect("rendered worker JSON");
+        assert_eq!(workers.len(), 10);
+        for worker in workers {
+            for flag in worker.argv.iter().filter(|arg| arg.starts_with("--")) {
+                assert!(
+                    worker.plist.contains(&format!("<string>{flag}</string>")),
+                    "{} plist omits rendered flag {flag}",
+                    worker.name
+                );
+            }
+            CliArgs::try_parse_from(&worker.argv)
+                .unwrap_or_else(|error| panic!("{} argv rejected: {error}", worker.name));
+        }
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {

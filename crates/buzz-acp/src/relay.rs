@@ -241,6 +241,13 @@ pub struct RestClient {
     pub auth_tag_json: Option<String>,
 }
 
+/// Durable reply evidence read back from the relay event log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredReply {
+    pub event_id: String,
+    pub reply_to: String,
+}
+
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
 fn is_retriable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
@@ -421,6 +428,26 @@ impl RestClient {
             .map_err(|e| RelayError::Http(e.to_string()))
     }
 
+    /// Query agent-authored kind-9 replies with an exact NIP-10 `reply` anchor.
+    pub async fn query_anchored_replies(
+        &self,
+        channel_id: Uuid,
+        author: nostr::PublicKey,
+        request_event_id: &str,
+    ) -> Result<Vec<AnchoredReply>, RelayError> {
+        use nostr::{Alphabet, SingleLetterTag};
+
+        let channel = channel_id.to_string();
+        let filter = nostr::Filter::new()
+            .kind(Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16))
+            .author(author)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()])
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::E), [request_event_id])
+            .limit(3);
+        let response = self.query(&[filter]).await?;
+        parse_anchored_replies(&response, channel_id, author, request_event_id)
+    }
+
     /// Submit a signed event via the HTTP bridge: `POST /events` with NIP-98 auth.
     ///
     /// The event must already be signed. Returns the relay response JSON.
@@ -437,6 +464,59 @@ impl RestClient {
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
     }
+}
+
+fn parse_anchored_replies(
+    response: &Value,
+    channel_id: Uuid,
+    author: nostr::PublicKey,
+    request_event_id: &str,
+) -> Result<Vec<AnchoredReply>, RelayError> {
+    let events = response
+        .as_array()
+        .ok_or_else(|| RelayError::Http("expected JSON array from /query (replies)".into()))?;
+    let expected_channel = channel_id.to_string();
+    let mut replies = Vec::new();
+    for value in events {
+        let Ok(event) = serde_json::from_value::<Event>(value.clone()) else {
+            continue;
+        };
+        if event.verify().is_err()
+            || event.kind.as_u16() as u32 != buzz_core::kind::KIND_STREAM_MESSAGE
+            || event.pubkey != author
+        {
+            continue;
+        }
+        let h_tags = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("h"))
+            .collect::<Vec<_>>();
+        let reply_tags = event
+            .tags
+            .iter()
+            .filter(|tag| {
+                let values = tag.as_slice();
+                values.first().map(String::as_str) == Some("e")
+                    && values.get(3).map(String::as_str) == Some("reply")
+            })
+            .collect::<Vec<_>>();
+        let exact_channel = h_tags.len() == 1
+            && h_tags[0].as_slice().get(1).map(String::as_str) == Some(expected_channel.as_str());
+        let exact_reply = reply_tags.len() == 1
+            && reply_tags[0].as_slice().len() == 4
+            && reply_tags[0].as_slice().get(1).map(String::as_str) == Some(request_event_id)
+            && reply_tags[0].as_slice().get(2).map(String::as_str) == Some("");
+        if exact_channel && exact_reply {
+            replies.push(AnchoredReply {
+                event_id: event.id.to_hex(),
+                reply_to: request_event_id.to_ascii_lowercase(),
+            });
+        }
+    }
+    replies.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+    replies.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(replies)
 }
 
 /// Events the harness cares about.

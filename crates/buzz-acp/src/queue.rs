@@ -1277,9 +1277,9 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
-                append_reply_instruction(&mut s, event_id);
-            }
+        }
+        if let Some(event_id) = reply_anchor {
+            append_reply_instruction(&mut s, event_id);
         }
         s
     } else if let Some(ref root) = thread_tags.root_event_id {
@@ -1360,6 +1360,8 @@ pub struct FormatPromptArgs<'a> {
     pub channel_info: Option<&'a PromptChannelInfo>,
     pub conversation_context: Option<&'a ConversationContext>,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
+    /// Require a durable reply anchor for first-turn DMs so receipt readback can correlate it.
+    pub turn_receipts: bool,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
     /// (legacy agents), they are injected as `[Base]` and `[System]` sections.
@@ -1386,6 +1388,29 @@ pub struct FormatPromptArgs<'a> {
 /// initial message).
 pub(crate) fn base_section(base_prompt: &str) -> String {
     format!("[Base]\n{}", base_prompt.trim_end())
+}
+
+/// Resolve the exact reply anchor shared by prompt instructions and receipt readback.
+pub(crate) fn resolve_turn_reply_anchor(
+    batch: &FlushBatch,
+    args: &FormatPromptArgs<'_>,
+) -> Option<String> {
+    let last_event = batch.events.last()?;
+    let thread_tags = parse_thread_tags(&last_event.event);
+    let is_dm = args
+        .channel_info
+        .map(|info| info.channel_type == "dm")
+        .unwrap_or(false);
+    if is_dm {
+        return (thread_tags.root_event_id.is_some() || args.turn_receipts)
+            .then(|| last_event.event.id.to_hex());
+    }
+    resolve_reply_anchor(
+        &last_event.event.pubkey.to_hex(),
+        &thread_tags,
+        &last_event.event.id.to_hex(),
+        args.profile_lookup,
+    )
 }
 
 /// Format a [`FlushBatch`] into the per-section prompt blocks for the agent.
@@ -1469,20 +1494,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //   - top-level     → anchor to the triggering event (it becomes the root)
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| last_event.event.id.to_hex())
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &last_event.event.id.to_hex(),
-            args.profile_lookup,
-        )
-    };
+    let reply_anchor = resolve_turn_reply_anchor(batch, args);
     sections.push(format_context_hints(
         batch.channel_id,
         args.channel_info,
