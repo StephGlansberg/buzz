@@ -97,6 +97,28 @@ test("cursor system prompt requires exact one-recipient Buzz mentions", () => {
   );
 });
 
+test("all AEON seats require one exact resolvable recipient rule", () => {
+  const sharedBase = join(here, "..", "..", "..", "crates", "buzz-acp", "src", "base_prompt.md");
+  const sources = [
+    ["Nexus", "../aeon-aspects/prompts/nexus-private-office.md"],
+    ["Mechanon", "../aeon-aspects/prompts/mechanon-private-office.md"],
+    ["Fontis", "../aeon-aspects/prompts/fontis-private-office.md"],
+    ["Sapientis", "../aeon-aspects/prompts/sapientis-private-office.md"],
+    ["Viatica", "../aeon-aspects/prompts/viatica-private-office.md"],
+    ["Voxis", "../aeon-aspects/prompts/voxis-private-office.md"],
+    ["Codex CLI", "config/codex_cli_system.md"],
+    ["Claude CLI", sharedBase],
+    ["Grok CLI", sharedBase],
+    ["Cursor CLI", "config/cursor_cli_system.md"],
+  ];
+  for (const [seat, source] of sources) {
+    const prompt = readFileSync(source === sharedBase ? source : join(here, source), "utf8");
+    assert.equal((prompt.match(/`@Display Name`/g) ?? []).length, 1, seat);
+    assert.match(prompt, /exact(?: resolvable)? `@Display Name`/);
+    assert.equal((prompt.match(/one\s+actionable recipient/gi) ?? []).length, 1, seat);
+  }
+});
+
 test("claude_cli selector binds the established external claude_code identity", () => {
   const result = validateManifest(claudeManifest, identityMap);
   assert.deepEqual(result.errors, []);
