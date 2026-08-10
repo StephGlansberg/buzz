@@ -109,10 +109,18 @@ non-secret fields:
 - `base_prompt_sha256`
 - `collaboration_contract_revision`
 - `collaboration_contract_present`
+- `session_scope` (`per-channel-acp` or `fixed-gateway`)
+- `fixed_session_key`
+- `canonical_channel_source`
+- `trusted_inbound_envelope`
+- `turn_receipts`
+- `expected_gateway_session_key`
 
 The same object is included as `startupReadback` in the existing
 `harness_started` observer frame when relay observer reporting is enabled. The
-readback never includes prompt text, credentials, or transcripts. A custom or
+readback never includes prompt text, credentials, or transcripts. Channel-scoped
+CLI seats report `canonical_channel_source=per-turn-observer-context`; the exact
+channel and ACP session remain on the existing per-turn observer frame. A custom or
 disabled base prompt reports `collaboration_contract_present=false`; operators
 must not infer that the contract was delivered from the revision field alone.
 

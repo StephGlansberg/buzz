@@ -16,6 +16,7 @@ import test from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
   REQUIRED_ROOM_NAMES,
   correlateVerifiedReceipt,
   hashCursorClosure,
@@ -44,6 +45,10 @@ const identityMap = loadJson(join(here, "fixtures", "identity-map.json"));
 const codexConfig = readFileSync(join(here, "config", "codex_cli.toml"), "utf8");
 const codexSystemPrompt = readFileSync(join(here, "config", "codex_cli_system.md"), "utf8");
 const cursorSystemPrompt = readFileSync(join(here, "config", "cursor_cli_system.md"), "utf8");
+const compiledBasePrompt = readFileSync(
+  join(here, "..", "..", "..", "crates", "buzz-acp", "src", "base_prompt.md"),
+  "utf8",
+);
 
 function expectedRoomIds(workerManifest) {
   return [
@@ -63,7 +68,7 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
 
 test("all external workers pin the same shared Data-volume buzz-acp release", () => {
   const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
-  const sha256 = "5fe7ea291eb73dcd3301a0af678f6082555adb7d3e0c3681e5def87f882cf670";
+  const sha256 = "02a1750186261cf2ab1e71b6c249ea4120fb4e9e1b8e9ffc9006f25be86a9ae4";
   assert.equal(manifest.runtime.buzzAcpBinary, binary);
   assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
   assert.equal(cursorManifest.runtime.buzzAcpBinary, binary);
@@ -72,6 +77,26 @@ test("all external workers pin the same shared Data-volume buzz-acp release", ()
   assert.equal(claudeManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(cursorManifest.runtime.buzzAcpSha256, sha256);
   assert.equal(grokManifest.runtime.buzzAcpSha256, sha256);
+});
+
+test("all four frontier seats receive the compiled collaboration contract and safe startup readback", () => {
+  assert.match(compiledBasePrompt, new RegExp(AEON_BUZZ_COLLABORATION_CONTRACT_REVISION));
+  for (const workerManifest of [manifest, claudeManifest, cursorManifest, grokManifest]) {
+    const worker = renderWorker(workerManifest, identityMap);
+    assert.equal(worker.args.includes("--no-base-prompt"), false);
+    assert.deepEqual(worker.startupEvidence, {
+      seatIdentity: workerManifest.worker.principal,
+      seatPublicKey: identityMap.members[workerManifest.worker.principal].pubkey_hex,
+      sessionScope: "per-channel-acp",
+      fixedSessionKey: null,
+      canonicalChannels: expectedRoomIds(workerManifest),
+      trustedInboundEnvelope: false,
+      turnReceipts: false,
+      expectedGatewaySessionKey: null,
+      collaborationContractRevision: AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+      collaborationContractPresent: true,
+    });
+  }
 });
 
 test("codex system prompt requires exact one-recipient Buzz mentions", () => {
@@ -464,7 +489,7 @@ test("renderer pins one native Cursor ACP subprocess with a proven operational m
     cursorManifest.runtime.systemPromptPath,
   );
   assert.match(cursorManifest.runtime.systemPromptSha256, /^[0-9a-f]{64}$/);
-  assert.equal(worker.args.includes("--no-base-prompt"), true);
+  assert.equal(worker.args.includes("--no-base-prompt"), false);
   assert.equal(worker.args.includes("--no-memory"), true);
   assert.equal(
     worker.args[worker.args.indexOf("--context-message-limit") + 1],
@@ -725,7 +750,7 @@ test("Cursor launchd artifact is separate, supervised, and secret-free", () => {
   assert.doesNotMatch(artifact.plist, /<key>CURSOR_API_KEY|<key>CURSOR_API_ENDPOINT|nsec1/);
   assert.match(artifact.plist, /grok-4\.5\[effort=high,fast=true\]/);
   assert.match(artifact.plist, /cursor-cli-system\.md/);
-  assert.match(artifact.plist, /<string>--no-base-prompt<\/string>/);
+  assert.doesNotMatch(artifact.plist, /<string>--no-base-prompt<\/string>/);
   assert.match(artifact.plist, /<string>--session-cwd<\/string>/);
   assert.match(
     artifact.plist,

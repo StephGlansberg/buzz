@@ -6,6 +6,7 @@ import path from "node:path";
 const HEX_64 = /^[0-9a-f]{64}$/;
 const SAFE_LABEL = /^[a-z0-9][a-z0-9._-]*$/;
 const REQUIRED_AGENT_MODE = "agent-full-access";
+export const AEON_BUZZ_COLLABORATION_CONTRACT_REVISION = "aeon-buzz-collaboration/v1";
 const REQUIRED_CODEX_ACP_VERSION = "1.1.7";
 const REQUIRED_CLAUDE_ACP_VERSION = "0.62.0";
 const REQUIRED_CLAUDE_CODE_VERSION = "2.1.220";
@@ -22,7 +23,7 @@ const REQUIRED_CLAUDE_CODE_SHA256 =
 const REQUIRED_CLAUDE_RUNTIME_ROOT = "/Users/architect/Library/Application Support/AEON/aeon-v6";
 const REQUIRED_SHARED_BUZZ_ACP_BINARY = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/bin/buzz-acp`;
 const REQUIRED_SHARED_BUZZ_ACP_SHA256 =
-  "5fe7ea291eb73dcd3301a0af678f6082555adb7d3e0c3681e5def87f882cf670";
+  "02a1750186261cf2ab1e71b6c249ea4120fb4e9e1b8e9ffc9006f25be86a9ae4";
 const REQUIRED_CURSOR_BOOTSTRAP_PATH = `${REQUIRED_CLAUDE_RUNTIME_ROOT}/buzz/cursor-acp-bootstrap.cjs`;
 const REQUIRED_CURSOR_BOOTSTRAP_SHA256 =
   "b3f4e90e675bd0e8f0827b618203c33b9904cbd01becd2b80fc868d75b8797e8";
@@ -812,14 +813,8 @@ export function validateManifest(manifest, identityMap) {
   if (posture?.memory !== expectedMemory) {
     errors.push(`memory must remain ${expectedMemory ? "enabled" : "disabled"}`);
   }
-  if (posture?.basePrompt !== true && posture?.basePrompt !== false) {
-    errors.push("basePrompt must be a boolean");
-  }
-  if (
-    posture?.basePrompt === false &&
-    !isAbsoluteSafePath(manifest.runtime?.systemPromptPath)
-  ) {
-    errors.push("a compact systemPromptPath is required when basePrompt is disabled");
+  if (posture?.basePrompt !== true) {
+    errors.push("the compiled AEON collaboration base prompt must remain enabled");
   }
   if (
     manifest.runtime?.systemPromptPath !== undefined &&
@@ -858,6 +853,7 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
   const adapter = manifest.runtime[contract.adapterKey];
   const usesSafeSupervisor = true;
   const signerFile = manifest.runtime.signerPath;
+  const subscriptionRoomIds = exactRoomIds(manifest, identityMap);
   const allowlist = manifest.buzz.allowedInbound
     .filter((memberId) => memberId !== manifest.buzz.owner)
     .map((memberId) => memberPubkey(identityMap, memberId));
@@ -948,7 +944,19 @@ export function renderWorker(manifest, identityMap, workspaceName = manifest.wor
     workspaceName,
     workingDirectory: manifest.runtime.supervisorWorkingDirectory,
     sessionCwd: workspace,
-    subscriptionRoomIds: exactRoomIds(manifest, identityMap),
+    subscriptionRoomIds,
+    startupEvidence: {
+      seatIdentity: manifest.worker.principal,
+      seatPublicKey: principal.pubkey_hex,
+      sessionScope: "per-channel-acp",
+      fixedSessionKey: null,
+      canonicalChannels: subscriptionRoomIds,
+      trustedInboundEnvelope: false,
+      turnReceipts: false,
+      expectedGatewaySessionKey: null,
+      collaborationContractRevision: AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+      collaborationContractPresent: manifest.posture.basePrompt,
+    },
     command: usesSafeSupervisor ? ENV_BINARY : manifest.runtime.buzzAcpBinary,
     args: usesSafeSupervisor
       ? [...scrubPrefix, manifest.runtime.buzzAcpBinary, ...buzzArgs]

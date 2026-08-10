@@ -484,6 +484,7 @@ const result = {
     : { permissionMode: manifest.posture.permissionMode }),
   roomCount: subscriptionValidation.roomIds.length,
   publisherCredentials: "managed",
+  startupEvidence: artifact.startupEvidence,
   ...(selector === "cursor_cli"
     ? {
         requestedModel: manifest.runtime.cursorAcp.model.requested,

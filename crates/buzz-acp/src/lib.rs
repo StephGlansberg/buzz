@@ -58,6 +58,12 @@ struct BasePromptStartupReadback {
     base_prompt_sha256: Option<String>,
     collaboration_contract_revision: &'static str,
     collaboration_contract_present: bool,
+    session_scope: &'static str,
+    fixed_session_key: Option<String>,
+    canonical_channel_source: &'static str,
+    trusted_inbound_envelope: bool,
+    turn_receipts: bool,
+    expected_gateway_session_key: Option<String>,
 }
 
 /// Describe only the prompt contract selected for startup, never its content.
@@ -68,6 +74,9 @@ fn base_prompt_startup_readback(config: &Config) -> BasePromptStartupReadback {
         &config.agent_command,
         config.no_base_prompt,
         config.base_prompt_content.as_deref(),
+        config.trusted_inbound_envelope,
+        config.turn_receipts,
+        config.expected_gateway_session_key.as_deref(),
     )
 }
 
@@ -75,6 +84,9 @@ fn base_prompt_startup_readback_for(
     agent_command: &str,
     no_base_prompt: bool,
     custom_base_prompt: Option<&str>,
+    trusted_inbound_envelope: bool,
+    turn_receipts: bool,
+    expected_gateway_session_key: Option<&str>,
 ) -> BasePromptStartupReadback {
     use sha2::{Digest, Sha256};
 
@@ -89,6 +101,17 @@ fn base_prompt_startup_readback_for(
     // repeat the revision marker without carrying the complete contract.
     let collaboration_contract_present = source == "compiled";
     let base_prompt_sha256 = prompt.map(|content| hex::encode(Sha256::digest(content.as_bytes())));
+    let fixed_session_key = expected_gateway_session_key.map(str::to_owned);
+    let session_scope = if fixed_session_key.is_some() {
+        "fixed-gateway"
+    } else {
+        "per-channel-acp"
+    };
+    let canonical_channel_source = if fixed_session_key.is_some() {
+        "gateway-session-contract"
+    } else {
+        "per-turn-observer-context"
+    };
 
     BasePromptStartupReadback {
         agent_identity: crate::config::normalize_agent_command_identity(agent_command),
@@ -96,6 +119,12 @@ fn base_prompt_startup_readback_for(
         base_prompt_sha256,
         collaboration_contract_revision: AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
         collaboration_contract_present,
+        session_scope,
+        fixed_session_key: fixed_session_key.clone(),
+        canonical_channel_source,
+        trusted_inbound_envelope,
+        turn_receipts,
+        expected_gateway_session_key: fixed_session_key,
     }
 }
 
@@ -1859,6 +1888,15 @@ async fn tokio_main() -> Result<()> {
         base_prompt_sha256 = base_prompt_readback.base_prompt_sha256.as_deref().unwrap_or("none"),
         collaboration_contract_revision = base_prompt_readback.collaboration_contract_revision,
         collaboration_contract_present = base_prompt_readback.collaboration_contract_present,
+        session_scope = base_prompt_readback.session_scope,
+        fixed_session_key = base_prompt_readback.fixed_session_key.as_deref().unwrap_or("none"),
+        canonical_channel_source = base_prompt_readback.canonical_channel_source,
+        trusted_inbound_envelope = base_prompt_readback.trusted_inbound_envelope,
+        turn_receipts = base_prompt_readback.turn_receipts,
+        expected_gateway_session_key = base_prompt_readback
+            .expected_gateway_session_key
+            .as_deref()
+            .unwrap_or("none"),
         "buzz_acp_startup_readback"
     );
 
@@ -4598,7 +4636,8 @@ mod agent_draft_prompt_tests {
             ("/Users/architect/.local/bin/cursor-agent", "cursor-agent"),
             ("/Users/architect/.grok/bin/grok", "grok"),
         ] {
-            let readback = base_prompt_startup_readback_for(command, false, None);
+            let readback =
+                base_prompt_startup_readback_for(command, false, None, false, false, None);
             assert_eq!(readback.agent_identity, expected_identity);
             assert_eq!(readback.base_prompt_source, "compiled");
             assert_eq!(
@@ -4606,6 +4645,15 @@ mod agent_draft_prompt_tests {
                 AEON_BUZZ_COLLABORATION_CONTRACT_REVISION
             );
             assert!(readback.collaboration_contract_present);
+            assert_eq!(readback.session_scope, "per-channel-acp");
+            assert_eq!(readback.fixed_session_key, None);
+            assert_eq!(
+                readback.canonical_channel_source,
+                "per-turn-observer-context"
+            );
+            assert!(!readback.trusted_inbound_envelope);
+            assert!(!readback.turn_receipts);
+            assert_eq!(readback.expected_gateway_session_key, None);
             assert_eq!(
                 readback.base_prompt_sha256.as_deref().map(str::len),
                 Some(64)
@@ -4619,15 +4667,46 @@ mod agent_draft_prompt_tests {
             "codex-acp",
             false,
             Some(AEON_BUZZ_COLLABORATION_CONTRACT_REVISION),
+            false,
+            false,
+            None,
         );
         assert_eq!(custom.base_prompt_source, "custom");
         assert!(!custom.collaboration_contract_present);
         assert_eq!(custom.base_prompt_sha256.as_deref().map(str::len), Some(64));
 
-        let disabled = base_prompt_startup_readback_for("codex-acp", true, None);
+        let disabled =
+            base_prompt_startup_readback_for("codex-acp", true, None, false, false, None);
         assert_eq!(disabled.base_prompt_source, "disabled");
         assert!(!disabled.collaboration_contract_present);
         assert_eq!(disabled.base_prompt_sha256, None);
+    }
+
+    #[test]
+    fn startup_readback_proves_the_fixed_gateway_contract_when_enabled() {
+        let readback = base_prompt_startup_readback_for(
+            "openclaw",
+            false,
+            None,
+            true,
+            true,
+            Some("agent:fontis-buzz:buzz-private"),
+        );
+        assert_eq!(readback.session_scope, "fixed-gateway");
+        assert_eq!(
+            readback.fixed_session_key.as_deref(),
+            Some("agent:fontis-buzz:buzz-private")
+        );
+        assert_eq!(
+            readback.canonical_channel_source,
+            "gateway-session-contract"
+        );
+        assert!(readback.trusted_inbound_envelope);
+        assert!(readback.turn_receipts);
+        assert_eq!(
+            readback.expected_gateway_session_key,
+            readback.fixed_session_key
+        );
     }
 }
 

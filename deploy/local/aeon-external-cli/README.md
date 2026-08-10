@@ -21,6 +21,16 @@ canonical entry and never invents or widens membership.
 External CLI seats cannot direct each other. Each worker starts one pinned ACP
 process.
 
+All four seats receive the compiled `aeon-buzz-collaboration/v1` base-prompt
+contract at startup. The source validator reports a secret-free
+`startupEvidence` object with the signed seat identity and public key, canonical
+subscription channels, channel-scoped session model, explicit Gateway-envelope
+and receipt applicability, and collaboration contract revision/presence. These
+frontier seats use one ACP session per Buzz channel, so `fixedSessionKey` and
+`expectedGatewaySessionKey` are `null`; the exact channel and session are joined
+on the existing per-turn observer frame. OpenClaw Aspect workers instead report
+their fixed Gateway session contract through the same harness readback.
+
 The Codex worker starts `@agentclientprotocol/codex-acp@1.1.7` with
 an isolated `CODEX_HOME` under the AEON Application Support runtime and
 `INITIAL_AGENT_MODE=agent-full-access`. Buzz's permission mode stays `default`;
@@ -38,7 +48,7 @@ Both services reuse the canonical shared
 `/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp`;
 neither worker installs or maintains a private harness executable. Both
 manifests pin the release at SHA-256
-`5fe7ea291eb73dcd3301a0af678f6082555adb7d3e0c3681e5def87f882cf670`.
+`02a1750186261cf2ab1e71b6c249ea4120fb4e9e1b8e9ffc9006f25be86a9ae4`.
 The pinned harness supports
 `--session-cwd` and requires the explicit `--agent-publisher-credentials`
 grant, so the renderer cannot silently depend on legacy default forwarding.
