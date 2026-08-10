@@ -47,6 +47,58 @@ use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+const DEFAULT_BASE_PROMPT: &str = include_str!("base_prompt.md");
+const AEON_BUZZ_COLLABORATION_CONTRACT_REVISION: &str = "aeon-buzz-collaboration/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BasePromptStartupReadback {
+    agent_identity: String,
+    base_prompt_source: &'static str,
+    base_prompt_sha256: Option<String>,
+    collaboration_contract_revision: &'static str,
+    collaboration_contract_present: bool,
+}
+
+/// Describe only the prompt contract selected for startup, never its content.
+/// This readback is safe for logs and observer frames and lets operators prove
+/// which CLI seat received the shared collaboration contract.
+fn base_prompt_startup_readback(config: &Config) -> BasePromptStartupReadback {
+    base_prompt_startup_readback_for(
+        &config.agent_command,
+        config.no_base_prompt,
+        config.base_prompt_content.as_deref(),
+    )
+}
+
+fn base_prompt_startup_readback_for(
+    agent_command: &str,
+    no_base_prompt: bool,
+    custom_base_prompt: Option<&str>,
+) -> BasePromptStartupReadback {
+    use sha2::{Digest, Sha256};
+
+    let (source, prompt) = if no_base_prompt {
+        ("disabled", None)
+    } else if let Some(content) = custom_base_prompt {
+        ("custom", Some(content))
+    } else {
+        ("compiled", Some(DEFAULT_BASE_PROMPT))
+    };
+    // Only the compiled prompt is owned by this binary. A custom prompt may
+    // repeat the revision marker without carrying the complete contract.
+    let collaboration_contract_present = source == "compiled";
+    let base_prompt_sha256 = prompt.map(|content| hex::encode(Sha256::digest(content.as_bytes())));
+
+    BasePromptStartupReadback {
+        agent_identity: crate::config::normalize_agent_command_identity(agent_command),
+        base_prompt_source: source,
+        base_prompt_sha256,
+        collaboration_contract_revision: AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+        collaboration_contract_present,
+    }
+}
+
 /// Check if argv[1] matches a subcommand name, before any clap parsing.
 ///
 /// This avoids clap rejecting harness flags (like `--private-key`) that aren't
@@ -1798,6 +1850,17 @@ async fn tokio_main() -> Result<()> {
     }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
+    let base_prompt_readback = base_prompt_startup_readback(&config);
+    tracing::info!(
+        target: "buzz_acp::startup",
+        event = "startup_readback",
+        agent_identity = %base_prompt_readback.agent_identity,
+        base_prompt_source = base_prompt_readback.base_prompt_source,
+        base_prompt_sha256 = base_prompt_readback.base_prompt_sha256.as_deref().unwrap_or("none"),
+        collaboration_contract_revision = base_prompt_readback.collaboration_contract_revision,
+        collaboration_contract_present = base_prompt_readback.collaboration_contract_present,
+        "buzz_acp_startup_readback"
+    );
 
     let observer = config
         .relay_observer
@@ -1813,6 +1876,7 @@ async fn tokio_main() -> Result<()> {
                 "agentArgs": config.agent_args,
                 "parallelism": config.agents,
                 "relayObserver": config.relay_observer,
+                "startupReadback": base_prompt_readback,
             }),
         );
     }
@@ -2078,7 +2142,7 @@ async fn tokio_main() -> Result<()> {
         } else if let Some(content) = base_prompt_content {
             Some(Box::leak(content.into_boxed_str()))
         } else {
-            Some(include_str!("base_prompt.md"))
+            Some(DEFAULT_BASE_PROMPT)
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
         cwd: session_cwd,
@@ -4465,9 +4529,14 @@ fn dispatch_heartbeat(
 
 #[cfg(test)]
 mod agent_draft_prompt_tests {
+    use super::{
+        base_prompt_startup_readback_for, AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+        DEFAULT_BASE_PROMPT,
+    };
+
     #[test]
     fn shared_base_prompt_teaches_portable_agent_drafts() {
-        let prompt = include_str!("base_prompt.md");
+        let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains("buzz agents draft-create"));
         assert!(prompt.contains("ask for at most two things"));
         assert!(prompt.contains("what it should do day-to-day"));
@@ -4477,7 +4546,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
-        let prompt = include_str!("base_prompt.md");
+        let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains("pass real newline bytes through stdin"));
         assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
         assert!(prompt.contains("buzz messages send ... --content -"));
@@ -4485,7 +4554,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
-        let prompt = include_str!("base_prompt.md");
+        let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains("another permitted recipient"));
         assert!(prompt.contains("exact `@Display Name` mention is mandatory"));
         assert!(prompt.contains("one actionable recipient per assignment"));
@@ -4501,6 +4570,64 @@ mod agent_draft_prompt_tests {
         assert!(prompt
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
+    }
+
+    #[test]
+    fn shared_base_prompt_carries_aeon_collaboration_contract() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        for required in [
+            AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+            "verified event metadata",
+            "canonical job path",
+            "what changed, why it matters, who needs it, and what should happen next",
+            "accepted Buzz event ID is terminal publication proof",
+            "they do not grant credentials or effect authority",
+        ] {
+            assert!(
+                prompt.contains(required),
+                "missing collaboration rule: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_readback_proves_contract_for_every_frontier_cli_identity() {
+        for (command, expected_identity) in [
+            ("/opt/aeon/bin/codex-acp", "codex-acp"),
+            ("claude-agent-acp", "claude-agent-acp"),
+            ("/Users/architect/.local/bin/cursor-agent", "cursor-agent"),
+            ("/Users/architect/.grok/bin/grok", "grok"),
+        ] {
+            let readback = base_prompt_startup_readback_for(command, false, None);
+            assert_eq!(readback.agent_identity, expected_identity);
+            assert_eq!(readback.base_prompt_source, "compiled");
+            assert_eq!(
+                readback.collaboration_contract_revision,
+                AEON_BUZZ_COLLABORATION_CONTRACT_REVISION
+            );
+            assert!(readback.collaboration_contract_present);
+            assert_eq!(
+                readback.base_prompt_sha256.as_deref().map(str::len),
+                Some(64)
+            );
+        }
+    }
+
+    #[test]
+    fn startup_readback_does_not_claim_contract_for_custom_or_disabled_prompt() {
+        let custom = base_prompt_startup_readback_for(
+            "codex-acp",
+            false,
+            Some(AEON_BUZZ_COLLABORATION_CONTRACT_REVISION),
+        );
+        assert_eq!(custom.base_prompt_source, "custom");
+        assert!(!custom.collaboration_contract_present);
+        assert_eq!(custom.base_prompt_sha256.as_deref().map(str::len), Some(64));
+
+        let disabled = base_prompt_startup_readback_for("codex-acp", true, None);
+        assert_eq!(disabled.base_prompt_source, "disabled");
+        assert!(!disabled.collaboration_contract_present);
+        assert_eq!(disabled.base_prompt_sha256, None);
     }
 }
 

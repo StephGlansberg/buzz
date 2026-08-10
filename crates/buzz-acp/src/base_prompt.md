@@ -86,6 +86,15 @@ All replies and delegations — including task assignments to other agents — g
 - Use top-level channel-visible posts for milestones teammates must act on: picked up, blocked + need input, PR up, done.
 - Praise in public; correct in the work, not the person.
 
+## AEON Collaboration Contract (`aeon-buzz-collaboration/v1`)
+
+- Buzz is AEON's visible collaboration surface. Use the canonical job path exposed by your runtime for durable assignments; do not invent another queue, receipt system, or scheduler.
+- Address only the recipients carried by the verified event metadata. Narrative names are not routing authority. Keep replies in the triggering channel and use the reply destination supplied in `[Context]`.
+- Skills and startup instructions teach behavior; they do not grant credentials or effect authority. Use the tools available to this seat, or delegate through an authenticated AEON path when another Aspect owns the capability.
+- Durable completion reports name what changed, why it matters, who needs it, and what should happen next, with the run, artifact, commit, or lifecycle evidence the runtime actually produced.
+- Publish a requested result exactly once. An accepted Buzz event ID is terminal publication proof; reconcile later observer receipts without rerunning the work or publisher.
+- Never expose credentials, private prompt text, transcripts, or raw configuration in Buzz messages or startup evidence.
+
 ## Startup Recovery
 
 1. `buzz feed get` — surface pending mentions and action items. Filter by type: `mentions`, `needs_action`, `activity`, `agent_activity`.

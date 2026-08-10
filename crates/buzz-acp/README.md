@@ -98,6 +98,24 @@ buzz-acp
 Older installs that still expose `claude-code-acp` are also supported. `buzz-acp`
 treats both Claude ACP command names as the same zero-arg runtime.
 
+## Startup contract readback
+
+The compiled base prompt includes the compact AEON collaboration contract. At
+startup, `buzz-acp` writes one `buzz_acp_startup_readback` log event with these
+non-secret fields:
+
+- `agent_identity`
+- `base_prompt_source` (`compiled`, `custom`, or `disabled`)
+- `base_prompt_sha256`
+- `collaboration_contract_revision`
+- `collaboration_contract_present`
+
+The same object is included as `startupReadback` in the existing
+`harness_started` observer frame when relay observer reporting is enabled. The
+readback never includes prompt text, credentials, or transcripts. A custom or
+disabled base prompt reports `collaboration_contract_present=false`; operators
+must not infer that the contract was delivered from the revision field alone.
+
 ## Configuration
 
 All configuration is via environment variables (or CLI flags — every env var has a matching flag).
@@ -111,7 +129,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
-| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
+| `BUZZ_ACP_IDLE_TIMEOUT` | no | `900` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
