@@ -93,6 +93,33 @@ impl TrustedInboundEventEnvelope {
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+const AGENT_PROCESS_GROUP_ENV: &str = "BUZZ_ACP_AGENT_PROCESS_GROUP";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProcessGroupMode {
+    Isolated,
+    Inherit,
+}
+
+fn parse_agent_process_group_mode(value: Option<&str>) -> Result<AgentProcessGroupMode, AcpError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("isolated") => Ok(AgentProcessGroupMode::Isolated),
+        Some("inherit") => Ok(AgentProcessGroupMode::Inherit),
+        Some(value) => Err(AcpError::Protocol(format!(
+            "{AGENT_PROCESS_GROUP_ENV} must be isolated or inherit, got: {value}"
+        ))),
+    }
+}
+
+fn configured_agent_process_group_mode() -> Result<AgentProcessGroupMode, AcpError> {
+    match std::env::var(AGENT_PROCESS_GROUP_ENV) {
+        Ok(value) => parse_agent_process_group_mode(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_agent_process_group_mode(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(AcpError::Protocol(format!(
+            "{AGENT_PROCESS_GROUP_ENV} must contain valid UTF-8"
+        ))),
+    }
+}
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -216,6 +243,9 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Whether the live child's PID is also a process group owned by Buzz.
+    /// Once Tokio clears `Child::id()`, no numeric group identity is retained.
+    owns_child_process_group: bool,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -503,26 +533,23 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
-        // Kill the entire process group when possible. The child was spawned
-        // with process_group(0), so its PID == its PGID. Killing the group
-        // ensures subprocesses (MCP servers, tool processes) are cleaned up
-        // rather than orphaned to init.
-        //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
-        }
+        self.signal_agent_processes();
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => self.owns_child_process_group = false,
             Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
             Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+        }
+    }
+
+    fn signal_agent_processes(&mut self) {
+        match (self.owns_child_process_group, self.child.id()) {
+            (true, Some(process_group_id)) if kill_process_group(process_group_id) => {}
+            _ => {
+                let _ = self.child.start_kill();
+            }
         }
     }
 
@@ -540,6 +567,26 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
         forward_buzz_publisher_credentials: bool,
+    ) -> Result<Self, AcpError> {
+        let process_group_mode = configured_agent_process_group_mode()?;
+        Self::spawn_with_process_group_mode(
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+            forward_buzz_publisher_credentials,
+            process_group_mode,
+        )
+        .await
+    }
+
+    async fn spawn_with_process_group_mode(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        forward_buzz_publisher_credentials: bool,
+        process_group_mode: AgentProcessGroupMode,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
@@ -623,17 +670,28 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
-        // Spawn the agent in its own process group so SIGKILL doesn't propagate
-        // to the harness's own process group on Unix.
-        // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
+        // Isolated groups let Buzz terminate a full agent subtree. A service
+        // manager can opt into inheritance to own hard-exit subtree cleanup.
+        // Inherited mode intentionally gives Buzz direct-child cleanup only;
+        // adapters that detach descendants must retain ownership of them.
         #[cfg(unix)]
-        cmd.process_group(0);
+        if process_group_mode == AgentProcessGroupMode::Isolated {
+            cmd.process_group(0);
+        }
 
         // Suppress the console window that Windows otherwise allocates for every
         // console-subsystem child process spawned from a GUI/non-console parent.
         configure_no_window(&mut cmd);
 
         let mut child = cmd.spawn()?;
+
+        #[cfg(unix)]
+        let owns_child_process_group = process_group_mode == AgentProcessGroupMode::Isolated;
+        #[cfg(not(unix))]
+        let owns_child_process_group = {
+            let _ = process_group_mode;
+            false
+        };
 
         let stdin = child
             .stdin
@@ -646,6 +704,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            owns_child_process_group,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -2401,12 +2460,7 @@ impl Drop for AcpClient {
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
-        }
+        self.signal_agent_processes();
         // Non-blocking reap attempt — prevents zombie accumulation in the
         // common case where SIGKILL takes effect before Drop returns.
         let _ = self.child.try_wait();
@@ -2415,25 +2469,24 @@ impl Drop for AcpClient {
 
 /// Send SIGKILL to an entire process group. Returns `true` if the signal was sent.
 ///
-/// The child is spawned with `process_group(0)`, so its PID equals its PGID.
-/// Killing the group ensures subprocesses (MCP servers, tool processes) are
-/// cleaned up rather than orphaned to init on repeated crash-recovery cycles.
+/// Isolated children are spawned with `process_group(0)`, so the live child's
+/// PID is also its PGID. The caller must not retain that number after reaping,
+/// when the operating system may reuse it for an unrelated process group.
 ///
 /// Uses `nix::sys::signal::killpg` — a safe wrapper around the POSIX `killpg`
 /// syscall — so the crate's `#![deny(unsafe_code)]` policy is preserved.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) -> bool {
+fn kill_process_group(process_group_id: u32) -> bool {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
-    // pid == pgid because the child was spawned with process_group(0).
-    killpg(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok()
+    killpg(Pid::from_raw(process_group_id as i32), Signal::SIGKILL).is_ok()
 }
 
 /// Fallback for non-Unix: process-group kill not available.
 /// Returns `false` so the caller falls back to `child.start_kill()`.
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) -> bool {
+fn kill_process_group(_process_group_id: u32) -> bool {
     false
 }
 
@@ -2453,6 +2506,172 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_process_group_mode_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_agent_process_group_mode(None).unwrap(),
+            AgentProcessGroupMode::Isolated
+        );
+        assert_eq!(
+            parse_agent_process_group_mode(Some(" ")).unwrap(),
+            AgentProcessGroupMode::Isolated
+        );
+        assert_eq!(
+            parse_agent_process_group_mode(Some("isolated")).unwrap(),
+            AgentProcessGroupMode::Isolated
+        );
+        assert_eq!(
+            parse_agent_process_group_mode(Some(" inherit ")).unwrap(),
+            AgentProcessGroupMode::Inherit
+        );
+        assert!(parse_agent_process_group_mode(Some("launchd")).is_err());
+    }
+
+    #[cfg(unix)]
+    fn unix_process_exists(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn unix_process_group(pid: u32) -> u32 {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to inspect process group");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("process group output should be UTF-8")
+            .trim()
+            .parse::<u32>()
+            .expect("process group should be numeric")
+    }
+
+    #[cfg(unix)]
+    async fn spawn_descendant_fixture(
+        keep_launcher_alive: bool,
+    ) -> (AcpClient, std::path::PathBuf, u32) {
+        let pid_path = std::env::temp_dir().join(format!(
+            "buzz-acp-descendant-{}-{}.pid",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = if keep_launcher_alive {
+            r#"trap 'exit 0' TERM
+sh -c 'trap "" HUP TERM; exec sleep 60' </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > "$1"
+while :; do sleep 1; done"#
+        } else {
+            r#"sh -c 'trap "" HUP TERM; exec sleep 60' </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > "$1""#
+        };
+        let args = vec![
+            "-c".to_string(),
+            script.to_string(),
+            "buzz-acp-process-group-fixture".to_string(),
+            pid_path.to_string_lossy().into_owned(),
+        ];
+        let client = AcpClient::spawn_with_process_group_mode(
+            "/bin/bash",
+            &args,
+            &[],
+            false,
+            false,
+            AgentProcessGroupMode::Isolated,
+        )
+        .await
+        .expect("failed to spawn process-group fixture");
+
+        for _ in 0..100 {
+            if let Ok(raw_pid) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = raw_pid.trim().parse::<u32>() {
+                    return (client, pid_path, pid);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("fixture did not publish descendant pid");
+    }
+
+    #[cfg(unix)]
+    async fn assert_descendant_reaped(pid_path: &std::path::Path, descendant_pid: u32) {
+        for _ in 0..80 {
+            if !unix_process_exists(descendant_pid) {
+                std::fs::remove_file(pid_path).ok();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        std::fs::remove_file(pid_path).ok();
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &descendant_pid.to_string()])
+            .status();
+        panic!("shutdown left descendant {descendant_pid} running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherit_mode_keeps_the_supervisor_process_group() {
+        let mut client = AcpClient::spawn_with_process_group_mode(
+            "/bin/cat",
+            &[],
+            &[],
+            false,
+            false,
+            AgentProcessGroupMode::Inherit,
+        )
+        .await
+        .expect("failed to spawn inherited process-group fixture");
+        let child_pid = client.child.id().expect("fixture child should be running");
+
+        assert!(!client.owns_child_process_group);
+        assert_eq!(
+            unix_process_group(child_pid),
+            unix_process_group(std::process::id())
+        );
+        client.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_reaps_group_after_immediate_or_sigterm_launcher_exit() {
+        for signal_launcher in [false, true] {
+            let (mut client, pid_path, descendant_pid) =
+                spawn_descendant_fixture(signal_launcher).await;
+            if signal_launcher {
+                let launcher_pid = client
+                    .child
+                    .id()
+                    .expect("fixture launcher should be running");
+                let signal_status = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &launcher_pid.to_string()])
+                    .status()
+                    .expect("failed to signal fixture launcher");
+                assert!(signal_status.success());
+            }
+            let launcher_stdout =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.reader.next())
+                    .await
+                    .expect("fixture launcher did not exit");
+
+            assert!(launcher_stdout.is_none());
+            let launcher_pid = client
+                .child
+                .id()
+                .expect("unreaped launcher should retain its process identity");
+            assert!(client.owns_child_process_group);
+            assert_eq!(launcher_pid, unix_process_group(descendant_pid),);
+            assert!(unix_process_exists(descendant_pid));
+
+            client.shutdown().await;
+            assert_descendant_reaped(&pid_path, descendant_pid).await;
+        }
+    }
 
     #[test]
     fn harness_buzz_credentials_override_parent_environment() {
