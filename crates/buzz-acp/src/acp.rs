@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::observer::{ObserverContext, ObserverHandle};
+use crate::relay::RestClient;
 use crate::usage::{TurnUsage, UsageTracker};
 
 /// ACP `_meta` key carrying a Buzz-verified triggering event.
@@ -22,6 +23,69 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// do not explicitly consume the extension ignore it per ACP extensibility.
 pub(crate) const TRUSTED_INBOUND_EVENT_META_NAMESPACE: &str = "buzz";
 pub(crate) const TRUSTED_INBOUND_EVENT_META_FIELD: &str = "inboundEvent";
+const MAX_INBOUND_IMAGES: usize = 4;
+const MAX_INBOUND_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+const INBOUND_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundImageDescriptor {
+    url: String,
+    mime_type: String,
+    sha256: String,
+    size: u64,
+}
+
+fn parse_inbound_image_tag(tag: &[String]) -> Result<InboundImageDescriptor, &'static str> {
+    let mut url = None;
+    let mut mime_type = None;
+    let mut sha256 = None;
+    let mut size = None;
+    for field in tag.iter().skip(1) {
+        let Some((key, value)) = field.split_once(' ') else {
+            continue;
+        };
+        let target = match key {
+            "url" => &mut url,
+            "m" => &mut mime_type,
+            "x" => &mut sha256,
+            "size" => &mut size,
+            _ => continue,
+        };
+        if target.replace(value).is_some() {
+            return Err("duplicate_field");
+        }
+    }
+
+    let url = url.filter(|value| !value.is_empty()).ok_or("missing_url")?;
+    let mime_type = mime_type.ok_or("missing_mime")?;
+    if !INBOUND_IMAGE_MIMES.contains(&mime_type) {
+        return Err("unsupported_mime");
+    }
+    let sha256 = sha256.ok_or("missing_sha256")?;
+    if sha256.len() != 64
+        || !sha256
+            .chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+    {
+        return Err("invalid_sha256");
+    }
+    let size = size
+        .ok_or("missing_size")?
+        .parse::<u64>()
+        .map_err(|_| "invalid_size")?;
+    if size == 0 {
+        return Err("invalid_size");
+    }
+    if size > MAX_INBOUND_IMAGE_BYTES {
+        return Err("oversize");
+    }
+    Ok(InboundImageDescriptor {
+        url: url.to_owned(),
+        mime_type: mime_type.to_owned(),
+        sha256: sha256.to_owned(),
+        size,
+    })
+}
 
 /// Immutable evidence copied from one signature-verified triggering event.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -36,6 +100,16 @@ pub(crate) struct TrustedInboundEventEnvelope {
 }
 
 impl TrustedInboundEventEnvelope {
+    fn inbound_images(
+        &self,
+    ) -> impl Iterator<Item = Result<InboundImageDescriptor, &'static str>> + '_ {
+        self.tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+            .take(MAX_INBOUND_IMAGES)
+            .map(|tag| parse_inbound_image_tag(tag))
+    }
+
     /// Build an envelope only for an unambiguous single-event batch whose
     /// signed `h` tag exactly matches the subscribed channel. Any ambiguity or
     /// failed signature verification produces no trusted metadata.
@@ -956,6 +1030,7 @@ impl AcpClient {
             session_id,
             prompt_blocks,
             None,
+            None,
             idle_timeout,
             max_duration,
         )
@@ -969,10 +1044,14 @@ impl AcpClient {
         session_id: &str,
         prompt_blocks: &[&str],
         trusted_inbound_event: Option<&TrustedInboundEventEnvelope>,
+        rest_client: Option<&RestClient>,
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks, trusted_inbound_event);
+        let mut params = build_prompt_params(session_id, prompt_blocks, trusted_inbound_event);
+        if let (Some(envelope), Some(rest_client)) = (trusted_inbound_event, rest_client) {
+            append_verified_inbound_images(&mut params, envelope, rest_client).await;
+        }
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -2235,6 +2314,61 @@ fn build_prompt_params(
     params
 }
 
+async fn load_inbound_image(
+    descriptor: InboundImageDescriptor,
+    rest_client: &RestClient,
+) -> Result<serde_json::Value, &'static str> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let bytes = rest_client
+        .fetch_blossom_image(&descriptor.url, &descriptor.mime_type, descriptor.size)
+        .await
+        .map_err(|_| "fetch_failed")?;
+    if bytes.len() as u64 != descriptor.size {
+        return Err("size_mismatch");
+    }
+    if hex::encode(Sha256::digest(&bytes)) != descriptor.sha256 {
+        return Err("hash_mismatch");
+    }
+    Ok(serde_json::json!({
+        "type": "image",
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mimeType": descriptor.mime_type,
+    }))
+}
+
+async fn append_verified_inbound_images(
+    params: &mut serde_json::Value,
+    envelope: &TrustedInboundEventEnvelope,
+    rest_client: &RestClient,
+) {
+    let mut images = Vec::new();
+    for descriptor in envelope.inbound_images() {
+        match descriptor {
+            Ok(descriptor) => match load_inbound_image(descriptor, rest_client).await {
+                Ok(image) => images.push(image),
+                Err(reason) => tracing::warn!(
+                    event_id = envelope.event_id,
+                    refusal_code = reason,
+                    "trusted inbound image refused"
+                ),
+            },
+            Err(reason) => tracing::warn!(
+                event_id = envelope.event_id,
+                refusal_code = reason,
+                "trusted inbound image refused"
+            ),
+        }
+    }
+    if let Some(prompt) = params
+        .get_mut("prompt")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        prompt.extend(images);
+    }
+}
+
 /// Build `_goose/unstable/session/steer` params from one or more text
 /// content blocks plus the freshest `expectedRunId`.
 ///
@@ -2737,6 +2871,53 @@ printf '%s\n' "$!" > "$1""#
         }
     }
 
+    fn image_tag(url: &str, mime_type: &str, sha256: &str, size: u64) -> nostr::Tag {
+        nostr::Tag::parse([
+            "imeta".to_owned(),
+            format!("url {url}"),
+            format!("m {mime_type}"),
+            format!("x {sha256}"),
+            format!("size {size}"),
+        ])
+        .expect("valid imeta test tag")
+    }
+
+    async fn media_fixture(
+        body: Vec<u8>,
+        mime_type: &'static str,
+    ) -> (RestClient, String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind media fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept media request");
+            let mut request = vec![0; 16 * 1024];
+            let read = stream.read(&mut request).await.expect("read media request");
+            request.truncate(read);
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {mime_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write media headers");
+            stream.write_all(&body).await.expect("write media body");
+        });
+        let client = RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.clone(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: Some(r#"["auth","delegation"]"#.into()),
+        };
+        (client, base_url, request_rx)
+    }
+
     #[test]
     fn stop_reason_parses_all_known_values() {
         assert_eq!(StopReason::from_str("end_turn"), Some(StopReason::EndTurn));
@@ -3014,6 +3195,102 @@ printf '%s\n' "$!" > "$1""#
         assert_eq!(
             metadata["tags"],
             serde_json::json!([["h", channel_id.to_string()], ["p", "ab".repeat(32)],])
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_image_appends_acp_block_without_changing_text_or_meta() {
+        use sha2::{Digest, Sha256};
+
+        let body = b"\x89PNG\r\n\x1a\ntrusted-image".to_vec();
+        let sha256 = hex::encode(Sha256::digest(&body));
+        let (client, base_url, request_rx) = media_fixture(body.clone(), "image/png").await;
+        let channel_id = uuid::Uuid::new_v4();
+        let tag = image_tag(
+            &format!("{base_url}/media/{sha256}.png"),
+            "image/png",
+            &sha256,
+            body.len() as u64,
+        );
+        let batch = signed_batch(channel_id, vec![tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let mut params = build_prompt_params(
+            "session",
+            &["exact first block", "exact second block"],
+            Some(&envelope),
+        );
+        let original_meta = params["_meta"].clone();
+
+        append_verified_inbound_images(&mut params, &envelope, &client).await;
+
+        assert_eq!(params["prompt"][0]["text"], "exact first block");
+        assert_eq!(params["prompt"][1]["text"], "exact second block");
+        assert_eq!(params["_meta"], original_meta);
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(3));
+        assert_eq!(params["prompt"][2]["type"], "image");
+        assert_eq!(params["prompt"][2]["mimeType"], "image/png");
+        assert_eq!(
+            params["prompt"][2]["data"],
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body)
+        );
+        let request = request_rx.await.expect("captured media request");
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: nostr "));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("x-auth-tag: [\"auth\",\"delegation\"]"));
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_image_hash_mismatch_is_omitted() {
+        let body = b"not-the-declared-image".to_vec();
+        let declared_sha = "0".repeat(64);
+        let (client, base_url, request_rx) = media_fixture(body.clone(), "image/jpeg").await;
+        let channel_id = uuid::Uuid::new_v4();
+        let tag = image_tag(
+            &format!("{base_url}/media/{declared_sha}.jpg"),
+            "image/jpeg",
+            &declared_sha,
+            body.len() as u64,
+        );
+        let batch = signed_batch(channel_id, vec![tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let mut params = build_prompt_params("session", &["unchanged"], Some(&envelope));
+        let original_meta = params["_meta"].clone();
+
+        append_verified_inbound_images(&mut params, &envelope, &client).await;
+
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
+        assert_eq!(params["prompt"][0]["text"], "unchanged");
+        assert_eq!(params["_meta"], original_meta);
+        request_rx.await.expect("hash mismatch still fetches once");
+    }
+
+    #[test]
+    fn inbound_image_rejects_oversize_and_unsupported_mime() {
+        let sha256 = "a".repeat(64);
+        let oversize = vec![
+            "imeta".into(),
+            "url https://relay.example/media/blob.png".into(),
+            "m image/png".into(),
+            format!("x {sha256}"),
+            format!("size {}", MAX_INBOUND_IMAGE_BYTES + 1),
+        ];
+        assert_eq!(parse_inbound_image_tag(&oversize), Err("oversize"));
+
+        let unsupported = vec![
+            "imeta".into(),
+            "url https://relay.example/media/blob.svg".into(),
+            "m image/svg+xml".into(),
+            format!("x {sha256}"),
+            "size 10".into(),
+        ];
+        assert_eq!(
+            parse_inbound_image_tag(&unsupported),
+            Err("unsupported_mime")
         );
     }
 

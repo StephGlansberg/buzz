@@ -418,6 +418,127 @@ fn unix_now_secs() -> u64 {
 }
 
 impl RestClient {
+    fn resolve_same_relay_media_url(&self, media_url: &str) -> Result<url::Url, RelayError> {
+        let relay = url::Url::parse(&self.base_url)
+            .map_err(|error| RelayError::Http(format!("invalid relay URL: {error}")))?;
+        let resolved = if media_url.starts_with('/') {
+            relay
+                .join(media_url)
+                .map_err(|error| RelayError::Http(format!("invalid media URL: {error}")))?
+        } else {
+            url::Url::parse(media_url)
+                .map_err(|error| RelayError::Http(format!("invalid media URL: {error}")))?
+        };
+        let same_origin = resolved.scheme() == relay.scheme()
+            && resolved.host_str() == relay.host_str()
+            && resolved.port_or_known_default() == relay.port_or_known_default();
+        let safe_path = resolved
+            .path()
+            .strip_prefix("/media/")
+            .is_some_and(|value| !value.is_empty() && !value.contains('/'));
+        if !same_origin
+            || !resolved.username().is_empty()
+            || resolved.password().is_some()
+            || resolved.query().is_some()
+            || resolved.fragment().is_some()
+            || !safe_path
+        {
+            return Err(RelayError::Http(
+                "refusing media GET outside the configured relay origin".into(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn blossom_get_header(&self, media_url: &url::Url) -> Result<String, RelayError> {
+        use base64::Engine;
+
+        let expiration = (nostr::Timestamp::now().as_secs() + 600).to_string();
+        let server = buzz_core::tenant::relay_url_authority(media_url.as_str());
+        if server.is_empty() {
+            return Err(RelayError::Http("media URL has no relay authority".into()));
+        }
+        let tags = [
+            Tag::parse(["t", "get"])
+                .map_err(|error| RelayError::Http(format!("Blossom tag error: {error}")))?,
+            Tag::parse(["expiration", expiration.as_str()])
+                .map_err(|error| RelayError::Http(format!("Blossom tag error: {error}")))?,
+            Tag::parse(["server", server.as_str()])
+                .map_err(|error| RelayError::Http(format!("Blossom tag error: {error}")))?,
+        ];
+        let event = EventBuilder::new(Kind::Custom(24242), "Get media")
+            .tags(tags)
+            .sign_with_keys(&self.keys)
+            .map_err(|error| RelayError::Http(format!("Blossom signing failed: {error}")))?;
+        let event_json = serde_json::to_string(&event)
+            .map_err(|error| RelayError::Http(format!("Blossom serialize failed: {error}")))?;
+        Ok(format!(
+            "Nostr {}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event_json.as_bytes())
+        ))
+    }
+
+    /// Fetch one same-relay Blossom blob with the harness signer and a bounded body.
+    pub(crate) async fn fetch_blossom_image(
+        &self,
+        media_url: &str,
+        expected_mime: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, RelayError> {
+        let url = self.resolve_same_relay_media_url(media_url)?;
+        let auth = self.blossom_get_header(&url)?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| RelayError::Http(format!("media client init failed: {error}")))?;
+        let mut request = client.get(url.clone()).header("Authorization", auth);
+        if let Some(auth_tag) = &self.auth_tag_json {
+            request = request.header("x-auth-tag", auth_tag);
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| RelayError::Http(format!("media GET failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(RelayError::Http(format!(
+                "media GET returned HTTP {}",
+                response.status()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err(RelayError::Http("media body exceeds declared size".into()));
+        }
+        let response_mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim);
+        if response_mime != Some(expected_mime) {
+            return Err(RelayError::Http(
+                "media response MIME does not match imeta".into(),
+            ));
+        }
+
+        let capacity = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let mut bytes = Vec::with_capacity(capacity.min(64 * 1024));
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| RelayError::Http(format!("media body read failed: {error}")))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > capacity {
+                return Err(RelayError::Http("media body exceeds declared size".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     /// Sign a NIP-98 HTTP Auth event (kind:27235) for the given method/URL/body.
     ///
     /// Returns the `Authorization: Nostr <base64>` header value (without the
@@ -4437,6 +4558,31 @@ async fn wait_for_any_ok(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_rest_client(base_url: &str) -> RestClient {
+        RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.to_owned(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn blossom_image_fetch_rejects_cross_origin_before_request() {
+        let client = test_rest_client("https://relay.example");
+        let error = client
+            .fetch_blossom_image(
+                "https://media.example/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+                "image/png",
+                10,
+            )
+            .await
+            .expect_err("cross-origin fetch must be rejected");
+        assert!(error
+            .to_string()
+            .contains("outside the configured relay origin"));
+    }
 
     #[test]
     fn relay_ws_to_http_plain() {
