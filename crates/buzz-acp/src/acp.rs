@@ -384,6 +384,10 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the adapter advertised ACP image prompt support during
+    /// `initialize`. Image blocks must stay off the wire when this is false;
+    /// unsupported adapters may reject the entire prompt instead of its image.
+    image_prompt_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -793,6 +797,7 @@ impl AcpClient {
             last_turn_run_id: None,
             active_session_key: None,
             steering_supported: false,
+            image_prompt_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
         })
@@ -861,6 +866,10 @@ impl AcpClient {
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.image_prompt_supported = result
+            .pointer("/agentCapabilities/promptCapabilities/image")
+            .and_then(|value| value.as_bool())
             .unwrap_or(false);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
@@ -1049,8 +1058,10 @@ impl AcpClient {
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let mut params = build_prompt_params(session_id, prompt_blocks, trusted_inbound_event);
-        if let (Some(envelope), Some(rest_client)) = (trusted_inbound_event, rest_client) {
-            append_verified_inbound_images(&mut params, envelope, rest_client).await;
+        if self.image_prompt_supported {
+            if let (Some(envelope), Some(rest_client)) = (trusted_inbound_event, rest_client) {
+                append_verified_inbound_images(&mut params, envelope, rest_client).await;
+            }
         }
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -4863,6 +4874,44 @@ printf '%s\n' "$!" > "$1""#
             .await
             .expect("initialize should succeed");
         client.steering_supported()
+    }
+
+    async fn image_prompt_supported_after_initialize(init_result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
+             sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.image_prompt_supported
+    }
+
+    #[tokio::test]
+    async fn initialize_records_image_prompt_capability() {
+        let supported = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{"promptCapabilities":{"image":true}}}"#,
+        )
+        .await;
+        assert!(supported);
+    }
+
+    #[tokio::test]
+    async fn initialize_keeps_image_blocks_off_for_unsupported_adapters() {
+        let supported = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{"promptCapabilities":{"image":false}}}"#,
+        )
+        .await;
+        assert!(!supported);
+
+        let absent = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{}}"#,
+        )
+        .await;
+        assert!(!absent);
     }
 
     /// Test 1a: an adapter advertising `_meta.steering.supported: true`
