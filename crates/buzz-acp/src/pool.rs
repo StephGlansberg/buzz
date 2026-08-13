@@ -2249,6 +2249,23 @@ pub async fn run_prompt_task(
         prompt_label(&source)
     );
 
+    // Resolve bounded media before entering the cancellable select. The prompt
+    // future must set its request id on its first poll so a queued control
+    // signal cannot mistake pre-send work for a naturally completed turn.
+    let media_started = tokio::time::Instant::now();
+    let inbound_images = agent
+        .acp
+        .prepare_trusted_inbound_images(
+            trusted_inbound_envelope.as_ref(),
+            &ctx.rest_client,
+            ctx.max_turn_duration,
+        )
+        .await;
+    let prompt_max_duration = ctx
+        .max_turn_duration
+        .saturating_sub(media_started.elapsed())
+        .max(std::time::Duration::from_millis(1));
+
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
@@ -2263,9 +2280,9 @@ pub async fn run_prompt_task(
                     &session_id,
                     &prompt_blocks,
                     trusted_inbound_envelope.as_ref(),
-                    Some(&ctx.rest_client),
+                    &inbound_images,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    prompt_max_duration,
                 ) => result,
             }
         }
@@ -2276,9 +2293,9 @@ pub async fn run_prompt_task(
                     &session_id,
                     &prompt_blocks,
                     trusted_inbound_envelope.as_ref(),
-                    Some(&ctx.rest_client),
+                    &inbound_images,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    prompt_max_duration,
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);

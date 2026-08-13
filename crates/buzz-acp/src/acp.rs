@@ -322,6 +322,30 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
+fn observer_safe_write_payload(value: &serde_json::Value) -> serde_json::Value {
+    let mut observed = value.clone();
+    if observed.get("method").and_then(serde_json::Value::as_str) != Some("session/prompt") {
+        return observed;
+    }
+    let Some(prompt) = observed
+        .pointer_mut("/params/prompt")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return observed;
+    };
+    for block in prompt {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("image") {
+            if let Some(object) = block.as_object_mut() {
+                object.insert(
+                    "data".into(),
+                    serde_json::Value::String("[redacted]".into()),
+                );
+            }
+        }
+    }
+    observed
+}
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -1050,7 +1074,7 @@ impl AcpClient {
             session_id,
             prompt_blocks,
             None,
-            None,
+            &[],
             idle_timeout,
             max_duration,
         )
@@ -1064,26 +1088,13 @@ impl AcpClient {
         session_id: &str,
         prompt_blocks: &[&str],
         trusted_inbound_event: Option<&TrustedInboundEventEnvelope>,
-        rest_client: Option<&RestClient>,
+        inbound_images: &[serde_json::Value],
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         let mut params = build_prompt_params(session_id, prompt_blocks, trusted_inbound_event);
-        if self.image_prompt_supported {
-            if let (Some(envelope), Some(rest_client)) = (trusted_inbound_event, rest_client) {
-                let remaining =
-                    hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-                let media_budget = remaining.min(INBOUND_IMAGE_PREPARATION_TIMEOUT);
-                append_verified_inbound_images_with_timeout(
-                    &mut params,
-                    envelope,
-                    rest_client,
-                    media_budget,
-                )
-                .await;
-            }
-        }
+        append_inbound_images(&mut params, inbound_images.iter().cloned());
         self.current_hard_deadline = Some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
@@ -1136,6 +1147,29 @@ impl AcpClient {
             }
         }
         self.parse_stop_reason(&result?)
+    }
+
+    /// Resolve trusted media before the cancellable prompt future begins.
+    /// `run_prompt_task` then enters its biased select with the prompt's first
+    /// poll free to establish `last_prompt_id`, preserving its control-race contract.
+    pub(crate) async fn prepare_trusted_inbound_images(
+        &self,
+        envelope: Option<&TrustedInboundEventEnvelope>,
+        rest_client: &RestClient,
+        budget: std::time::Duration,
+    ) -> Vec<serde_json::Value> {
+        if !self.image_prompt_supported {
+            return Vec::new();
+        }
+        let Some(envelope) = envelope else {
+            return Vec::new();
+        };
+        load_verified_inbound_images_with_timeout(
+            envelope,
+            rest_client,
+            budget.min(INBOUND_IMAGE_PREPARATION_TIMEOUT),
+        )
+        .await
     }
 
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
@@ -1389,7 +1423,7 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        self.observe("acp_write", observer_safe_write_payload(value));
         Ok(())
     }
 
@@ -2394,7 +2428,10 @@ async fn load_verified_inbound_images(
     images
 }
 
-fn append_inbound_images(params: &mut serde_json::Value, images: Vec<serde_json::Value>) {
+fn append_inbound_images(
+    params: &mut serde_json::Value,
+    images: impl IntoIterator<Item = serde_json::Value>,
+) {
     if let Some(prompt) = params
         .get_mut("prompt")
         .and_then(serde_json::Value::as_array_mut)
@@ -2403,18 +2440,20 @@ fn append_inbound_images(params: &mut serde_json::Value, images: Vec<serde_json:
     }
 }
 
-async fn append_verified_inbound_images_with_timeout(
-    params: &mut serde_json::Value,
+async fn load_verified_inbound_images_with_timeout(
     envelope: &TrustedInboundEventEnvelope,
     rest_client: &RestClient,
     timeout: std::time::Duration,
-) {
+) -> Vec<serde_json::Value> {
     match tokio::time::timeout(timeout, load_verified_inbound_images(envelope, rest_client)).await {
-        Ok(images) => append_inbound_images(params, images),
-        Err(_) => tracing::warn!(
-            event_id = envelope.event_id,
-            "trusted inbound image preparation timed out; delivering text only"
-        ),
+        Ok(images) => images,
+        Err(_) => {
+            tracing::warn!(
+                event_id = envelope.event_id,
+                "trusted inbound image preparation timed out; delivering text only"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -3340,13 +3379,13 @@ printf '%s\n' "$!" > "$1""#
         let mut params = build_prompt_params("session", &["deliver this text"], Some(&envelope));
         let original_meta = params["_meta"].clone();
 
-        append_verified_inbound_images_with_timeout(
-            &mut params,
+        let images = load_verified_inbound_images_with_timeout(
             &envelope,
             &client,
             std::time::Duration::ZERO,
         )
         .await;
+        append_inbound_images(&mut params, images);
 
         assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
         assert_eq!(params["prompt"][0]["text"], "deliver this text");
@@ -3472,6 +3511,29 @@ printf '%s\n' "$!" > "$1""#
     fn ordinary_prompt_params_have_no_trusted_metadata() {
         let params = build_prompt_params("session", &["hello"], None);
         assert!(params.get("_meta").is_none());
+    }
+
+    #[test]
+    fn observer_payload_redacts_image_bytes_without_changing_wire_value() {
+        let wire = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "session",
+                "prompt": [
+                    {"type": "text", "text": "keep me"},
+                    {"type": "image", "data": "large-base64", "mimeType": "image/png"}
+                ]
+            }
+        });
+
+        let observed = observer_safe_write_payload(&wire);
+
+        assert_eq!(wire["params"]["prompt"][1]["data"], "large-base64");
+        assert_eq!(observed["params"]["prompt"][0]["text"], "keep me");
+        assert_eq!(observed["params"]["prompt"][1]["data"], "[redacted]");
+        assert_eq!(observed["params"]["prompt"][1]["mimeType"], "image/png");
     }
 
     #[test]
