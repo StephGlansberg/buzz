@@ -25,6 +25,8 @@ pub(crate) const TRUSTED_INBOUND_EVENT_META_NAMESPACE: &str = "buzz";
 pub(crate) const TRUSTED_INBOUND_EVENT_META_FIELD: &str = "inboundEvent";
 const MAX_INBOUND_IMAGES: usize = 4;
 const MAX_INBOUND_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_INBOUND_IMAGE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const INBOUND_IMAGE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const INBOUND_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,14 +102,24 @@ pub(crate) struct TrustedInboundEventEnvelope {
 }
 
 impl TrustedInboundEventEnvelope {
-    fn inbound_images(
-        &self,
-    ) -> impl Iterator<Item = Result<InboundImageDescriptor, &'static str>> + '_ {
+    fn inbound_images(&self) -> Vec<Result<InboundImageDescriptor, &'static str>> {
+        let mut total_bytes = 0_u64;
         self.tags
             .iter()
             .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
             .take(MAX_INBOUND_IMAGES)
-            .map(|tag| parse_inbound_image_tag(tag))
+            .map(|tag| {
+                let descriptor = parse_inbound_image_tag(tag)?;
+                let next_total = total_bytes
+                    .checked_add(descriptor.size)
+                    .ok_or("aggregate_oversize")?;
+                if next_total > MAX_INBOUND_IMAGE_TOTAL_BYTES {
+                    return Err("aggregate_oversize");
+                }
+                total_bytes = next_total;
+                Ok(descriptor)
+            })
+            .collect()
     }
 
     /// Build an envelope only for an unambiguous single-event batch whose
@@ -869,8 +881,7 @@ impl AcpClient {
             .unwrap_or(false);
         self.image_prompt_supported = result
             .pointer("/agentCapabilities/promptCapabilities/image")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
+            .is_some_and(|value| value.as_bool().unwrap_or_else(|| value.is_object()));
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -1057,13 +1068,22 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        let hard_deadline = tokio::time::Instant::now() + max_duration;
         let mut params = build_prompt_params(session_id, prompt_blocks, trusted_inbound_event);
         if self.image_prompt_supported {
             if let (Some(envelope), Some(rest_client)) = (trusted_inbound_event, rest_client) {
-                append_verified_inbound_images(&mut params, envelope, rest_client).await;
+                let remaining =
+                    hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let media_budget = remaining.min(INBOUND_IMAGE_PREPARATION_TIMEOUT);
+                append_verified_inbound_images_with_timeout(
+                    &mut params,
+                    envelope,
+                    rest_client,
+                    media_budget,
+                )
+                .await;
             }
         }
-        let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
@@ -2349,11 +2369,10 @@ async fn load_inbound_image(
     }))
 }
 
-async fn append_verified_inbound_images(
-    params: &mut serde_json::Value,
+async fn load_verified_inbound_images(
     envelope: &TrustedInboundEventEnvelope,
     rest_client: &RestClient,
-) {
+) -> Vec<serde_json::Value> {
     let mut images = Vec::new();
     for descriptor in envelope.inbound_images() {
         match descriptor {
@@ -2372,11 +2391,30 @@ async fn append_verified_inbound_images(
             ),
         }
     }
+    images
+}
+
+fn append_inbound_images(params: &mut serde_json::Value, images: Vec<serde_json::Value>) {
     if let Some(prompt) = params
         .get_mut("prompt")
         .and_then(serde_json::Value::as_array_mut)
     {
         prompt.extend(images);
+    }
+}
+
+async fn append_verified_inbound_images_with_timeout(
+    params: &mut serde_json::Value,
+    envelope: &TrustedInboundEventEnvelope,
+    rest_client: &RestClient,
+    timeout: std::time::Duration,
+) {
+    match tokio::time::timeout(timeout, load_verified_inbound_images(envelope, rest_client)).await {
+        Ok(images) => append_inbound_images(params, images),
+        Err(_) => tracing::warn!(
+            event_id = envelope.event_id,
+            "trusted inbound image preparation timed out; delivering text only"
+        ),
     }
 }
 
@@ -3233,7 +3271,8 @@ printf '%s\n' "$!" > "$1""#
         );
         let original_meta = params["_meta"].clone();
 
-        append_verified_inbound_images(&mut params, &envelope, &client).await;
+        let images = load_verified_inbound_images(&envelope, &client).await;
+        append_inbound_images(&mut params, images);
 
         assert_eq!(params["prompt"][0]["text"], "exact first block");
         assert_eq!(params["prompt"][1]["text"], "exact second block");
@@ -3272,12 +3311,46 @@ printf '%s\n' "$!" > "$1""#
         let mut params = build_prompt_params("session", &["unchanged"], Some(&envelope));
         let original_meta = params["_meta"].clone();
 
-        append_verified_inbound_images(&mut params, &envelope, &client).await;
+        let images = load_verified_inbound_images(&envelope, &client).await;
+        append_inbound_images(&mut params, images);
 
         assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
         assert_eq!(params["prompt"][0]["text"], "unchanged");
         assert_eq!(params["_meta"], original_meta);
         request_rx.await.expect("hash mismatch still fetches once");
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_image_timeout_preserves_text_only_prompt() {
+        use sha2::{Digest, Sha256};
+
+        let body = b"slow-image".to_vec();
+        let sha256 = hex::encode(Sha256::digest(&body));
+        let (client, base_url, _request_rx) = media_fixture(body.clone(), "image/png").await;
+        let channel_id = uuid::Uuid::new_v4();
+        let tag = image_tag(
+            &format!("{base_url}/media/{sha256}.png"),
+            "image/png",
+            &sha256,
+            body.len() as u64,
+        );
+        let batch = signed_batch(channel_id, vec![tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let mut params = build_prompt_params("session", &["deliver this text"], Some(&envelope));
+        let original_meta = params["_meta"].clone();
+
+        append_verified_inbound_images_with_timeout(
+            &mut params,
+            &envelope,
+            &client,
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
+        assert_eq!(params["prompt"][0]["text"], "deliver this text");
+        assert_eq!(params["_meta"], original_meta);
     }
 
     #[test]
@@ -3303,6 +3376,36 @@ printf '%s\n' "$!" > "$1""#
             parse_inbound_image_tag(&unsupported),
             Err("unsupported_mime")
         );
+    }
+
+    #[test]
+    fn inbound_images_enforce_one_aggregate_budget() {
+        let channel_id = uuid::Uuid::new_v4();
+        let sha256 = "a".repeat(64);
+        let each_size = (MAX_INBOUND_IMAGE_TOTAL_BYTES / 2) + 1;
+        let batch = signed_batch(
+            channel_id,
+            vec![
+                image_tag(
+                    "https://relay.example/media/first.png",
+                    "image/png",
+                    &sha256,
+                    each_size,
+                ),
+                image_tag(
+                    "https://relay.example/media/second.png",
+                    "image/png",
+                    &sha256,
+                    each_size,
+                ),
+            ],
+        );
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let images = envelope.inbound_images();
+
+        assert!(images[0].is_ok());
+        assert_eq!(images[1], Err("aggregate_oversize"));
     }
 
     #[test]
@@ -4893,10 +4996,16 @@ printf '%s\n' "$!" > "$1""#
     #[tokio::test]
     async fn initialize_records_image_prompt_capability() {
         let supported = image_prompt_supported_after_initialize(
-            r#"{"protocolVersion":2,"agentCapabilities":{"promptCapabilities":{"image":true}}}"#,
+            r#"{"protocolVersion":2,"agentCapabilities":{"promptCapabilities":{"image":{}}}}"#,
         )
         .await;
         assert!(supported);
+
+        let legacy_boolean = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":true}}}"#,
+        )
+        .await;
+        assert!(legacy_boolean);
     }
 
     #[tokio::test]
