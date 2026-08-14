@@ -194,12 +194,18 @@ pub struct MatchedRule {
 /// be cancelled after a timeout fires, so we cap length before dispatching.
 const MAX_EXPR_LEN: usize = 4096;
 
-/// Maximum wall-clock time allowed for a single evalexpr evaluation.
-const EVAL_TIMEOUT: Duration = Duration::from_millis(100);
+/// Maximum time a filter evaluation may wait to enter the bounded evaluator.
+const EVAL_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Maximum wall-clock time allowed once a filter evaluation has started.
+///
+/// This tolerates ordinary host scheduling pauses while the expression-size cap
+/// and bounded blocking pool continue to contain expensive expressions.
+const EVAL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Maximum time an admitted evaluation may wait for a blocking worker.
 ///
-/// This is deliberately separate from [`EVAL_TIMEOUT`]. Blocking-pool queue
+/// This is deliberately separate from [`EVAL_EXECUTION_TIMEOUT`]. Blocking-pool queue
 /// latency is executor pressure, not expression execution time, and charging
 /// it to the expression deadline caused trivial filters to fail spuriously.
 const EVAL_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -228,7 +234,7 @@ static FILTER_EVAL_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// - Acquires an owned permit from [`FILTER_EVAL_SEMAPHORE`] and moves it into
 ///   the blocking closure so it is held until the task finishes, not just until
 ///   the caller's timeout fires.
-/// - Runs evaluation on a blocking thread with a [`EVAL_TIMEOUT`] hard timeout.
+/// - Runs evaluation on a blocking thread with an [`EVAL_EXECUTION_TIMEOUT`] hard timeout.
 /// - When a pre-compiled `node` is provided (via `Arc`), uses
 ///   `node.eval_boolean_with_context()` instead of re-parsing the expression
 ///   string on every call.
@@ -270,10 +276,10 @@ where
     // the caller's timeout fires — so the semaphore truly bounds the number of live
     // blocking threads even when callers time out.
     //
-    // The acquire itself is bounded by EVAL_TIMEOUT: if all permits are held by
+    // The acquire itself is bounded by EVAL_ADMISSION_TIMEOUT: if all permits are held by
     // wedged blocking tasks, we time out instead of blocking the main event loop.
     let permit = tokio::time::timeout(
-        EVAL_TIMEOUT,
+        EVAL_ADMISSION_TIMEOUT,
         Arc::clone(&*FILTER_EVAL_SEMAPHORE).acquire_owned(),
     )
     .await
@@ -310,14 +316,14 @@ where
         }
     }
 
-    let (result, execution_time) = tokio::time::timeout(EVAL_TIMEOUT, &mut task)
+    let (result, execution_time) = tokio::time::timeout(EVAL_EXECUTION_TIMEOUT, &mut task)
         .await
         .map_err(|_| FilterError::Timeout {
             stage: FilterTimeoutStage::Execution,
         })?
         .map_err(|error| FilterError::EvalError(format!("eval task panicked: {error}")))?;
 
-    if execution_time > EVAL_TIMEOUT {
+    if execution_time > EVAL_EXECUTION_TIMEOUT {
         return Err(FilterError::Timeout {
             stage: FilterTimeoutStage::Execution,
         });
@@ -695,7 +701,7 @@ mod tests {
                 .unwrap();
 
             let release_thread = std::thread::spawn(move || {
-                std::thread::sleep(EVAL_TIMEOUT + Duration::from_millis(150));
+                std::thread::sleep(EVAL_EXECUTION_TIMEOUT + Duration::from_millis(150));
                 release_blocker_tx.send(()).unwrap();
             });
 
@@ -727,9 +733,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execution_delay_within_budget_succeeds() {
+        let result = run_filter_eval(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(true)
+        })
+        .await
+        .unwrap();
+
+        assert!(result);
+    }
+
+    #[tokio::test]
     async fn test_execution_deadline_remains_fail_closed() {
         let error = run_filter_eval(|| {
-            std::thread::sleep(EVAL_TIMEOUT + Duration::from_millis(150));
+            std::thread::sleep(EVAL_EXECUTION_TIMEOUT + Duration::from_millis(150));
             Ok(true)
         })
         .await
