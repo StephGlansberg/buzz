@@ -458,6 +458,10 @@ pub enum MessagesCmd {
         /// Optional human-readable public reason for the tombstone
         #[arg(long)]
         public_reason: Option<String>,
+        /// Emit a canonical NIP-09 kind:5 deletion instead of a moderator
+        /// kind:9005 tombstone. Cannot be combined with moderation metadata.
+        #[arg(long)]
+        nip09: bool,
     },
     /// Retrieve messages from a channel
     #[command(

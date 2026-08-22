@@ -446,11 +446,23 @@ pub fn build_delete_compat(
     channel_id: Uuid,
     target_event_id: nostr::EventId,
 ) -> Result<EventBuilder, SdkError> {
+    build_delete_compat_with_reason(channel_id, target_event_id, "")
+}
+
+/// Build a NIP-09 deletion event (kind 5) with an optional public reason in
+/// the event content. The `h` tag keeps the deletion visible to Buzz's
+/// channel-scoped subscriptions.
+pub fn build_delete_compat_with_reason(
+    channel_id: Uuid,
+    target_event_id: nostr::EventId,
+    reason: &str,
+) -> Result<EventBuilder, SdkError> {
+    check_content(reason, 512)?;
     let tags = vec![
         tag(&["h", &channel_id.to_string()])?,
         tag(&["e", &target_event_id.to_hex()])?,
     ];
-    Ok(EventBuilder::new(Kind::Custom(5), "").tags(tags))
+    Ok(EventBuilder::new(Kind::EventDeletion, reason).tags(tags))
 }
 
 /// Build a forum vote event (kind 45002). Content is `"+"` or `"-"`.
@@ -2783,6 +2795,17 @@ mod tests {
         assert!(has_tag(&ev, "h", &cid.to_string()));
         assert!(has_tag(&ev, "e", &eid.to_hex()));
         assert_eq!(ev.content, "");
+    }
+
+    #[test]
+    fn delete_compat_with_reason_uses_nip09_content() {
+        let cid = uuid();
+        let eid = event_id();
+        let ev = sign(build_delete_compat_with_reason(cid, eid, "operator correction").unwrap());
+        assert_eq!(ev.kind, Kind::EventDeletion);
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "e", &eid.to_hex()));
+        assert_eq!(ev.content, "operator correction");
     }
 
     #[test]
