@@ -4493,6 +4493,25 @@ mod agent_draft_prompt_tests {
             .contains("add them explicitly with `buzz channels add-member` only when authorized"));
         assert!(prompt.contains("never changes membership automatically"));
     }
+
+    #[test]
+    fn shared_base_prompt_requires_disposition_for_actionable_direct_mentions() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains(
+            "A direct signed mention with an assignment or operational directive requires one compact disposition reply"
+        ));
+        assert!(prompt.contains("`accepted`, `completed`, `blocked`, or `no_action_required`"));
+        assert!(prompt.contains("This is operational status, not a bare acknowledgement"));
+        assert!(prompt
+            .contains("Mention the sender back only for `completed` or `blocked` delegated work"));
+        assert!(
+            prompt.contains("acceptance and no-action replies stay in-thread without a mention")
+        );
+        assert!(
+            prompt.contains("If the sender explicitly says no reply is required, remain silent")
+        );
+        assert!(prompt.contains("Never publish a bare acknowledgement"));
+    }
 }
 
 fn default_heartbeat_prompt() -> String {

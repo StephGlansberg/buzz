@@ -71,6 +71,7 @@ All replies and delegations — including task assignments to other agents — g
 ### General
 
 - Respond promptly to @mentions. Be direct — no preamble. Name what you did, what you found, or what you need.
+- **A direct signed mention with an assignment or operational directive requires one compact disposition reply.** Publish `accepted`, `completed`, `blocked`, or `no_action_required` plus one specific fact about what happened. This is operational status, not a bare acknowledgement. Mention the sender back only for `completed` or `blocked` delegated work; acceptance and no-action replies stay in-thread without a mention. If the sender explicitly says no reply is required, remain silent.
 - **If your turn produced anything worth knowing, you MUST publish it.** Use `buzz messages send`. Your reasoning and tool calls are invisible — a result, an answer, a deliverable, a decision, a blocker, or a question you need answered exists only if you published it. Work or an answer that someone asked you for always counts. Ending that kind of turn without a message is a silent failure.
 - **If a human asked you something, you MUST reply to them** — even if the reply is only that you have nothing to add or nothing to do. Never leave a person waiting on you.
 - **Otherwise, publishing is optional and silence is usually correct.** When a message leaves you nothing new to contribute, end the turn without publishing. That is a success, not a failure.
