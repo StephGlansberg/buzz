@@ -2730,7 +2730,7 @@ async fn tokio_main() -> Result<()> {
                                         let ids = drained_ids.clone();
                                         tokio::spawn(async move {
                                             for eid in &ids {
-                                                pool::reaction_remove(&rc, eid, "👀").await;
+                                                pool::reaction_remove(&rc, ch, eid, "👀").await;
                                             }
                                         });
                                     }
@@ -2825,7 +2825,12 @@ async fn tokio_main() -> Result<()> {
                                         if !drained_ids.is_empty() {
                                             let rest = ctx.rest_client.clone();
                                             tokio::spawn(async move {
-                                                pool::clear_reactions(rest, drained_ids).await;
+                                                pool::clear_reactions(
+                                                    rest,
+                                                    buzz_event.channel_id,
+                                                    drained_ids,
+                                                )
+                                                .await;
                                             });
                                         }
                                         continue;
@@ -3016,8 +3021,9 @@ async fn tokio_main() -> Result<()> {
                             ) {
                                 let rc = ctx.rest_client.clone();
                                 let eid = event_id_hex.clone();
+                                let channel_id = buzz_event.channel_id;
                                 tokio::spawn(async move {
-                                    pool::reaction_add(&rc, &eid, "👀").await;
+                                    pool::reaction_add(&rc, channel_id, &eid, "👀").await;
                                 });
                             }
                             // Event is already queued. If mode requires it AND
@@ -3250,7 +3256,7 @@ async fn tokio_main() -> Result<()> {
                         if !drained_ids.is_empty() {
                             let rest = ctx.rest_client.clone();
                             tokio::spawn(async move {
-                                pool::clear_reactions(rest, drained_ids).await;
+                                pool::clear_reactions(rest, channel_id, drained_ids).await;
                             });
                         }
                         tracing::info!(
