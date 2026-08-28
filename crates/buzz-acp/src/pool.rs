@@ -1921,7 +1921,9 @@ pub async fn run_prompt_task(
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
-    let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+    let _reaction_guard = observer_channel_id.map(|channel_id| {
+        ReactionGuard::new(ctx.rest_client.clone(), channel_id, reaction_ids.clone())
+    });
 
     // Resolve project authority exactly once, before any ACP session creation or
     // initial-message delivery. An indeterminate result is a local relay-state
@@ -2519,11 +2521,14 @@ pub async fn run_prompt_task(
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
     if !reaction_ids.is_empty() {
-        let rest = ctx.rest_client.clone();
-        let ids = reaction_ids.clone();
-        tokio::spawn(async move {
-            react_working(&rest, &ids).await;
-        });
+        if let PromptSource::Channel(channel_id) = &source {
+            let rest = ctx.rest_client.clone();
+            let ids = reaction_ids.clone();
+            let channel_id = *channel_id;
+            tokio::spawn(async move {
+                react_working(&rest, channel_id, &ids).await;
+            });
+        }
     }
 
     // Slash-command pass-through sends the bare command as the first text
@@ -4302,13 +4307,15 @@ fn record_channel_delivery_success(
 /// stale 👀 is harmless.
 struct ReactionGuard {
     rest: Option<crate::relay::RestClient>,
+    channel_id: Uuid,
     ids: Vec<String>,
 }
 
 impl ReactionGuard {
-    fn new(rest: crate::relay::RestClient, ids: Vec<String>) -> Self {
+    fn new(rest: crate::relay::RestClient, channel_id: Uuid, ids: Vec<String>) -> Self {
         Self {
             rest: if ids.is_empty() { None } else { Some(rest) },
+            channel_id,
             ids,
         }
     }
@@ -4324,7 +4331,7 @@ impl Drop for ReactionGuard {
         if let Some(rest) = self.rest.take() {
             let ids = std::mem::take(&mut self.ids);
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(clear_reactions(rest, ids));
+                handle.spawn(clear_reactions(rest, self.channel_id, ids));
             }
             // If no runtime is available, reactions are left as-is — they are
             // cosmetic indicators and the stale state is harmless.
@@ -4669,6 +4676,17 @@ const REACTION_WORKING: &str = "💬";
 /// Best-effort timeout for a single reaction REST call.
 const REACTION_TIMEOUT: Duration = Duration::from_millis(500);
 
+fn channel_scoped_lifecycle_builder<E: std::fmt::Display>(
+    channel_id: Uuid,
+    builder: Result<nostr::EventBuilder, E>,
+) -> Result<nostr::EventBuilder, String> {
+    let builder = builder.map_err(|error| error.to_string())?;
+    let channel_id = channel_id.to_string();
+    let channel_tag = nostr::Tag::parse(["h", channel_id.as_str()])
+        .map_err(|error| format!("invalid lifecycle channel tag: {error}"))?;
+    Ok(builder.tag(channel_tag))
+}
+
 /// Percent-encode a string for use in a URL path segment (used in tests only).
 #[cfg(test)]
 fn pct_encode(s: &str) -> String {
@@ -4689,10 +4707,16 @@ fn pct_encode(s: &str) -> String {
 
 /// Best-effort: add a reaction via a signed Nostr kind-7 event (NIP-25).
 ///
-/// Builds a reaction event with `buzz_sdk::build_reaction`, signs it with
-/// the keys already stored in `RestClient`, and submits via `POST /events`.
+/// Builds a channel-scoped reaction event, signs it with the keys already
+/// stored in `RestClient`, and submits via `POST /events`. The `h` tag keeps
+/// the existing Desktop channel subscription live for lifecycle transitions.
 /// Returns immediately on timeout or any error — reactions are cosmetic.
-pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str, emoji: &str) {
+pub(crate) async fn reaction_add(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    event_id: &str,
+    emoji: &str,
+) {
     let target_id = match nostr::EventId::from_hex(event_id) {
         Ok(id) => id,
         Err(e) => {
@@ -4700,7 +4724,10 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
             return;
         }
     };
-    let builder = match buzz_sdk::build_reaction(target_id, emoji) {
+    let builder = match channel_scoped_lifecycle_builder(
+        channel_id,
+        buzz_sdk::build_reaction(target_id, emoji),
+    ) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(event_id, emoji, "reaction add: build failed: {e}");
@@ -4768,9 +4795,14 @@ pub(crate) async fn post_failure_notice(
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
-/// emoji, then submits a signed kind:5 deletion via `POST /events`.
+/// emoji, then submits a channel-scoped signed kind:5 deletion via `POST /events`.
 /// Returns immediately on timeout or any error — reactions are cosmetic.
-pub(crate) async fn reaction_remove(rest: &crate::relay::RestClient, event_id: &str, emoji: &str) {
+pub(crate) async fn reaction_remove(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    event_id: &str,
+    emoji: &str,
+) {
     use nostr::{Alphabet, SingleLetterTag};
 
     // Step 1: query our kind:7 reactions targeting this event.
@@ -4825,7 +4857,10 @@ pub(crate) async fn reaction_remove(rest: &crate::relay::RestClient, event_id: &
             return;
         }
     };
-    let builder = match buzz_sdk::build_remove_reaction(target_id) {
+    let builder = match channel_scoped_lifecycle_builder(
+        channel_id,
+        buzz_sdk::build_remove_reaction(target_id),
+    ) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(event_id, emoji, "reaction remove: build failed: {e}");
@@ -4852,12 +4887,12 @@ const REACTION_CONCURRENCY: usize = 10;
 
 /// Add 💬 to all events, capped at `REACTION_CONCURRENCY` concurrent requests.
 /// Awaited inline before the prompt fires.
-async fn react_working(rest: &crate::relay::RestClient, event_ids: &[String]) {
+async fn react_working(rest: &crate::relay::RestClient, channel_id: Uuid, event_ids: &[String]) {
     for chunk in event_ids.chunks(REACTION_CONCURRENCY) {
         futures_util::future::join_all(
             chunk
                 .iter()
-                .map(|eid| reaction_add(rest, eid, REACTION_WORKING)),
+                .map(|eid| reaction_add(rest, channel_id, eid, REACTION_WORKING)),
         )
         .await;
     }
@@ -4866,14 +4901,14 @@ async fn react_working(rest: &crate::relay::RestClient, event_ids: &[String]) {
 /// Fire-and-forget: remove both 👀 and 💬 from all events. Spawned on turn complete.
 /// Capped at `REACTION_CONCURRENCY` concurrent requests per chunk to avoid
 /// unbounded HTTP fan-out on large batches.
-async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>) {
+async fn clear_reactions(rest: crate::relay::RestClient, channel_id: Uuid, event_ids: Vec<String>) {
     // Each event needs two removals (👀 and 💬); pair them and chunk by
     // REACTION_CONCURRENCY pairs so the total concurrent requests stay bounded.
     for chunk in event_ids.chunks(REACTION_CONCURRENCY) {
         futures_util::future::join_all(chunk.iter().flat_map(|eid| {
             [
-                reaction_remove(&rest, eid, REACTION_SEEN),
-                reaction_remove(&rest, eid, REACTION_WORKING),
+                reaction_remove(&rest, channel_id, eid, REACTION_SEEN),
+                reaction_remove(&rest, channel_id, eid, REACTION_WORKING),
             ]
         }))
         .await;
@@ -6873,6 +6908,46 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         assert_eq!(pct_encode("/"), "%2F");
         assert_eq!(pct_encode("+"), "%2B");
         assert_eq!(pct_encode(" "), "%20");
+    }
+
+    #[test]
+    fn lifecycle_reactions_are_visible_to_channel_subscriptions() {
+        let keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let target_id = EventBuilder::new(Kind::Custom(9), "mentioned")
+            .sign_with_keys(&keys)
+            .unwrap()
+            .id;
+        let reaction = channel_scoped_lifecycle_builder(
+            channel_id,
+            buzz_sdk::build_reaction(target_id, REACTION_WORKING),
+        )
+        .unwrap()
+        .sign_with_keys(&keys)
+        .unwrap();
+        let reaction_id = reaction.id;
+        let deletion = channel_scoped_lifecycle_builder(
+            channel_id,
+            buzz_sdk::build_remove_reaction(reaction_id),
+        )
+        .unwrap()
+        .sign_with_keys(&keys)
+        .unwrap();
+
+        for (event, kind, target) in [
+            (reaction, Kind::Reaction, target_id),
+            (deletion, Kind::EventDeletion, reaction_id),
+        ] {
+            assert_eq!(event.kind, kind);
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["e", target.to_hex().as_str()]));
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| { tag.as_slice() == ["h", channel_id.to_string().as_str()] }));
+        }
     }
 
     fn make_state() -> (SessionState, Uuid, Uuid) {
