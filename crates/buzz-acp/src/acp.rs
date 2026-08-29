@@ -101,6 +101,74 @@ pub(crate) struct TrustedInboundEventEnvelope {
     kind: u16,
     channel_id: String,
     tags: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_envelope: Option<TrustedTurnEnvelope>,
+}
+
+/// AEON's correlation contract for a reply-required, Paperclip-bound Buzz turn.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TrustedTurnEnvelope {
+    schema: &'static str,
+    request_id: String,
+    source_event_id: String,
+    issue_id: String,
+    consumer_ref: String,
+    authority_ref: String,
+    reply_surface: &'static str,
+    reply_thread: String,
+    ack_deadline: String,
+    completion_deadline: String,
+    requires_reply: bool,
+}
+
+fn single_aeo_issue_id(content: &str) -> Option<&str> {
+    let mut matches = content
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        })
+        .filter(|token| {
+            token.strip_prefix("AEO-").is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        });
+    let issue_id = matches.next()?;
+    matches.next().is_none().then_some(issue_id)
+}
+
+fn canonical_utc_after(created_at: u64, offset: std::time::Duration) -> Option<String> {
+    let created_at = i64::try_from(created_at).ok()?;
+    let offset = i64::try_from(offset.as_secs()).ok()?;
+    let deadline = chrono::DateTime::<chrono::Utc>::from_timestamp(created_at, 0)?
+        .checked_add_signed(chrono::TimeDelta::seconds(offset))?;
+    Some(deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+fn build_turn_envelope(
+    event: &nostr::Event,
+    requires_reply: bool,
+    max_turn_duration: std::time::Duration,
+) -> Option<TrustedTurnEnvelope> {
+    if !requires_reply || max_turn_duration < std::time::Duration::from_secs(30) {
+        return None;
+    }
+    let issue_id = single_aeo_issue_id(&event.content)?.to_owned();
+    let event_id = event.id.to_hex();
+    Some(TrustedTurnEnvelope {
+        schema: "buzz_turn_envelope_v1",
+        request_id: event_id.clone(),
+        source_event_id: event_id.clone(),
+        consumer_ref: format!("paperclip:{issue_id}"),
+        authority_ref: format!("buzz_event:{event_id}"),
+        issue_id,
+        reply_surface: "buzz",
+        reply_thread: event_id,
+        ack_deadline: canonical_utc_after(
+            event.created_at.as_secs(),
+            std::time::Duration::from_secs(30),
+        )?,
+        completion_deadline: canonical_utc_after(event.created_at.as_secs(), max_turn_duration)?,
+        requires_reply: true,
+    })
 }
 
 impl TrustedInboundEventEnvelope {
@@ -135,8 +203,24 @@ impl TrustedInboundEventEnvelope {
     /// Return a stable, secret-free refusal code when trusted metadata cannot
     /// be derived. The worker logs this at the admission boundary so a missing
     /// envelope cannot masquerade as an agent/tool-policy failure.
+    #[cfg(test)]
     pub(crate) fn try_from_prompt_batch(
         batch: Option<&crate::queue::FlushBatch>,
+    ) -> Result<Self, &'static str> {
+        Self::try_from_prompt_batch_with_turn_contract(
+            batch,
+            false,
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    /// Build the signed inbound event plus the optional AEON turn contract.
+    /// The rule-derived reply bit is supplied by the durable per-event replay
+    /// record; no prompt tag or content can grant it.
+    pub(crate) fn try_from_prompt_batch_with_turn_contract(
+        batch: Option<&crate::queue::FlushBatch>,
+        requires_reply: bool,
+        max_turn_duration: std::time::Duration,
     ) -> Result<Self, &'static str> {
         let batch = batch.ok_or("missing_batch")?;
         if batch.cancel_reason.is_some() {
@@ -174,6 +258,7 @@ impl TrustedInboundEventEnvelope {
             kind: event.kind.as_u16(),
             channel_id: expected_channel,
             tags,
+            turn_envelope: build_turn_envelope(event, requires_reply, max_turn_duration),
         })
     }
 }
@@ -3410,6 +3495,95 @@ printf '%s\n' "$!" > "$1""#
             metadata["tags"],
             serde_json::json!([["h", channel_id.to_string()], ["p", "ab".repeat(32)],])
         );
+        assert!(metadata.get("turnEnvelope").is_none());
+    }
+
+    #[test]
+    fn trusted_inbound_event_carries_exact_aeon_turn_envelope_wire_shape() {
+        let channel_id = uuid::Uuid::new_v4();
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
+            .expect("fixture timestamp")
+            .timestamp() as u64;
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(9), "Architect admitted (AEO-267).")
+                .tags([nostr::Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag")])
+                .custom_created_at(nostr::Timestamp::from(created_at))
+                .sign_with_keys(&nostr::Keys::generate())
+                .expect("signed event");
+        let event_id = event.id.to_hex();
+        let batch = crate::queue::FlushBatch {
+            channel_id,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "private-office".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let envelope = TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+            Some(&batch),
+            true,
+            std::time::Duration::from_secs(3600),
+        )
+        .expect("trusted reply-required event");
+        let params = build_prompt_params("session", &["model-visible body"], Some(&envelope));
+        let turn = &params["_meta"][TRUSTED_INBOUND_EVENT_META_NAMESPACE]
+            [TRUSTED_INBOUND_EVENT_META_FIELD]["turnEnvelope"];
+
+        assert_eq!(
+            turn,
+            &serde_json::json!({
+                "schema": "buzz_turn_envelope_v1",
+                "request_id": event_id,
+                "source_event_id": event_id,
+                "issue_id": "AEO-267",
+                "consumer_ref": "paperclip:AEO-267",
+                "authority_ref": format!("buzz_event:{event_id}"),
+                "reply_surface": "buzz",
+                "reply_thread": event_id,
+                "ack_deadline": "2026-08-29T12:00:30.000Z",
+                "completion_deadline": "2026-08-29T13:00:00.000Z",
+                "requires_reply": true,
+            })
+        );
+    }
+
+    #[test]
+    fn turn_envelope_requires_one_exact_issue_and_rule_authority() {
+        assert_eq!(single_aeo_issue_id("work AEO-267 now"), Some("AEO-267"));
+        assert_eq!(single_aeo_issue_id("work AEO-267, now"), Some("AEO-267"));
+        assert_eq!(single_aeo_issue_id("work aeo-267 now"), None);
+        assert_eq!(single_aeo_issue_id("work XAEO-267 now"), None);
+        assert_eq!(single_aeo_issue_id("work AEO-267-extra now"), None);
+        assert_eq!(single_aeo_issue_id("AEO-267 and AEO-268"), None);
+
+        let channel_id = uuid::Uuid::new_v4();
+        let mut batch = signed_batch(channel_id, vec![]);
+        let keys = nostr::Keys::generate();
+        batch.events[0].event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(9), "Please handle AEO-267.")
+                .tags([nostr::Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag")])
+                .sign_with_keys(&keys)
+                .expect("signed event");
+
+        let without_rule_authority =
+            TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+                Some(&batch),
+                false,
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("base envelope remains valid");
+        assert!(without_rule_authority.turn_envelope.is_none());
+
+        let impossible_deadline =
+            TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+                Some(&batch),
+                true,
+                std::time::Duration::from_secs(29),
+            )
+            .expect("base envelope remains valid");
+        assert!(impossible_deadline.turn_envelope.is_none());
     }
 
     #[tokio::test]

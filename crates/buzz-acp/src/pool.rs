@@ -2174,7 +2174,23 @@ pub async fn run_prompt_task(
         match &source {
             PromptSource::Heartbeat => None,
             PromptSource::Channel(_) => {
-                match TrustedInboundEventEnvelope::try_from_prompt_batch(batch.as_ref()) {
+                let requires_reply = batch
+                    .as_ref()
+                    .filter(|batch| batch.events.len() == 1)
+                    .and_then(|batch| {
+                        batch.events.first().map(|event| {
+                            ctx.replay_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .requires_reply(batch.channel_id, &event.event.id.to_hex())
+                        })
+                    })
+                    .unwrap_or(false);
+                match TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+                    batch.as_ref(),
+                    requires_reply,
+                    ctx.max_turn_duration,
+                ) {
                     Ok(envelope) => Some(envelope),
                     Err(reason) => {
                         tracing::warn!(
