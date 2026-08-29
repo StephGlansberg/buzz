@@ -514,6 +514,13 @@ pub enum TimeoutKind {
 #[allow(dead_code)]
 pub enum PromptOutcome {
     Ok(StopReason),
+    /// ACP completed normally, but a rule-level origin reply contract was not
+    /// satisfied. The agent process remains healthy; Queue mode retries the
+    /// triggering batch rather than reporting a false success.
+    Incomplete {
+        missing_reply_event_ids: Vec<String>,
+        stop_reason: StopReason,
+    },
     Error(AcpError),
     /// Local relay state could not establish project authority. The ACP
     /// process is healthy; preserve the batch for bounded retry.
@@ -699,6 +706,9 @@ pub struct PromptContext {
     /// from `heartbeat_prompt` (agent self-prompting).
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
+    /// Effective prompt tags for subscription rules that require an origin
+    /// reply before the turn can be considered complete.
+    pub requires_reply_prompt_tags: HashSet<String>,
     pub system_prompt: Option<String>,
     /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
     /// on `session/new`. Never part of the prompt.
@@ -1035,6 +1045,11 @@ const CONTEXT_COUNT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Delay between the first failed context fetch and the single retry.
 const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Reply-contract readback is intentionally shorter than conversation context:
+/// the agent just published the reply, so two bounded probes are sufficient.
+const REPLY_READBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const REPLY_READBACK_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1838,12 +1853,15 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
 /// On the happy path the read loop has already called `take()`, so this is a no-op.
 fn send_prompt_result(
     result_tx: &mpsc::UnboundedSender<PromptResult>,
+    completion: &TurnCompletionGuard,
     turn_id: &str,
     mut agent: OwnedAgent,
     source: PromptSource,
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
+    completion.set_publisher_invoked(agent.acp.reply_publisher_invoked());
+    completion.finish(&outcome);
     agent.acp.clear_steer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
@@ -1891,6 +1909,7 @@ pub async fn run_prompt_task(
         turn_id.clone(),
         turn_started_at.clone(),
     ));
+    agent.acp.reset_reply_publisher_invoked();
     let triggering_event_ids: Vec<String> = batch
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
@@ -1910,11 +1929,12 @@ pub async fn run_prompt_task(
     // metadata now, before the agent is moved into PromptResult. It must be
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
-    let _turn_guard = TurnCompletionGuard::new(
+    let turn_guard = TurnCompletionGuard::new(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),
         observer_channel_id,
         turn_id.clone(),
+        triggering_event_ids.clone(),
     );
 
     // Start liveness with `turn_started`, not the final session/prompt call:
@@ -1969,6 +1989,7 @@ pub async fn run_prompt_task(
                 );
                 send_prompt_result(
                     &result_tx,
+                    &turn_guard,
                     &turn_id,
                     agent,
                     source,
@@ -2150,6 +2171,7 @@ pub async fn run_prompt_task(
                         agent.state.invalidate_all();
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2163,6 +2185,7 @@ pub async fn run_prompt_task(
                         // so the next retry will re-fetch a fresh revision.
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2207,6 +2230,7 @@ pub async fn run_prompt_task(
                         agent.state.invalidate_all();
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2218,6 +2242,7 @@ pub async fn run_prompt_task(
                     Err(e) => {
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2239,6 +2264,7 @@ pub async fn run_prompt_task(
     // Backfill liveness's shared session ID so ticks after this point carry
     // it too, matching every other observer frame for this turn.
     liveness_guard.set_session_id(session_id.clone());
+    turn_guard.set_session_id(session_id.clone());
     agent.acp.observe(
         "session_resolved",
         serde_json::json!({
@@ -2327,6 +2353,7 @@ pub async fn run_prompt_task(
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2363,6 +2390,7 @@ pub async fn run_prompt_task(
                             agent.state.invalidate_all();
                             send_prompt_result(
                                 &result_tx,
+                                &turn_guard,
                                 &turn_id,
                                 agent,
                                 source,
@@ -2381,6 +2409,7 @@ pub async fn run_prompt_task(
                     }
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2399,6 +2428,7 @@ pub async fn run_prompt_task(
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2415,6 +2445,7 @@ pub async fn run_prompt_task(
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2537,6 +2568,7 @@ pub async fn run_prompt_task(
         tracing::error!("run_prompt_task: no batch and no prompt_text — returning agent");
         send_prompt_result(
             &result_tx,
+            &turn_guard,
             &turn_id,
             agent,
             source,
@@ -2672,6 +2704,7 @@ pub async fn run_prompt_task(
                                 .await;
                                 send_prompt_result(
                                     &result_tx,
+                                    &turn_guard,
                                     &turn_id,
                                     agent,
                                     source,
@@ -2708,6 +2741,7 @@ pub async fn run_prompt_task(
                                 .await;
                                 send_prompt_result(
                                     &result_tx,
+                                    &turn_guard,
                                     &turn_id,
                                     agent,
                                     source,
@@ -2747,6 +2781,42 @@ pub async fn run_prompt_task(
                             );
                         }
                         log_stop_reason(&source, &StopReason::EndTurn);
+                        let reply_check = match batch.as_ref() {
+                            Some(batch) => check_required_replies(batch, &ctx).await,
+                            None => ReplyContractCheck::default(),
+                        };
+                        turn_guard.set_reply_event_ids(reply_check.reply_event_ids);
+                        if !reply_check.missing_source_event_ids.is_empty() {
+                            let missing_reply_event_ids = reply_check.missing_source_event_ids;
+                            tracing::warn!(
+                                target: "pool::prompt",
+                                missing = ?missing_reply_event_ids,
+                                "turn completed without required origin reply"
+                            );
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &turn_id,
+                                Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+                            )
+                            .await;
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_guard,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Incomplete {
+                                    missing_reply_event_ids,
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
                         if let PromptSource::Channel(cid) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             record_channel_delivery_success(
@@ -2773,6 +2843,7 @@ pub async fn run_prompt_task(
                         .await;
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2789,6 +2860,43 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            let reply_check = match batch.as_ref() {
+                Some(batch) => check_required_replies(batch, &ctx).await,
+                None => ReplyContractCheck::default(),
+            };
+            turn_guard.set_reply_event_ids(reply_check.reply_event_ids);
+            if !reply_check.missing_source_event_ids.is_empty() {
+                let missing_reply_event_ids = reply_check.missing_source_event_ids;
+                tracing::warn!(
+                    target: "pool::prompt",
+                    missing = ?missing_reply_event_ids,
+                    "turn completed without required origin reply"
+                );
+                let usage = agent.acp.take_turn_usage();
+                publish_agent_turn_metric(
+                    &ctx,
+                    usage,
+                    observer_channel_id,
+                    &session_id,
+                    &turn_id,
+                    Some(acp_stop_to_core(&stop_reason)),
+                )
+                .await;
+                send_prompt_result(
+                    &result_tx,
+                    &turn_guard,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Incomplete {
+                        missing_reply_event_ids,
+                        stop_reason: stop_reason.clone(),
+                    },
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
 
             if let PromptSource::Channel(cid) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -2848,6 +2956,7 @@ pub async fn run_prompt_task(
 
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -2870,6 +2979,7 @@ pub async fn run_prompt_task(
             .await;
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -2904,6 +3014,7 @@ pub async fn run_prompt_task(
                     // session state will be discarded with the old agent.
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2930,6 +3041,7 @@ pub async fn run_prompt_task(
                     .await;
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2955,6 +3067,7 @@ pub async fn run_prompt_task(
                     .await;
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2984,6 +3097,7 @@ pub async fn run_prompt_task(
             .await;
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -3011,6 +3125,7 @@ pub async fn run_prompt_task(
             .await;
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -4166,6 +4281,141 @@ fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Opt
     }
 }
 
+#[derive(Debug)]
+struct ReplyRequirement {
+    source_event_id: String,
+    created_at: nostr::Timestamp,
+}
+
+#[derive(Debug, Default)]
+struct ReplyContractCheck {
+    reply_event_ids: Vec<String>,
+    missing_source_event_ids: Vec<String>,
+}
+
+fn reply_requirements(batch: &FlushBatch, ctx: &PromptContext) -> Vec<ReplyRequirement> {
+    batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .filter(|event| ctx.requires_reply_prompt_tags.contains(&event.prompt_tag))
+        .map(|event| {
+            let source_event_id = event.event.id.to_hex();
+            ReplyRequirement {
+                source_event_id,
+                created_at: event.event.created_at,
+            }
+        })
+        .collect()
+}
+
+fn reply_contract_filters(
+    channel_id: Uuid,
+    requirements: &[ReplyRequirement],
+    agent_pubkey: nostr::PublicKey,
+) -> Vec<nostr::Filter> {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let e_tag = SingleLetterTag::lowercase(Alphabet::E);
+    let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+    let channel = channel_id.to_string();
+    requirements
+        .iter()
+        .map(|requirement| {
+            nostr::Filter::new()
+                .kinds([
+                    nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+                    nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+                ])
+                .author(agent_pubkey)
+                // The proof must name the exact triggering event, not merely
+                // another message under the same conversation root.
+                .custom_tags(e_tag, [requirement.source_event_id.as_str()])
+                .custom_tags(h_tag, [channel.as_str()])
+                .since(requirement.created_at)
+                .limit(1)
+        })
+        .collect()
+}
+
+fn reply_contract_check_from_json(
+    json: &serde_json::Value,
+    requirements: &[ReplyRequirement],
+) -> ReplyContractCheck {
+    let events = json.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut check = ReplyContractCheck::default();
+
+    for requirement in requirements {
+        let reply = events.iter().find(|event| {
+            let created_at = event
+                .get("created_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            created_at >= requirement.created_at.as_secs()
+                && event
+                    .get("tags")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|tags| {
+                        tags.iter().any(|tag| {
+                            tag.as_array().is_some_and(|values| {
+                                values.first().and_then(serde_json::Value::as_str) == Some("e")
+                                    && values.get(1).and_then(serde_json::Value::as_str)
+                                        == Some(requirement.source_event_id.as_str())
+                            })
+                        })
+                    })
+        });
+        if let Some(reply_id) = reply
+            .and_then(|event| event.get("id"))
+            .and_then(|id| id.as_str())
+        {
+            if !check.reply_event_ids.iter().any(|seen| seen == reply_id) {
+                check.reply_event_ids.push(reply_id.to_string());
+            }
+        } else {
+            check
+                .missing_source_event_ids
+                .push(requirement.source_event_id.clone());
+        }
+    }
+    check
+}
+
+async fn check_required_replies(batch: &FlushBatch, ctx: &PromptContext) -> ReplyContractCheck {
+    let requirements = reply_requirements(batch, ctx);
+    if requirements.is_empty() {
+        return ReplyContractCheck::default();
+    }
+    let filters =
+        reply_contract_filters(batch.channel_id, &requirements, ctx.agent_keys.public_key());
+
+    for attempt in 0..2 {
+        match timeout(REPLY_READBACK_TIMEOUT, ctx.rest_client.query(&filters)).await {
+            Ok(Ok(json)) => {
+                let check = reply_contract_check_from_json(&json, &requirements);
+                if check.missing_source_event_ids.is_empty() || attempt == 1 {
+                    return check;
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(attempt, "required reply readback failed: {error}");
+            }
+            Err(_) => {
+                tracing::warn!(attempt, "required reply readback timed out");
+            }
+        }
+        tokio::time::sleep(REPLY_READBACK_RETRY_DELAY).await;
+    }
+
+    ReplyContractCheck {
+        reply_event_ids: Vec::new(),
+        missing_source_event_ids: requirements
+            .into_iter()
+            .map(|requirement| requirement.source_event_id)
+            .collect(),
+    }
+}
+
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
 /// the merged re-prompt, then requeue the batch (in `Queue` dedup mode) with
 /// that reason stamped onto [`FlushBatch::cancel_reason`]. `Cancel`/`Rotate`
@@ -4487,11 +4737,25 @@ impl Drop for LivenessGuard {
 // observer handle and metadata at creation time so it remains valid even after
 // the agent is moved into `PromptResult`.
 
+const TERMINAL_CORRELATION_ID_CAP: usize = 8;
+
+struct TurnCompletionState {
+    session_id: Option<String>,
+    outcome: Option<&'static str>,
+    stop_reason: Option<&'static str>,
+    publisher_invoked: bool,
+    reply_event_ids: Vec<String>,
+    reply_event_count: usize,
+}
+
 struct TurnCompletionGuard {
     observer: Option<observer::ObserverHandle>,
     agent_index: Option<usize>,
     channel_id: Option<uuid::Uuid>,
     turn_id: String,
+    source_event_ids: Vec<String>,
+    source_event_count: usize,
+    state: Arc<Mutex<TurnCompletionState>>,
 }
 
 impl TurnCompletionGuard {
@@ -4500,27 +4764,121 @@ impl TurnCompletionGuard {
         agent_index: Option<usize>,
         channel_id: Option<uuid::Uuid>,
         turn_id: String,
+        source_event_ids: Vec<String>,
     ) -> Self {
+        let source_event_count = source_event_ids.len();
         Self {
             observer,
             agent_index,
             channel_id,
             turn_id,
+            source_event_ids: source_event_ids
+                .into_iter()
+                .take(TERMINAL_CORRELATION_ID_CAP)
+                .collect(),
+            source_event_count,
+            state: Arc::new(Mutex::new(TurnCompletionState {
+                session_id: None,
+                outcome: None,
+                stop_reason: None,
+                publisher_invoked: false,
+                reply_event_ids: Vec::new(),
+                reply_event_count: 0,
+            })),
         }
+    }
+
+    fn set_session_id(&self, session_id: String) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.session_id = Some(session_id);
+    }
+
+    fn finish(&self, outcome: &PromptOutcome) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.outcome = Some(outcome.observer_label());
+        state.stop_reason = outcome.observer_stop_reason();
+    }
+
+    fn set_publisher_invoked(&self, invoked: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.publisher_invoked = invoked;
+    }
+
+    fn set_reply_event_ids(&self, reply_event_ids: Vec<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.reply_event_count = reply_event_ids.len();
+        state.reply_event_ids = reply_event_ids
+            .into_iter()
+            .take(TERMINAL_CORRELATION_ID_CAP)
+            .collect();
     }
 }
 
 impl Drop for TurnCompletionGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.observer.take() {
-            let context = observer::context_for(self.channel_id, None, Some(self.turn_id.clone()));
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let context = observer::context_for(
+                self.channel_id,
+                state.session_id.clone(),
+                Some(self.turn_id.clone()),
+            );
             observer.emit(
                 "turn_completed",
                 self.agent_index,
                 &context,
-                serde_json::json!({}),
+                serde_json::json!({
+                    "v": 1,
+                    "outcome": state.outcome.unwrap_or("panicked"),
+                    "stopReason": state.stop_reason,
+                    "triggeringEventIds": self.source_event_ids,
+                    "triggeringEventCount": self.source_event_count,
+                    "triggeringEventIdsTruncated": self.source_event_count > self.source_event_ids.len(),
+                    "replyEventIds": state.reply_event_ids,
+                    "replyEventCount": state.reply_event_count,
+                    "replyEventIdsTruncated": state.reply_event_count > state.reply_event_ids.len(),
+                    "publisherInvoked": state.publisher_invoked,
+                }),
             );
         }
+    }
+}
+
+impl PromptOutcome {
+    fn observer_label(&self) -> &'static str {
+        match self {
+            Self::Ok(_) => "ok",
+            Self::Incomplete { .. } => "incomplete",
+            Self::Error(_) => "error",
+            Self::ProjectContextIndeterminate(_) => "project_context_indeterminate",
+            Self::AgentExited => "exited",
+            Self::Timeout(TimeoutKind::Idle) => "idle_timeout",
+            Self::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
+            Self::Cancelled => "cancelled",
+            Self::CancelDrainTimeout(_) => "cancel_drain_timeout",
+        }
+    }
+
+    fn observer_stop_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Ok(reason)
+            | Self::Incomplete {
+                stop_reason: reason,
+                ..
+            } => Some(stop_reason_label(reason)),
+            Self::Cancelled => Some("cancelled"),
+            _ => None,
+        }
+    }
+}
+
+fn stop_reason_label(reason: &StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::Cancelled => "cancelled",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurnRequests => "max_turn_requests",
+        StopReason::Refusal => "refusal",
     }
 }
 
@@ -7177,6 +7535,86 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         }
     }
 
+    #[test]
+    fn reply_contract_requires_direct_triggering_event_proof() {
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let source = &batch.events[0].event;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.requires_reply_prompt_tags.insert("test".into());
+
+        let requirements = reply_requirements(&batch, &ctx);
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].source_event_id, source.id.to_hex());
+
+        let unrelated_thread_reply = serde_json::json!([{
+            "id": "wrong-reply",
+            "created_at": source.created_at.as_secs(),
+            "tags": [["e", "conversation-root-only"]],
+        }]);
+        let missing = reply_contract_check_from_json(&unrelated_thread_reply, &requirements);
+        assert_eq!(missing.missing_source_event_ids, vec![source.id.to_hex()]);
+
+        // Nostr timestamps have one-second precision. This is safe because no
+        // reply can name the signed triggering event id before it exists.
+        let direct_same_second_reply = serde_json::json!([{
+            "id": "direct-reply",
+            "created_at": source.created_at.as_secs(),
+            "tags": [["e", source.id.to_hex()]],
+        }]);
+        let closed = reply_contract_check_from_json(&direct_same_second_reply, &requirements);
+        assert!(closed.missing_source_event_ids.is_empty());
+        assert_eq!(closed.reply_event_ids, vec!["direct-reply"]);
+    }
+
+    #[test]
+    fn turn_completed_is_discriminated_and_compact() {
+        let observer = observer::ObserverHandle::in_process();
+        let source_ids: Vec<String> = (0..20).map(|index| format!("source-{index}")).collect();
+        let guard = TurnCompletionGuard::new(
+            Some(observer.clone()),
+            Some(3),
+            Some(Uuid::new_v4()),
+            "turn-1".into(),
+            source_ids,
+        );
+        guard.set_session_id("session-1".into());
+        guard.set_publisher_invoked(true);
+        guard.set_reply_event_ids(vec!["reply-1".into()]);
+        guard.finish(&PromptOutcome::Incomplete {
+            missing_reply_event_ids: vec!["source-19".into()],
+            stop_reason: StopReason::EndTurn,
+        });
+        drop(guard);
+
+        let event = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "turn_completed")
+            .expect("completion frame");
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+        assert_eq!(event.payload["outcome"], "incomplete");
+        assert_eq!(event.payload["stopReason"], "end_turn");
+        assert_eq!(event.payload["triggeringEventCount"], 20);
+        assert_eq!(
+            event.payload["triggeringEventIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(event.payload["triggeringEventIdsTruncated"], true);
+        assert_eq!(
+            event.payload["replyEventIds"],
+            serde_json::json!(["reply-1"])
+        );
+        assert_eq!(event.payload["publisherInvoked"], true);
+        assert!(
+            serde_json::to_vec(&event).unwrap().len() < 2_048,
+            "terminal receipt must stay far below the NIP-44 plaintext ceiling"
+        );
+    }
+
     // ── classify_control_cancel_failure ─────────────────────────────────────
     // Table-driven pin of the single production seam used by the
     // `Err(error)` arm in `run_prompt_task`'s control-cancel branch. Crosses
@@ -7197,6 +7635,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::ProjectContextIndeterminate(_) => "ProjectContextIndeterminate",
             PromptOutcome::Cancelled => "Cancelled",
+            PromptOutcome::Incomplete { .. } => "Incomplete",
             PromptOutcome::Ok(_) => "Ok",
         };
         assert_eq!(
@@ -7701,8 +8140,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         // `send_prompt_result` without the read loop ever running `take()`.
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
         let source = PromptSource::Heartbeat;
+        let completion = TurnCompletionGuard::new(None, None, None, "test-turn-id".into(), vec![]);
         send_prompt_result(
             &result_tx,
+            &completion,
             "test-turn-id",
             agent,
             source,
@@ -7762,8 +8203,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
         let source = PromptSource::Heartbeat;
+        let completion = TurnCompletionGuard::new(None, None, None, "test-turn-id".into(), vec![]);
         send_prompt_result(
             &result_tx,
+            &completion,
             "test-turn-id",
             agent,
             source,
@@ -8207,6 +8650,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
+            requires_reply_prompt_tags: HashSet::new(),
             system_prompt: None,
             session_title: None,
             team_instructions: None,

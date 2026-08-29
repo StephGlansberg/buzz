@@ -80,6 +80,7 @@ impl ChannelScope {
 /// without requiring `&mut self` — rules are shared via `Arc<[SubscriptionRule]>`
 /// across the event-dispatch loop.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionRule {
     /// Human-readable rule name; used as fallback `prompt_tag`.
     pub name: String,
@@ -91,6 +92,19 @@ pub struct SubscriptionRule {
     /// If `true`, the event must contain a `p` tag referencing the agent pubkey.
     #[serde(default)]
     pub require_mention: bool,
+    /// If `true`, the event must carry exactly one canonical `h` tag whose
+    /// value is the channel selected by the relay subscription.
+    #[serde(default)]
+    pub require_exact_channel_tag: bool,
+    /// If `true`, a successful ACP turn is incomplete until the agent has
+    /// published a reply in the triggering event's origin thread.
+    #[serde(default)]
+    pub requires_reply: bool,
+    /// Reserved mesh contract for membership-triggered ephemeral channels.
+    /// The ACP membership path owns admission; keeping the field typed makes
+    /// generated configs strict without silently accepting misspellings.
+    #[serde(default)]
+    pub admit_invited_ephemeral: bool,
     /// Optional evalexpr boolean expression for fine-grained filtering.
     #[serde(default)]
     pub filter: Option<String>,
@@ -120,6 +134,9 @@ impl Default for SubscriptionRule {
             channels: ChannelScope::All("all".into()),
             kinds: Vec::new(),
             require_mention: false,
+            require_exact_channel_tag: false,
+            requires_reply: false,
+            admit_invited_ephemeral: false,
             filter: None,
             prompt_tag: None,
             compiled_filter: None,
@@ -135,6 +152,9 @@ impl Clone for SubscriptionRule {
             channels: self.channels.clone(),
             kinds: self.kinds.clone(),
             require_mention: self.require_mention,
+            require_exact_channel_tag: self.require_exact_channel_tag,
+            requires_reply: self.requires_reply,
+            admit_invited_ephemeral: self.admit_invited_ephemeral,
             filter: self.filter.clone(),
             prompt_tag: self.prompt_tag.clone(),
             compiled_filter: self.compiled_filter.clone(),
@@ -153,6 +173,23 @@ pub struct MatchedRule {
     pub rule_index: usize,
     /// Prompt tag to use (rule's `prompt_tag` or its `name`).
     pub prompt_tag: String,
+    /// Whether this rule requires a durable origin-thread reply.
+    pub requires_reply: bool,
+}
+
+/// Why a channel-scoped rule rejected an otherwise eligible event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchRejection {
+    /// The rule requires one canonical `h` tag and the event did not carry it.
+    ExactChannelTagRequired,
+}
+
+/// Detailed matcher result used by the harness for structured rejection.
+#[derive(Debug, Clone)]
+pub enum MatchDecision {
+    Matched(MatchedRule),
+    Rejected(MatchRejection),
+    NoMatch,
 }
 
 /// Maximum expression length accepted by `evaluate_filter`.
@@ -365,12 +402,12 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 5;
 /// After [`MAX_CONSECUTIVE_TIMEOUTS`] consecutive timeouts on a single rule,
 /// that rule is logged at ERROR and the call returns `None` immediately to
 /// avoid blocking the event loop indefinitely.
-pub async fn match_event(
+pub async fn match_event_decision(
     event: &nostr::Event,
     channel_id: uuid::Uuid,
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
-) -> Option<MatchedRule> {
+) -> MatchDecision {
     let filter_ctx = FilterContext::from_event(event, channel_id);
 
     for (index, rule) in rules.iter().enumerate() {
@@ -384,7 +421,14 @@ pub async fn match_event(
             continue;
         }
 
-        // 3. Mention check — look for a `p` tag whose first element equals
+        // 3. Exact channel binding. The relay extracts a UUID from the first
+        // parseable `h` tag, but a signed event may carry extra or conflicting
+        // `h` tags. Strict rules accept one canonical two-element tag only.
+        if rule.require_exact_channel_tag && !has_exact_channel_tag(event, channel_id) {
+            return MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired);
+        }
+
+        // 4. Mention check — look for a `p` tag whose first element equals
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
         if rule.require_mention {
@@ -411,7 +455,7 @@ pub async fn match_event(
                      failing closed (no match for any rule)"
                 );
                 // Fail-closed: disabled rule → no match for this event.
-                return None;
+                return MatchDecision::NoMatch;
             }
 
             match evaluate_filter(expr, &filter_ctx, rule.compiled_filter.clone()).await {
@@ -432,7 +476,7 @@ pub async fn match_event(
                         "filter expression timed out; failing closed (no match for any rule)"
                     );
                     // Fail-closed: timeout → no match, not next rule.
-                    return None;
+                    return MatchDecision::NoMatch;
                 }
                 Err(e) => {
                     warn!(
@@ -442,7 +486,7 @@ pub async fn match_event(
                         "filter expression error; failing closed (no match for any rule)"
                     );
                     // Fail-closed: any error → no match, not next rule.
-                    return None;
+                    return MatchDecision::NoMatch;
                 }
             }
         }
@@ -450,13 +494,41 @@ pub async fn match_event(
         // All checks passed — this rule wins.
         let prompt_tag = rule.prompt_tag.clone().unwrap_or_else(|| rule.name.clone());
 
-        return Some(MatchedRule {
+        return MatchDecision::Matched(MatchedRule {
             rule_index: index,
             prompt_tag,
+            requires_reply: rule.requires_reply,
         });
     }
 
-    None
+    MatchDecision::NoMatch
+}
+
+/// Match an event while preserving the historical `Option` API for callers
+/// that do not publish sender-visible routing diagnostics.
+pub async fn match_event(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+) -> Option<MatchedRule> {
+    match match_event_decision(event, channel_id, rules, agent_pubkey_hex).await {
+        MatchDecision::Matched(rule) => Some(rule),
+        MatchDecision::Rejected(_) | MatchDecision::NoMatch => None,
+    }
+}
+
+fn has_exact_channel_tag(event: &nostr::Event, channel_id: uuid::Uuid) -> bool {
+    let expected = channel_id.to_string();
+    let mut h_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("h"));
+    let Some(tag) = h_tags.next() else {
+        return false;
+    };
+    let values = tag.as_slice();
+    values.len() == 2 && values[1] == expected && h_tags.next().is_none()
 }
 
 #[cfg(test)]
@@ -484,6 +556,13 @@ mod tests {
             .unwrap()
     }
 
+    fn make_event_with_tags(kind: u32, tags: Vec<Tag>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(kind as u16), "hello")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
     fn any_channel() -> Uuid {
         Uuid::new_v4()
     }
@@ -501,6 +580,9 @@ mod tests {
             channels,
             kinds,
             require_mention: mention,
+            require_exact_channel_tag: false,
+            requires_reply: false,
+            admit_invited_ephemeral: false,
             filter: filter.map(|s| s.into()),
             prompt_tag: prompt_tag.map(|s| s.into()),
             compiled_filter: None,
@@ -661,6 +743,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(matched.prompt_tag, "mentioned");
+    }
+
+    #[tokio::test]
+    async fn exact_channel_tag_requires_one_canonical_h_tag() {
+        let channel_id = any_channel();
+        let exact_h = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
+        let mut rule = make_rule(
+            "strict-channel",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        let accepted = make_event_with_tags(9, vec![exact_h.clone()]);
+        assert!(matches!(
+            match_event_decision(&accepted, channel_id, &[rule.clone()], "").await,
+            MatchDecision::Matched(_)
+        ));
+
+        let missing = make_event(9, "hello");
+        assert!(matches!(
+            match_event_decision(&missing, channel_id, &[rule.clone()], "").await,
+            MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired)
+        ));
+
+        let duplicate = make_event_with_tags(9, vec![exact_h.clone(), exact_h]);
+        assert!(matches!(
+            match_event_decision(&duplicate, channel_id, &[rule], "").await,
+            MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn match_carries_rule_level_reply_requirement() {
+        let event = make_event(9, "hello");
+        let channel_id = any_channel();
+        let mut rule = make_rule(
+            "reply-required",
+            ChannelScope::All("all".into()),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        rule.requires_reply = true;
+
+        let matched = match_event(&event, channel_id, &[rule], "").await.unwrap();
+        assert!(matched.requires_reply);
     }
 
     #[tokio::test]

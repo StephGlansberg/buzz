@@ -2113,6 +2113,9 @@ async fn tokio_main() -> Result<()> {
                     ]
                 }),
                 require_mention: !config.no_mention_filter,
+                require_exact_channel_tag: false,
+                requires_reply: false,
+                admit_invited_ephemeral: false,
                 filter: None,
                 compiled_filter: None,
                 consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2125,6 +2128,9 @@ async fn tokio_main() -> Result<()> {
                 channels: filter::ChannelScope::All("all".into()),
                 kinds: config.kinds_override.clone().unwrap_or_default(),
                 require_mention: false,
+                require_exact_channel_tag: false,
+                requires_reply: false,
+                admit_invited_ephemeral: false,
                 filter: None,
                 compiled_filter: None,
                 consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2192,6 +2198,11 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
+    let requires_reply_prompt_tags = rules
+        .iter()
+        .filter(|rule| rule.requires_reply)
+        .map(|rule| rule.prompt_tag.clone().unwrap_or_else(|| rule.name.clone()))
+        .collect();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2199,6 +2210,7 @@ async fn tokio_main() -> Result<()> {
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
+        requires_reply_prompt_tags,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
@@ -2897,7 +2909,16 @@ async fn tokio_main() -> Result<()> {
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
                             let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
+                                Some(m) => {
+                                    if m.requires_reply {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            rule_index = m.rule_index,
+                                            "matched reply-required subscription rule"
+                                        );
+                                    }
+                                    m.prompt_tag
+                                }
                                 None => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
@@ -4013,6 +4034,9 @@ fn handle_prompt_result(
                         "the turn exceeded the maximum duration".to_string()
                     }
                     PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                    PromptOutcome::Incomplete { .. } => {
+                        "the required origin reply was not published".to_string()
+                    }
                     PromptOutcome::Error(e) => format!("{e}"),
                     PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
                     _ => "repeated failures".to_string(),
@@ -4046,6 +4070,7 @@ fn handle_prompt_result(
 
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
+        PromptOutcome::Incomplete { .. } => "incomplete",
         PromptOutcome::Error(_) => "error",
         PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
@@ -4100,6 +4125,19 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
+            pool.return_agent(result.agent);
+        }
+        PromptOutcome::Incomplete {
+            missing_reply_event_ids,
+            ..
+        } => {
+            tracing::warn!(
+                agent = agent_index,
+                outcome = outcome_label,
+                missing = ?missing_reply_event_ids,
+                "agent_returned — required origin reply missing"
+            );
+            emit_turn_error("required origin reply was not published", None);
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.

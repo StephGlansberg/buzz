@@ -174,6 +174,9 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    /// Whether the current turn emitted an ACP tool-call update naming an
+    /// Aspect reply publisher (`buzz_<aspect>_reply`).
+    reply_publisher_invoked: bool,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -557,6 +560,7 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            reply_publisher_invoked: false,
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
@@ -585,6 +589,17 @@ impl AcpClient {
     /// Return the pool slot index for this agent process.
     pub(crate) fn observer_agent_index(&self) -> Option<usize> {
         self.observer_agent_index
+    }
+
+    /// Reset the per-turn reply publisher latch before any setup step can exit.
+    pub(crate) fn reset_reply_publisher_invoked(&mut self) {
+        self.reply_publisher_invoked = false;
+    }
+
+    /// Return whether this turn invoked an Aspect reply publisher according to
+    /// the adapter's ACP tool-call stream.
+    pub(crate) fn reply_publisher_invoked(&self) -> bool {
+        self.reply_publisher_invoked
     }
 
     /// Emit a semantic event to the local observer feed, if enabled.
@@ -1764,6 +1779,7 @@ impl AcpClient {
                     .get("title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
+                self.reply_publisher_invoked |= reply_publisher_named(update);
                 let kind = update
                     .get("kind")
                     .and_then(|v| v.as_str())
@@ -2038,6 +2054,20 @@ impl AcpClient {
         StopReason::from_str(raw)
             .ok_or_else(|| AcpError::Protocol(format!("unknown stopReason: {raw:?}")))
     }
+}
+
+fn reply_publisher_named(update: &serde_json::Value) -> bool {
+    [
+        update.get("title"),
+        update.get("name"),
+        update.get("toolName"),
+        update.pointer("/_meta/toolName"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .flat_map(|name| name.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
+    .any(|token| token.starts_with("buzz_") && token.ends_with("_reply"))
 }
 
 /// Build `session/prompt` params from one or more text content blocks.
@@ -2351,6 +2381,22 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_publisher_matcher_accepts_only_aspect_reply_tools() {
+        assert!(reply_publisher_named(&serde_json::json!({
+            "title": "Call buzz_mechanon_reply"
+        })));
+        assert!(reply_publisher_named(&serde_json::json!({
+            "_meta": {"toolName": "buzz_sapientis_reply"}
+        })));
+        assert!(!reply_publisher_named(&serde_json::json!({
+            "title": "buzz_mechanon_react"
+        })));
+        assert!(!reply_publisher_named(&serde_json::json!({
+            "title": "shell"
+        })));
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {

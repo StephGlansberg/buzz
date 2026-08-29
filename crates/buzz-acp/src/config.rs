@@ -1192,6 +1192,7 @@ impl Config {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlConfig {
     #[serde(default)]
     rules: Vec<SubscriptionRule>,
@@ -1532,6 +1533,9 @@ mod tests {
             channels,
             kinds,
             require_mention: mention,
+            require_exact_channel_tag: false,
+            requires_reply: false,
+            admit_invited_ephemeral: false,
             filter: None,
             prompt_tag: None,
             compiled_filter: None,
@@ -2009,6 +2013,52 @@ require_mention = false
         let rules = load_rules(&path).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "catch-all");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_rules_typed_lifecycle_fields() {
+        let dir = std::env::temp_dir().join("buzz-acp-test-lifecycle-fields");
+        let path = dir.join("rules.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+name = "private-office"
+channels = ["00000000-0000-0000-0000-000000000001"]
+require_exact_channel_tag = true
+requires_reply = true
+admit_invited_ephemeral = false
+"#,
+        )
+        .unwrap();
+
+        let rules = load_rules(&path).unwrap();
+        assert!(rules[0].require_exact_channel_tag);
+        assert!(rules[0].requires_reply);
+        assert!(!rules[0].admit_invited_ephemeral);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_rules_unknown_field_rejected() {
+        let dir = std::env::temp_dir().join("buzz-acp-test-unknown-field");
+        let path = dir.join("rules.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+name = "strict"
+channels = "all"
+requires_repy = true
+"#,
+        )
+        .unwrap();
+
+        let error = load_rules(&path).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
