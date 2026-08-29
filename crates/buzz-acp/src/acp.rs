@@ -14,13 +14,200 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::observer::{ObserverContext, ObserverHandle};
+use crate::relay::RestClient;
 use crate::usage::{
     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
 };
 
+/// ACP `_meta` key carrying a Buzz-verified triggering event.
+///
+/// The value is transport metadata, not a prompt content block. Adapters that
+/// do not explicitly consume the extension ignore it per ACP extensibility.
+pub(crate) const TRUSTED_INBOUND_EVENT_META_NAMESPACE: &str = "buzz";
+pub(crate) const TRUSTED_INBOUND_EVENT_META_FIELD: &str = "inboundEvent";
+const MAX_INBOUND_IMAGES: usize = 4;
+const MAX_INBOUND_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_INBOUND_IMAGE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const INBOUND_IMAGE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const INBOUND_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundImageDescriptor {
+    url: String,
+    mime_type: String,
+    sha256: String,
+    size: u64,
+}
+
+fn parse_inbound_image_tag(tag: &[String]) -> Result<InboundImageDescriptor, &'static str> {
+    let mut url = None;
+    let mut mime_type = None;
+    let mut sha256 = None;
+    let mut size = None;
+    for field in tag.iter().skip(1) {
+        let Some((key, value)) = field.split_once(' ') else {
+            continue;
+        };
+        let target = match key {
+            "url" => &mut url,
+            "m" => &mut mime_type,
+            "x" => &mut sha256,
+            "size" => &mut size,
+            _ => continue,
+        };
+        if target.replace(value).is_some() {
+            return Err("duplicate_field");
+        }
+    }
+
+    let url = url.filter(|value| !value.is_empty()).ok_or("missing_url")?;
+    let mime_type = mime_type.ok_or("missing_mime")?;
+    if !INBOUND_IMAGE_MIMES.contains(&mime_type) {
+        return Err("unsupported_mime");
+    }
+    let sha256 = sha256.ok_or("missing_sha256")?;
+    if sha256.len() != 64
+        || !sha256
+            .chars()
+            .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+    {
+        return Err("invalid_sha256");
+    }
+    let size = size
+        .ok_or("missing_size")?
+        .parse::<u64>()
+        .map_err(|_| "invalid_size")?;
+    if size == 0 {
+        return Err("invalid_size");
+    }
+    if size > MAX_INBOUND_IMAGE_BYTES {
+        return Err("oversize");
+    }
+    Ok(InboundImageDescriptor {
+        url: url.to_owned(),
+        mime_type: mime_type.to_owned(),
+        sha256: sha256.to_owned(),
+        size,
+    })
+}
+
+/// Immutable evidence copied from one signature-verified triggering event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TrustedInboundEventEnvelope {
+    schema_version: u8,
+    event_id: String,
+    author_pubkey: String,
+    kind: u16,
+    channel_id: String,
+    tags: Vec<Vec<String>>,
+}
+
+impl TrustedInboundEventEnvelope {
+    fn inbound_images(&self) -> Vec<Result<InboundImageDescriptor, &'static str>> {
+        let mut total_bytes = 0_u64;
+        self.tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+            .take(MAX_INBOUND_IMAGES)
+            .map(|tag| {
+                let descriptor = parse_inbound_image_tag(tag)?;
+                let next_total = total_bytes
+                    .checked_add(descriptor.size)
+                    .ok_or("aggregate_oversize")?;
+                if next_total > MAX_INBOUND_IMAGE_TOTAL_BYTES {
+                    return Err("aggregate_oversize");
+                }
+                total_bytes = next_total;
+                Ok(descriptor)
+            })
+            .collect()
+    }
+
+    /// Build an envelope only for an unambiguous single-event batch whose
+    /// signed `h` tag exactly matches the subscribed channel. Any ambiguity or
+    /// failed signature verification produces no trusted metadata.
+    #[cfg(test)]
+    pub(crate) fn from_prompt_batch(batch: Option<&crate::queue::FlushBatch>) -> Option<Self> {
+        Self::try_from_prompt_batch(batch).ok()
+    }
+
+    /// Return a stable, secret-free refusal code when trusted metadata cannot
+    /// be derived. The worker logs this at the admission boundary so a missing
+    /// envelope cannot masquerade as an agent/tool-policy failure.
+    pub(crate) fn try_from_prompt_batch(
+        batch: Option<&crate::queue::FlushBatch>,
+    ) -> Result<Self, &'static str> {
+        let batch = batch.ok_or("missing_batch")?;
+        if batch.cancel_reason.is_some() {
+            return Err("cancelled_batch");
+        }
+        if !batch.cancelled_events.is_empty() {
+            return Err("cancelled_events_present");
+        }
+        if batch.events.len() != 1 {
+            return Err("ambiguous_event_count");
+        }
+        let event = &batch.events[0].event;
+        if event.verify().is_err() {
+            return Err("invalid_signature");
+        }
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        let expected_channel = batch.channel_id.to_string();
+        let h_tags: Vec<&Vec<String>> = tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("h"))
+            .collect();
+        if h_tags.len() != 1
+            || h_tags[0].get(1).map(String::as_str) != Some(expected_channel.as_str())
+        {
+            return Err("invalid_channel_binding");
+        }
+        Ok(Self {
+            schema_version: 1,
+            event_id: event.id.to_hex(),
+            author_pubkey: event.pubkey.to_hex(),
+            kind: event.kind.as_u16(),
+            channel_id: expected_channel,
+            tags,
+        })
+    }
+}
+
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
+const AGENT_PROCESS_GROUP_ENV: &str = "BUZZ_ACP_AGENT_PROCESS_GROUP";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProcessGroupMode {
+    Isolated,
+    Inherit,
+}
+
+fn parse_agent_process_group_mode(value: Option<&str>) -> Result<AgentProcessGroupMode, AcpError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("isolated") => Ok(AgentProcessGroupMode::Isolated),
+        Some("inherit") => Ok(AgentProcessGroupMode::Inherit),
+        Some(value) => Err(AcpError::Protocol(format!(
+            "{AGENT_PROCESS_GROUP_ENV} must be isolated or inherit, got: {value}"
+        ))),
+    }
+}
+
+fn configured_agent_process_group_mode() -> Result<AgentProcessGroupMode, AcpError> {
+    match std::env::var(AGENT_PROCESS_GROUP_ENV) {
+        Ok(value) => parse_agent_process_group_mode(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_agent_process_group_mode(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(AcpError::Protocol(format!(
+            "{AGENT_PROCESS_GROUP_ENV} must contain valid UTF-8"
+        ))),
+    }
+}
 
 /// An MCP server configuration passed to `session/new`.
 ///
@@ -108,6 +295,9 @@ pub enum AcpError {
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
+
+    #[error("Trusted inbound event refused: {0}")]
+    TrustedInboundEventRefused(&'static str),
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -134,6 +324,30 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
+fn observer_safe_write_payload(value: &serde_json::Value) -> serde_json::Value {
+    let mut observed = value.clone();
+    if observed.get("method").and_then(serde_json::Value::as_str) != Some("session/prompt") {
+        return observed;
+    }
+    let Some(prompt) = observed
+        .pointer_mut("/params/prompt")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return observed;
+    };
+    for block in prompt {
+        if block.get("type").and_then(serde_json::Value::as_str) == Some("image") {
+            if let Some(object) = block.as_object_mut() {
+                object.insert(
+                    "data".into(),
+                    serde_json::Value::String("[redacted]".into()),
+                );
+            }
+        }
+    }
+    observed
+}
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -141,6 +355,9 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Whether the live child's PID is also a process group owned by Buzz.
+    /// Once Tokio clears `Child::id()`, no numeric group identity is retained.
+    owns_child_process_group: bool,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -192,6 +409,11 @@ pub struct AcpClient {
     /// Other agents may leave this unset — readers must treat `None` as
     /// "no active run to steer into" and fall back to cancel+merge.
     active_run_id: Option<String>,
+    /// Most recent run ID observed during the current prompt, retained after
+    /// adapters clear their active-run marker at turn completion.
+    last_turn_run_id: Option<String>,
+    /// Stable backend session key reported by ACP session lineage metadata.
+    active_session_key: Option<String>,
     /// Whether the agent advertised `_meta.steering.supported: true` in its
     /// `initialize` response, meaning it implements the cross-adapter
     /// [`ACP_STEER_METHOD`] extension.
@@ -203,6 +425,10 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Whether the adapter advertised ACP image prompt support during
+    /// `initialize`. Image blocks must stay off the wire when this is false;
+    /// unsupported adapters may reject the entire prompt instead of its image.
+    image_prompt_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -217,6 +443,10 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+}
+
+fn harness_bound_agent_env(key: &str) -> bool {
+    matches!(key, "BUZZ_RELAY_URL" | "BUZZ_PRIVATE_KEY")
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -423,26 +653,23 @@ impl AcpClient {
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
-        // Kill the entire process group when possible. The child was spawned
-        // with process_group(0), so its PID == its PGID. Killing the group
-        // ensures subprocesses (MCP servers, tool processes) are cleaned up
-        // rather than orphaned to init.
-        //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
-        }
+        self.signal_agent_processes();
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
         // wedge the harness during respawn or shutdown if a child is stuck.
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => self.owns_child_process_group = false,
             Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
             Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+        }
+    }
+
+    fn signal_agent_processes(&mut self) {
+        match (self.owns_child_process_group, self.child.id()) {
+            (true, Some(process_group_id)) if kill_process_group(process_group_id) => {}
+            _ => {
+                let _ = self.child.start_kill();
+            }
         }
     }
 
@@ -459,6 +686,27 @@ impl AcpClient {
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
+        forward_buzz_publisher_credentials: bool,
+    ) -> Result<Self, AcpError> {
+        let process_group_mode = configured_agent_process_group_mode()?;
+        Self::spawn_with_process_group_mode(
+            command,
+            args,
+            extra_env,
+            has_generated_codex_config,
+            forward_buzz_publisher_credentials,
+            process_group_mode,
+        )
+        .await
+    }
+
+    async fn spawn_with_process_group_mode(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        forward_buzz_publisher_credentials: bool,
+        process_group_mode: AgentProcessGroupMode,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
@@ -471,10 +719,23 @@ impl AcpClient {
             // Ensure the child is killed when the AcpClient is dropped (best-effort).
             // Callers MUST still call shutdown().await for guaranteed cleanup.
             .kill_on_drop(true);
+        // Buzz signing authority is opt-in through `extra_env`; never inherit
+        // credentials from the harness process into an arbitrary ACP child.
+        for key in [
+            "BUZZ_RELAY_URL",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_ACP_PRIVATE_KEY",
+            "BUZZ_PRIVATE_KEY_FILE",
+            "BUZZ_EXPECTED_PUBLIC_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
 
         // Per-persona env vars (e.g., GOOSE_PROVIDER, BUZZ_AGENT_PROVIDER).
         // For most keys, operator precedence wins: skip injection if already set
-        // in the parent environment.
+        // in the parent environment. Harness-bound Buzz credentials are the
+        // exception: they must match the validated relay identity even if the
+        // parent happens to carry credentials for another workspace.
         //
         // CODEX_CONFIG is handled specially via build_codex_config_env:
         //   • has_generated_codex_config=true: merge all CODEX_CONFIG entries + parent
@@ -496,12 +757,20 @@ impl AcpClient {
         // entry falls through to the standard operator-wins treatment below.
         let codex_merge_active = codex_config_value.is_some();
 
+        // This boundary controls credential inheritance only: it removes the
+        // harness signer from the child environment, but is not an OS sandbox
+        // against same-UID process or filesystem inspection.
+        if !forward_buzz_publisher_credentials {
+            cmd.env_remove("BUZZ_RELAY_URL");
+            cmd.env_remove("BUZZ_PRIVATE_KEY");
+        }
+
         // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
         for &(key, value) in crate::config::default_agent_env(command) {
-            if std::env::var_os(key).is_none() {
+            if harness_bound_agent_env(key) || std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
         }
@@ -511,7 +780,9 @@ impl AcpClient {
                 // Handled by build_codex_config_env; skip here to avoid double-setting.
                 continue;
             }
-            if std::env::var_os(key).is_none() {
+            if (forward_buzz_publisher_credentials && harness_bound_agent_env(key))
+                || (!harness_bound_agent_env(key) && std::env::var_os(key).is_none())
+            {
                 cmd.env(key, value);
             }
         }
@@ -519,11 +790,14 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
-        // Spawn the agent in its own process group so SIGKILL doesn't propagate
-        // to the harness's own process group on Unix.
-        // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
+        // Isolated groups let Buzz terminate a full agent subtree. A service
+        // manager can opt into inheritance to own hard-exit subtree cleanup.
+        // Inherited mode intentionally gives Buzz direct-child cleanup only;
+        // adapters that detach descendants must retain ownership of them.
         #[cfg(unix)]
-        cmd.process_group(0);
+        if process_group_mode == AgentProcessGroupMode::Isolated {
+            cmd.process_group(0);
+        }
 
         // Suppress the console window that Windows otherwise allocates for every
         // console-subsystem child process spawned from a GUI/non-console parent.
@@ -539,6 +813,14 @@ impl AcpClient {
             };
         let mut child = cmd.spawn()?;
 
+        #[cfg(unix)]
+        let owns_child_process_group = process_group_mode == AgentProcessGroupMode::Isolated;
+        #[cfg(not(unix))]
+        let owns_child_process_group = {
+            let _ = process_group_mode;
+            false
+        };
+
         let stdin = child
             .stdin
             .take()
@@ -550,6 +832,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            owns_child_process_group,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -562,7 +845,10 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             reply_publisher_invoked: false,
             active_run_id: None,
+            last_turn_run_id: None,
+            active_session_key: None,
             steering_supported: false,
+            image_prompt_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -624,14 +910,30 @@ impl AcpClient {
     /// arm can choose [`ACP_STEER_METHOD`] for adapters that implement it.
     /// Parsed here rather than at each call site so no caller can forget it.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
+        self.initialize_with_timeout(Self::REQUEST_TIMEOUT).await
+    }
+
+    /// Initialize with a caller-owned deadline.
+    ///
+    /// Supervisors use a longer bound for cold agent processes; probes retain
+    /// the normal request deadline through [`Self::initialize`].
+    pub async fn initialize_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
-        let result = self.send_request("initialize", params).await?;
+        let result = self
+            .send_request_with_timeout("initialize", params, timeout)
+            .await?;
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.image_prompt_supported = result
+            .pointer("/agentCapabilities/promptCapabilities/image")
+            .is_some_and(|value| value.as_bool().unwrap_or_else(|| value.is_object()));
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -796,8 +1098,31 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        self.session_prompt_blocks_with_idle_timeout_and_meta(
+            session_id,
+            prompt_blocks,
+            None,
+            &[],
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    /// Send `session/prompt`, optionally attaching a verified Buzz event as
+    /// ACP extension metadata outside the model-visible content blocks.
+    pub(crate) async fn session_prompt_blocks_with_idle_timeout_and_meta(
+        &mut self,
+        session_id: &str,
+        prompt_blocks: &[&str],
+        trusted_inbound_event: Option<&TrustedInboundEventEnvelope>,
+        inbound_images: &[serde_json::Value],
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
         let hard_deadline = tokio::time::Instant::now() + max_duration;
+        let mut params = build_prompt_params(session_id, prompt_blocks, trusted_inbound_event);
+        append_inbound_images(&mut params, inbound_images.iter().cloned());
         self.current_hard_deadline = Some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
@@ -853,6 +1178,29 @@ impl AcpClient {
         self.parse_prompt_response(session_id, &result?)
     }
 
+    /// Resolve trusted media before the cancellable prompt future begins.
+    /// `run_prompt_task` then enters its biased select with the prompt's first
+    /// poll free to establish `last_prompt_id`, preserving its control-race contract.
+    pub(crate) async fn prepare_trusted_inbound_images(
+        &self,
+        envelope: Option<&TrustedInboundEventEnvelope>,
+        rest_client: &RestClient,
+        budget: std::time::Duration,
+    ) -> Vec<serde_json::Value> {
+        if !self.image_prompt_supported {
+            return Vec::new();
+        }
+        let Some(envelope) = envelope else {
+            return Vec::new();
+        };
+        load_verified_inbound_images_with_timeout(
+            envelope,
+            rest_client,
+            budget.min(INBOUND_IMAGE_PREPARATION_TIMEOUT),
+        )
+        .await
+    }
+
     /// Send a `session/cancel` **notification** (no `id` field, no response expected).
     ///
     /// After calling this, the agent will eventually respond to the in-flight
@@ -885,6 +1233,24 @@ impl AcpClient {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn active_run_id(&self) -> Option<&str> {
         self.active_run_id.as_deref()
+    }
+
+    /// Stable backend session key observed from ACP session lineage evidence.
+    pub fn active_session_key(&self) -> Option<&str> {
+        self.active_session_key.as_deref()
+    }
+
+    /// Run ID observed during the current turn, including after active state clears.
+    pub fn turn_run_id(&self) -> Option<&str> {
+        self.active_run_id
+            .as_deref()
+            .or(self.last_turn_run_id.as_deref())
+    }
+
+    /// Reset turn-scoped evidence before issuing a new prompt.
+    pub fn begin_turn_evidence(&mut self) {
+        self.active_run_id = None;
+        self.last_turn_run_id = None;
     }
 
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
@@ -1092,7 +1458,7 @@ impl AcpClient {
         .await
         .map_err(|_| AcpError::WriteTimeout(WRITE_TIMEOUT))?
         .map_err(AcpError::Io)?;
-        self.observe("acp_write", value.clone());
+        self.observe("acp_write", observer_safe_write_payload(value));
         Ok(())
     }
 
@@ -1104,14 +1470,22 @@ impl AcpClient {
     /// Assigns the next available id, writes the NDJSON line to stdin,
     /// then calls [`read_until_response`](Self::read_until_response).
     ///
-    /// The write phase is bounded by `WRITE_TIMEOUT` (30s) and the read phase
-    /// by `REQUEST_TIMEOUT` (60s), so worst-case wall clock is ~90s. Non-prompt
-    /// RPCs like `initialize` and `session/new` should complete in seconds;
-    /// if they don't, the agent is likely stuck and we must not block forever.
+    /// The caller-owned timeout bounds the write and read phases together, so a
+    /// slow write cannot grant the response read a fresh deadline.
     async fn send_request(
         &mut self,
         method: &str,
         params: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
     ) -> Result<serde_json::Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1128,13 +1502,17 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + timeout;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
             Err(_) => return Err(AcpError::Timeout(timeout)),
         }
 
-        match tokio::time::timeout(timeout, self.read_until_response(id)).await {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AcpError::Timeout(timeout));
+        }
+        match tokio::time::timeout(remaining, self.read_until_response(id)).await {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
         }
@@ -1832,19 +2210,30 @@ impl AcpClient {
                 // on the update object itself — nested inside `update`, not
                 // alongside it at the params level. Goose and buzz-agent both
                 // emit it at `params.update._meta.goose.activeRunId`.
-                let meta = msg["params"]["update"]
-                    .get("_meta")
-                    .and_then(|m| m.get("goose"));
-                if let Some(goose_meta) = meta {
-                    match goose_meta.get("activeRunId") {
-                        Some(serde_json::Value::String(run_id)) => {
+                let update_meta = msg["params"]["update"].get("_meta");
+                if let Some(session_key) = update_meta
+                    .and_then(|meta| meta.get("sessionKey"))
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    self.active_session_key = Some(session_key.to_string());
+                }
+                let run_value = update_meta.and_then(|meta| {
+                    meta.get("activeRunId")
+                        .or_else(|| meta.get("runId"))
+                        .or_else(|| meta.get("goose").and_then(|goose| goose.get("activeRunId")))
+                });
+                if let Some(run_value) = run_value {
+                    match run_value {
+                        serde_json::Value::String(run_id) => {
                             tracing::debug!(
                                 target: "acp::update",
                                 "session_info_update: activeRunId={run_id}"
                             );
                             self.active_run_id = Some(run_id.clone());
+                            self.last_turn_run_id = Some(run_id.clone());
                         }
-                        Some(serde_json::Value::Null) => {
+                        serde_json::Value::Null => {
                             tracing::debug!(
                                 target: "acp::update",
                                 "session_info_update: activeRunId cleared"
@@ -2071,15 +2460,105 @@ fn reply_publisher_named(update: &serde_json::Value) -> bool {
 }
 
 /// Build `session/prompt` params from one or more text content blocks.
-fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
+fn build_prompt_params(
+    session_id: &str,
+    prompt_blocks: &[&str],
+    trusted_inbound_event: Option<&TrustedInboundEventEnvelope>,
+) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = prompt_blocks
         .iter()
         .map(|text| serde_json::json!({ "type": "text", "text": text }))
         .collect();
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "sessionId": session_id,
         "prompt": blocks,
-    })
+    });
+    if let Some(envelope) = trusted_inbound_event {
+        params["_meta"] = serde_json::json!({
+            TRUSTED_INBOUND_EVENT_META_NAMESPACE: {
+                TRUSTED_INBOUND_EVENT_META_FIELD: envelope,
+            },
+        });
+    }
+    params
+}
+
+async fn load_inbound_image(
+    descriptor: InboundImageDescriptor,
+    rest_client: &RestClient,
+) -> Result<serde_json::Value, &'static str> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let bytes = rest_client
+        .fetch_blossom_image(&descriptor.url, &descriptor.mime_type, descriptor.size)
+        .await
+        .map_err(|_| "fetch_failed")?;
+    if bytes.len() as u64 != descriptor.size {
+        return Err("size_mismatch");
+    }
+    if hex::encode(Sha256::digest(&bytes)) != descriptor.sha256 {
+        return Err("hash_mismatch");
+    }
+    Ok(serde_json::json!({
+        "type": "image",
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        "mimeType": descriptor.mime_type,
+    }))
+}
+
+async fn load_verified_inbound_images(
+    envelope: &TrustedInboundEventEnvelope,
+    rest_client: &RestClient,
+) -> Vec<serde_json::Value> {
+    let mut images = Vec::new();
+    for descriptor in envelope.inbound_images() {
+        match descriptor {
+            Ok(descriptor) => match load_inbound_image(descriptor, rest_client).await {
+                Ok(image) => images.push(image),
+                Err(reason) => tracing::warn!(
+                    event_id = envelope.event_id,
+                    refusal_code = reason,
+                    "trusted inbound image refused"
+                ),
+            },
+            Err(reason) => tracing::warn!(
+                event_id = envelope.event_id,
+                refusal_code = reason,
+                "trusted inbound image refused"
+            ),
+        }
+    }
+    images
+}
+
+fn append_inbound_images(
+    params: &mut serde_json::Value,
+    images: impl IntoIterator<Item = serde_json::Value>,
+) {
+    if let Some(prompt) = params
+        .get_mut("prompt")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        prompt.extend(images);
+    }
+}
+
+async fn load_verified_inbound_images_with_timeout(
+    envelope: &TrustedInboundEventEnvelope,
+    rest_client: &RestClient,
+    timeout: std::time::Duration,
+) -> Vec<serde_json::Value> {
+    match tokio::time::timeout(timeout, load_verified_inbound_images(envelope, rest_client)).await {
+        Ok(images) => images,
+        Err(_) => {
+            tracing::warn!(
+                event_id = envelope.event_id,
+                "trusted inbound image preparation timed out; delivering text only"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Build `_goose/unstable/session/steer` params from one or more text
@@ -2329,12 +2808,7 @@ impl Drop for AcpClient {
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
         // Kill the process group when possible so subprocesses don't leak.
         // Callers SHOULD still call `shutdown().await` for guaranteed reaping.
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
-        }
+        self.signal_agent_processes();
         // Non-blocking reap attempt — prevents zombie accumulation in the
         // common case where SIGKILL takes effect before Drop returns.
         let _ = self.child.try_wait();
@@ -2343,25 +2817,24 @@ impl Drop for AcpClient {
 
 /// Send SIGKILL to an entire process group. Returns `true` if the signal was sent.
 ///
-/// The child is spawned with `process_group(0)`, so its PID equals its PGID.
-/// Killing the group ensures subprocesses (MCP servers, tool processes) are
-/// cleaned up rather than orphaned to init on repeated crash-recovery cycles.
+/// Isolated children are spawned with `process_group(0)`, so the live child's
+/// PID is also its PGID. The caller must not retain that number after reaping,
+/// when the operating system may reuse it for an unrelated process group.
 ///
 /// Uses `nix::sys::signal::killpg` — a safe wrapper around the POSIX `killpg`
 /// syscall — so the crate's `#![deny(unsafe_code)]` policy is preserved.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) -> bool {
+fn kill_process_group(process_group_id: u32) -> bool {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
-    // pid == pgid because the child was spawned with process_group(0).
-    killpg(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok()
+    killpg(Pid::from_raw(process_group_id as i32), Signal::SIGKILL).is_ok()
 }
 
 /// Fallback for non-Unix: process-group kill not available.
 /// Returns `false` so the caller falls back to `child.start_kill()`.
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) -> bool {
+fn kill_process_group(_process_group_id: u32) -> bool {
     false
 }
 
@@ -2383,19 +2856,280 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reply_publisher_matcher_accepts_only_aspect_reply_tools() {
-        assert!(reply_publisher_named(&serde_json::json!({
-            "title": "Call buzz_mechanon_reply"
-        })));
-        assert!(reply_publisher_named(&serde_json::json!({
-            "_meta": {"toolName": "buzz_sapientis_reply"}
-        })));
-        assert!(!reply_publisher_named(&serde_json::json!({
-            "title": "buzz_mechanon_react"
-        })));
-        assert!(!reply_publisher_named(&serde_json::json!({
-            "title": "shell"
-        })));
+    fn agent_process_group_mode_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_agent_process_group_mode(None).unwrap(),
+            AgentProcessGroupMode::Isolated
+        );
+        assert_eq!(
+            parse_agent_process_group_mode(Some(" ")).unwrap(),
+            AgentProcessGroupMode::Isolated
+        );
+        assert_eq!(
+            parse_agent_process_group_mode(Some("isolated")).unwrap(),
+            AgentProcessGroupMode::Isolated
+        );
+        assert_eq!(
+            parse_agent_process_group_mode(Some(" inherit ")).unwrap(),
+            AgentProcessGroupMode::Inherit
+        );
+        assert!(parse_agent_process_group_mode(Some("launchd")).is_err());
+    }
+
+    #[cfg(unix)]
+    fn unix_process_exists(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn unix_process_group(pid: u32) -> u32 {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to inspect process group");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("process group output should be UTF-8")
+            .trim()
+            .parse::<u32>()
+            .expect("process group should be numeric")
+    }
+
+    #[cfg(unix)]
+    async fn spawn_descendant_fixture(
+        keep_launcher_alive: bool,
+    ) -> (AcpClient, std::path::PathBuf, u32) {
+        let pid_path = std::env::temp_dir().join(format!(
+            "buzz-acp-descendant-{}-{}.pid",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = if keep_launcher_alive {
+            r#"trap 'exit 0' TERM
+sh -c 'trap "" HUP TERM; exec sleep 60' </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > "$1"
+while :; do sleep 1; done"#
+        } else {
+            r#"sh -c 'trap "" HUP TERM; exec sleep 60' </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!" > "$1""#
+        };
+        let args = vec![
+            "-c".to_string(),
+            script.to_string(),
+            "buzz-acp-process-group-fixture".to_string(),
+            pid_path.to_string_lossy().into_owned(),
+        ];
+        let client = AcpClient::spawn_with_process_group_mode(
+            "/bin/bash",
+            &args,
+            &[],
+            false,
+            false,
+            AgentProcessGroupMode::Isolated,
+        )
+        .await
+        .expect("failed to spawn process-group fixture");
+
+        for _ in 0..100 {
+            if let Ok(raw_pid) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = raw_pid.trim().parse::<u32>() {
+                    return (client, pid_path, pid);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("fixture did not publish descendant pid");
+    }
+
+    #[cfg(unix)]
+    async fn assert_descendant_reaped(pid_path: &std::path::Path, descendant_pid: u32) {
+        for _ in 0..80 {
+            if !unix_process_exists(descendant_pid) {
+                std::fs::remove_file(pid_path).ok();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        std::fs::remove_file(pid_path).ok();
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &descendant_pid.to_string()])
+            .status();
+        panic!("shutdown left descendant {descendant_pid} running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherit_mode_keeps_the_supervisor_process_group() {
+        let mut client = AcpClient::spawn_with_process_group_mode(
+            "/bin/cat",
+            &[],
+            &[],
+            false,
+            false,
+            AgentProcessGroupMode::Inherit,
+        )
+        .await
+        .expect("failed to spawn inherited process-group fixture");
+        let child_pid = client.child.id().expect("fixture child should be running");
+
+        assert!(!client.owns_child_process_group);
+        assert_eq!(
+            unix_process_group(child_pid),
+            unix_process_group(std::process::id())
+        );
+        client.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_reaps_group_after_immediate_or_sigterm_launcher_exit() {
+        for signal_launcher in [false, true] {
+            let (mut client, pid_path, descendant_pid) =
+                spawn_descendant_fixture(signal_launcher).await;
+            if signal_launcher {
+                let launcher_pid = client
+                    .child
+                    .id()
+                    .expect("fixture launcher should be running");
+                let signal_status = std::process::Command::new("/bin/kill")
+                    .args(["-TERM", &launcher_pid.to_string()])
+                    .status()
+                    .expect("failed to signal fixture launcher");
+                assert!(signal_status.success());
+            }
+            let launcher_stdout =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.reader.next())
+                    .await
+                    .expect("fixture launcher did not exit");
+
+            assert!(launcher_stdout.is_none());
+            let launcher_pid = client
+                .child
+                .id()
+                .expect("unreaped launcher should retain its process identity");
+            assert!(client.owns_child_process_group);
+            assert_eq!(launcher_pid, unix_process_group(descendant_pid),);
+            assert!(unix_process_exists(descendant_pid));
+
+            client.shutdown().await;
+            assert_descendant_reaped(&pid_path, descendant_pid).await;
+        }
+    }
+
+    #[test]
+    fn harness_buzz_credentials_override_parent_environment() {
+        assert!(harness_bound_agent_env("BUZZ_RELAY_URL"));
+        assert!(harness_bound_agent_env("BUZZ_PRIVATE_KEY"));
+        assert!(!harness_bound_agent_env("GOOSE_PROVIDER"));
+        assert!(!harness_bound_agent_env("CODEX_CONFIG"));
+    }
+
+    #[tokio::test]
+    async fn isolated_child_cannot_read_explicit_publisher_credentials() {
+        let script = r#"
+            if test -n "$BUZZ_RELAY_URL" || test -n "$BUZZ_PRIVATE_KEY"; then
+                exit 23
+            fi
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+        "#;
+        let publisher_env = vec![
+            (
+                "BUZZ_RELAY_URL".to_string(),
+                "ws://relay.invalid".to_string(),
+            ),
+            ("BUZZ_PRIVATE_KEY".to_string(), "secret".to_string()),
+        ];
+        let mut client = AcpClient::spawn(
+            "bash",
+            &["-c".to_string(), script.to_string()],
+            &publisher_env,
+            false,
+            false,
+        )
+        .await
+        .expect("spawn isolated child");
+
+        client
+            .initialize()
+            .await
+            .expect("child initializes only when publisher credentials are absent");
+    }
+
+    fn signed_batch(
+        channel_id: uuid::Uuid,
+        extra_tags: Vec<nostr::Tag>,
+    ) -> crate::queue::FlushBatch {
+        let keys = nostr::Keys::generate();
+        let mut tags =
+            vec![nostr::Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag")];
+        tags.extend(extra_tags);
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hello")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        crate::queue::FlushBatch {
+            channel_id,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    fn image_tag(url: &str, mime_type: &str, sha256: &str, size: u64) -> nostr::Tag {
+        nostr::Tag::parse([
+            "imeta".to_owned(),
+            format!("url {url}"),
+            format!("m {mime_type}"),
+            format!("x {sha256}"),
+            format!("size {size}"),
+        ])
+        .expect("valid imeta test tag")
+    }
+
+    async fn media_fixture(
+        body: Vec<u8>,
+        mime_type: &'static str,
+    ) -> (RestClient, String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind media fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture address"));
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept media request");
+            let mut request = vec![0; 16 * 1024];
+            let read = stream.read(&mut request).await.expect("read media request");
+            request.truncate(read);
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {mime_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write media headers");
+            stream.write_all(&body).await.expect("write media body");
+        });
+        let client = RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.clone(),
+            keys: nostr::Keys::generate(),
+            auth_tag_json: Some(r#"["auth","delegation"]"#.into()),
+        };
+        (client, base_url, request_rx)
     }
 
     #[test]
@@ -2631,6 +3365,7 @@ mod tests {
                 "/goal ship it",
                 "[Buzz event: @mention]\nContent: @Eva /goal ship it",
             ],
+            None,
         );
         let prompt = params["prompt"].as_array().unwrap();
         assert_eq!(prompt.len(), 2);
@@ -2638,6 +3373,293 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    #[test]
+    fn trusted_inbound_event_is_verified_and_stays_out_of_prompt_blocks() {
+        let channel_id = uuid::Uuid::new_v4();
+        let p_tag = nostr::Tag::parse(["p", "ab".repeat(32).as_str()]).expect("p tag");
+        let batch = signed_batch(channel_id, vec![p_tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("valid signed single event");
+        let params = build_prompt_params("session", &["model-visible body"], Some(&envelope));
+
+        assert_eq!(params["prompt"][0]["text"], "model-visible body");
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            params["_meta"].as_object().map(|value| value.len()),
+            Some(1)
+        );
+        assert_eq!(
+            params["_meta"][TRUSTED_INBOUND_EVENT_META_NAMESPACE]
+                .as_object()
+                .map(|value| value.len()),
+            Some(1)
+        );
+        let metadata = &params["_meta"][TRUSTED_INBOUND_EVENT_META_NAMESPACE]
+            [TRUSTED_INBOUND_EVENT_META_FIELD];
+        assert_eq!(metadata["schemaVersion"], 1);
+        assert_eq!(metadata["eventId"], batch.events[0].event.id.to_hex());
+        assert_eq!(
+            metadata["authorPubkey"],
+            batch.events[0].event.pubkey.to_hex()
+        );
+        assert_eq!(metadata["kind"], 9);
+        assert_eq!(metadata["channelId"], channel_id.to_string());
+        assert_eq!(
+            metadata["tags"],
+            serde_json::json!([["h", channel_id.to_string()], ["p", "ab".repeat(32)],])
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_image_appends_acp_block_without_changing_text_or_meta() {
+        use sha2::{Digest, Sha256};
+
+        let body = b"\x89PNG\r\n\x1a\ntrusted-image".to_vec();
+        let sha256 = hex::encode(Sha256::digest(&body));
+        let (client, base_url, request_rx) = media_fixture(body.clone(), "image/png").await;
+        let channel_id = uuid::Uuid::new_v4();
+        let tag = image_tag(
+            &format!("{base_url}/media/{sha256}.png"),
+            "image/png",
+            &sha256,
+            body.len() as u64,
+        );
+        let batch = signed_batch(channel_id, vec![tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let mut params = build_prompt_params(
+            "session",
+            &["exact first block", "exact second block"],
+            Some(&envelope),
+        );
+        let original_meta = params["_meta"].clone();
+
+        let images = load_verified_inbound_images(&envelope, &client).await;
+        append_inbound_images(&mut params, images);
+
+        assert_eq!(params["prompt"][0]["text"], "exact first block");
+        assert_eq!(params["prompt"][1]["text"], "exact second block");
+        assert_eq!(params["_meta"], original_meta);
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(3));
+        assert_eq!(params["prompt"][2]["type"], "image");
+        assert_eq!(params["prompt"][2]["mimeType"], "image/png");
+        assert_eq!(
+            params["prompt"][2]["data"],
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body)
+        );
+        let request = request_rx.await.expect("captured media request");
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: nostr "));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("x-auth-tag: [\"auth\",\"delegation\"]"));
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_image_hash_mismatch_is_omitted() {
+        let body = b"not-the-declared-image".to_vec();
+        let declared_sha = "0".repeat(64);
+        let (client, base_url, request_rx) = media_fixture(body.clone(), "image/jpeg").await;
+        let channel_id = uuid::Uuid::new_v4();
+        let tag = image_tag(
+            &format!("{base_url}/media/{declared_sha}.jpg"),
+            "image/jpeg",
+            &declared_sha,
+            body.len() as u64,
+        );
+        let batch = signed_batch(channel_id, vec![tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let mut params = build_prompt_params("session", &["unchanged"], Some(&envelope));
+        let original_meta = params["_meta"].clone();
+
+        let images = load_verified_inbound_images(&envelope, &client).await;
+        append_inbound_images(&mut params, images);
+
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
+        assert_eq!(params["prompt"][0]["text"], "unchanged");
+        assert_eq!(params["_meta"], original_meta);
+        request_rx.await.expect("hash mismatch still fetches once");
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_image_timeout_preserves_text_only_prompt() {
+        use sha2::{Digest, Sha256};
+
+        let body = b"slow-image".to_vec();
+        let sha256 = hex::encode(Sha256::digest(&body));
+        let (client, base_url, _request_rx) = media_fixture(body.clone(), "image/png").await;
+        let channel_id = uuid::Uuid::new_v4();
+        let tag = image_tag(
+            &format!("{base_url}/media/{sha256}.png"),
+            "image/png",
+            &sha256,
+            body.len() as u64,
+        );
+        let batch = signed_batch(channel_id, vec![tag]);
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let mut params = build_prompt_params("session", &["deliver this text"], Some(&envelope));
+        let original_meta = params["_meta"].clone();
+
+        let images = load_verified_inbound_images_with_timeout(
+            &envelope,
+            &client,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        append_inbound_images(&mut params, images);
+
+        assert_eq!(params["prompt"].as_array().map(Vec::len), Some(1));
+        assert_eq!(params["prompt"][0]["text"], "deliver this text");
+        assert_eq!(params["_meta"], original_meta);
+    }
+
+    #[test]
+    fn inbound_image_rejects_oversize_and_unsupported_mime() {
+        let sha256 = "a".repeat(64);
+        let oversize = vec![
+            "imeta".into(),
+            "url https://relay.example/media/blob.png".into(),
+            "m image/png".into(),
+            format!("x {sha256}"),
+            format!("size {}", MAX_INBOUND_IMAGE_BYTES + 1),
+        ];
+        assert_eq!(parse_inbound_image_tag(&oversize), Err("oversize"));
+
+        let unsupported = vec![
+            "imeta".into(),
+            "url https://relay.example/media/blob.svg".into(),
+            "m image/svg+xml".into(),
+            format!("x {sha256}"),
+            "size 10".into(),
+        ];
+        assert_eq!(
+            parse_inbound_image_tag(&unsupported),
+            Err("unsupported_mime")
+        );
+    }
+
+    #[test]
+    fn inbound_images_enforce_one_aggregate_budget() {
+        let channel_id = uuid::Uuid::new_v4();
+        let sha256 = "a".repeat(64);
+        let each_size = (MAX_INBOUND_IMAGE_TOTAL_BYTES / 2) + 1;
+        let batch = signed_batch(
+            channel_id,
+            vec![
+                image_tag(
+                    "https://relay.example/media/first.png",
+                    "image/png",
+                    &sha256,
+                    each_size,
+                ),
+                image_tag(
+                    "https://relay.example/media/second.png",
+                    "image/png",
+                    &sha256,
+                    each_size,
+                ),
+            ],
+        );
+        let envelope = TrustedInboundEventEnvelope::from_prompt_batch(Some(&batch))
+            .expect("verified triggering event");
+        let images = envelope.inbound_images();
+
+        assert!(images[0].is_ok());
+        assert_eq!(images[1], Err("aggregate_oversize"));
+    }
+
+    #[test]
+    fn trusted_inbound_event_fails_closed_for_tampering_or_ambiguous_room() {
+        let channel_id = uuid::Uuid::new_v4();
+        let mut tampered = signed_batch(channel_id, vec![]);
+        let mut raw = serde_json::to_value(&tampered.events[0].event).expect("serialize");
+        raw["content"] = serde_json::Value::String("tampered".into());
+        tampered.events[0].event = serde_json::from_value(raw).expect("parse tampered event");
+        assert!(TrustedInboundEventEnvelope::from_prompt_batch(Some(&tampered)).is_none());
+        assert_eq!(
+            TrustedInboundEventEnvelope::try_from_prompt_batch(Some(&tampered)).err(),
+            Some("invalid_signature")
+        );
+
+        let second_h = nostr::Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag");
+        let duplicate_room = signed_batch(channel_id, vec![second_h]);
+        assert!(TrustedInboundEventEnvelope::from_prompt_batch(Some(&duplicate_room)).is_none());
+
+        let other_channel = uuid::Uuid::new_v4();
+        let wrong_h =
+            nostr::Tag::parse(["h", other_channel.to_string().as_str()]).expect("wrong h tag");
+        let mut wrong_room = signed_batch(channel_id, vec![]);
+        wrong_room.events[0].event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "hello")
+            .tags([wrong_h])
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("signed wrong-room event");
+        assert!(TrustedInboundEventEnvelope::from_prompt_batch(Some(&wrong_room)).is_none());
+
+        let mut multi = signed_batch(channel_id, vec![]);
+        multi.events.push(multi.events[0].clone());
+        assert!(TrustedInboundEventEnvelope::from_prompt_batch(Some(&multi)).is_none());
+        assert_eq!(
+            TrustedInboundEventEnvelope::try_from_prompt_batch(Some(&multi)).err(),
+            Some("ambiguous_event_count")
+        );
+
+        let mut cancelled = signed_batch(channel_id, vec![]);
+        cancelled.cancelled_events.push(cancelled.events[0].clone());
+        assert!(TrustedInboundEventEnvelope::from_prompt_batch(Some(&cancelled)).is_none());
+        assert_eq!(
+            TrustedInboundEventEnvelope::try_from_prompt_batch(Some(&cancelled)).err(),
+            Some("cancelled_events_present")
+        );
+
+        // Queue fallback re-dispatches cancelled events in the regular event
+        // slot while preserving the cancellation reason. That shape must not
+        // regain trusted inbound authority merely because cancelled_events is
+        // empty after the move.
+        let mut cancelled_fallback = signed_batch(channel_id, vec![]);
+        cancelled_fallback.cancel_reason = Some(crate::queue::CancelReason::Steer);
+        assert!(
+            TrustedInboundEventEnvelope::from_prompt_batch(Some(&cancelled_fallback)).is_none()
+        );
+        assert_eq!(
+            TrustedInboundEventEnvelope::try_from_prompt_batch(Some(&cancelled_fallback)).err(),
+            Some("cancelled_batch")
+        );
+
+        assert!(TrustedInboundEventEnvelope::from_prompt_batch(None).is_none());
+    }
+
+    #[test]
+    fn ordinary_prompt_params_have_no_trusted_metadata() {
+        let params = build_prompt_params("session", &["hello"], None);
+        assert!(params.get("_meta").is_none());
+    }
+
+    #[test]
+    fn observer_payload_redacts_image_bytes_without_changing_wire_value() {
+        let wire = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "session",
+                "prompt": [
+                    {"type": "text", "text": "keep me"},
+                    {"type": "image", "data": "large-base64", "mimeType": "image/png"}
+                ]
+            }
+        });
+
+        let observed = observer_safe_write_payload(&wire);
+
+        assert_eq!(wire["params"]["prompt"][1]["data"], "large-base64");
+        assert_eq!(observed["params"]["prompt"][0]["text"], "keep me");
+        assert_eq!(observed["params"]["prompt"][1]["data"], "[redacted]");
+        assert_eq!(observed["params"]["prompt"][1]["mimeType"], "image/png");
     }
 
     #[test]
@@ -3069,8 +4091,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reply_publisher_matcher_accepts_only_aspect_reply_tools() {
+        assert!(reply_publisher_named(&serde_json::json!({
+            "title": "Call buzz_mechanon_reply"
+        })));
+        assert!(reply_publisher_named(&serde_json::json!({
+            "_meta": {"toolName": "buzz_sapientis_reply"}
+        })));
+        assert!(!reply_publisher_named(&serde_json::json!({
+            "title": "buzz_mechanon_react"
+        })));
+        assert!(!reply_publisher_named(&serde_json::json!({
+            "title": "shell"
+        })));
+    }
+
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false, true)
             .await
             .expect("failed to spawn test script")
     }
@@ -3093,10 +4131,29 @@ mod tests {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake adapter");
-        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false)
+        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false, false)
             .await
             .expect("spawn named fake adapter");
         (client, dir)
+    }
+
+    #[tokio::test]
+    async fn initialize_with_timeout_honors_supervisor_owned_deadline() {
+        let script = r#"
+            read -t 2 _init
+            sleep 1
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+        "#;
+        let mut client = spawn_script(script).await;
+        let timeout = std::time::Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let error = client
+            .initialize_with_timeout(timeout)
+            .await
+            .expect_err("slow cold-start probe must honor its caller deadline");
+        assert!(matches!(error, AcpError::Timeout(value) if value == timeout));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        client.shutdown().await;
     }
 
     /// Spawn a probe script whose file name carries a runtime identity (e.g.
@@ -3127,6 +4184,7 @@ mod tests {
             &[],
             extra_env,
             false,
+            true,
         )
         .await
         .expect("spawn env probe script");
@@ -3763,7 +4821,7 @@ mod tests {
     /// which is fine — these tests don't read from the agent, they just
     /// feed JSON into the parser.
     async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[], false)
+        AcpClient::spawn("cat", &[], &[], false, true)
             .await
             .expect("spawn cat as inert client")
     }
@@ -3821,6 +4879,37 @@ mod tests {
             client.active_run_id().is_none(),
             "explicit null must clear active_run_id"
         );
+        assert_eq!(
+            client.turn_run_id(),
+            Some("run-xyz"),
+            "turn evidence must retain the completed run id"
+        );
+    }
+
+    #[tokio::test]
+    async fn openclaw_session_lineage_and_flat_run_id_are_captured() {
+        let mut client = spawn_inert_client().await;
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "acp-session",
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "sessionKey": "agent:main:buzz-private",
+                        "runId": "gateway-run-42"
+                    }
+                }
+            }
+        });
+        let _ = client.handle_session_update(&msg);
+        assert_eq!(client.active_session_key(), Some("agent:main:buzz-private"));
+        assert_eq!(client.turn_run_id(), Some("gateway-run-42"));
+
+        client.begin_turn_evidence();
+        assert_eq!(client.active_session_key(), Some("agent:main:buzz-private"));
+        assert!(client.turn_run_id().is_none());
     }
 
     #[tokio::test]
@@ -4164,6 +5253,50 @@ mod tests {
             .await
             .expect("initialize should succeed");
         client.steering_supported()
+    }
+
+    async fn image_prompt_supported_after_initialize(init_result: &str) -> bool {
+        let script = format!(
+            "read -r _init; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{result}}}'; \
+             sleep 5",
+            result = init_result,
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.image_prompt_supported
+    }
+
+    #[tokio::test]
+    async fn initialize_records_image_prompt_capability() {
+        let supported = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{"promptCapabilities":{"image":{}}}}"#,
+        )
+        .await;
+        assert!(supported);
+
+        let legacy_boolean = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"image":true}}}"#,
+        )
+        .await;
+        assert!(legacy_boolean);
+    }
+
+    #[tokio::test]
+    async fn initialize_keeps_image_blocks_off_for_unsupported_adapters() {
+        let supported = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{"promptCapabilities":{"image":false}}}"#,
+        )
+        .await;
+        assert!(!supported);
+
+        let absent = image_prompt_supported_after_initialize(
+            r#"{"protocolVersion":2,"agentCapabilities":{}}"#,
+        )
+        .await;
+        assert!(!absent);
     }
 
     /// Test 1a: an adapter advertising `_meta.steering.supported: true`

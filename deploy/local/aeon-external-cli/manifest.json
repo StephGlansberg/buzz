@@ -1,0 +1,98 @@
+{
+  "schema": "aeon_buzz_external_cli_worker_v1",
+  "enabled": true,
+  "identityMap": "/Volumes/AEON/aeon-vault/aeon-v6-workspace/contracts/buzz/identity-map.json",
+  "worker": {
+    "principal": "codex_cli",
+    "displayName": "Codex CLI",
+    "label": "org.aeon.buzz-acp.codex-cli",
+    "agents": 1
+  },
+  "buzz": {
+    "relayUrl": "wss://architects-mac-mini.tail757661.ts.net",
+    "owner": "architect",
+    "allowedInbound": [
+      "architect",
+      "nexus",
+      "mechanon",
+      "fontis",
+      "sapientis",
+      "viatica",
+      "voxis"
+    ],
+    "sharedRooms": ["ops", "concilium"],
+    "officeRooms": [
+      "aspect_nexus",
+      "aspect_mechanon",
+      "aspect_fontis",
+      "aspect_sapientis",
+      "aspect_viatica",
+      "aspect_voxis"
+    ],
+    "privateRooms": ["seat_codex_cli"]
+  },
+  "runtime": {
+    "buzzAcpBinary": "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp",
+    "buzzAcpSha256": "02a1750186261cf2ab1e71b6c249ea4120fb4e9e1b8e9ffc9006f25be86a9ae4",
+    "configPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/codex-cli.toml",
+    "logDir": "/Users/architect/Library/Application Support/AEON/aeon-v6/logs",
+    "signerPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/secrets/codex-cli.sk",
+    "systemPromptPath": "/Users/architect/Library/Application Support/AEON/aeon-v6/buzz/codex-cli-system.md",
+    "systemPromptSha256": "2550a52277573b359c5956cff1dcbab9c62eb391ed66d83ebc47fb6976b49bf5",
+    "supervisorWorkingDirectory": "/Users/architect/Library/Application Support/AEON/aeon-v6",
+    "sessionCwd": "/Volumes/AEON/tmp/aeon-worktrees/buzz-seat-codex-cli",
+    "launchAgentPath": "/Users/architect/Library/LaunchAgents/org.aeon.buzz-acp.codex-cli.plist",
+    "codexAcp": {
+      "package": "@agentclientprotocol/codex-acp",
+      "version": "1.1.7",
+      "integrity": "sha512-bhFLbGtOMEw6+PAp33vNERb6dXlULOfV3mWbRdps4v7sY7PHha/C2T1dnlG0yVcvBu9W+NYPzL0CAupnVoFTiQ==",
+      "entrypointSha256": "0deb6b820dfed8804cd76b16a50210fe12202e5e339b5edaa23f6987f1742e0a",
+      "binary": "/Users/architect/Library/Application Support/AEON/aeon-v6/codex-acp/1.1.7/node_modules/.bin/codex-acp",
+      "model": "gpt-5.6-sol[medium]"
+    },
+    "codexHome": "/Users/architect/Library/Application Support/AEON/aeon-v6/codex-home",
+    "initialAgentMode": "agent-full-access",
+    "path": [
+      "/Users/architect/.nvm/versions/node/v24.1.0/bin",
+      "/Users/architect/Library/Application Support/AEON/aeon-v6/codex-acp/1.1.7/node_modules/.bin",
+      "/Volumes/AEON/Projects/buzz/target/release",
+      "/Volumes/AEON/runtime/aeon-v6-state/service-runtime/current/bin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin"
+    ]
+  },
+  "workspaces": {
+    "default": "aeon-v6",
+    "allowed": {
+      "aeon-v6": "/Volumes/AEON/Projects/aeon-v6",
+      "buzz": "/Volumes/AEON/Projects/buzz",
+      "codex": "/Volumes/AEON/Projects/codex"
+    }
+  },
+  "posture": {
+    "subscribe": "config",
+    "respondTo": "strict-allowlist",
+    "allowedRespondTo": ["strict-allowlist"],
+    "dedup": "queue",
+    "multipleEventHandling": "queue",
+    "presence": true,
+    "typing": true,
+    "memory": true,
+    "basePrompt": true,
+    "relayObserver": true,
+    "permissionMode": "default",
+    "heartbeatIntervalSecs": 0,
+    "turnLivenessSecs": 10,
+    "idleTimeoutSecs": 900,
+    "maxTurnDurationSecs": 7200,
+    "contextMessageLimit": 24,
+    "maxTurnsPerSession": 0
+  },
+  "supervisor": {
+    "runAtLoad": true,
+    "keepAlive": true,
+    "throttleSeconds": 300
+  }
+}
