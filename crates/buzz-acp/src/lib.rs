@@ -3720,12 +3720,14 @@ async fn tokio_main() -> Result<()> {
                                     // to the universal cancel+merge `Steer`
                                     // signal so the event still reaches the
                                     // agent.
-                                    // A reply-required event must become part of a
-                                    // normal batch so terminal readback can prove
-                                    // its direct origin reply. Native steer has no
-                                    // independent terminal boundary.
-                                    let native_attempted = !requires_reply
-                                        && matches!(signal, ControlSignal::Steer)
+                                    // Contracted events must become normal
+                                    // one-source batches. Native steer has no
+                                    // independent envelope/reply/terminal boundary.
+                                    let native_attempted = native_steer_is_eligible(
+                                        requires_reply,
+                                        config.trusted_inbound_envelope,
+                                        &signal,
+                                    )
                                         && try_native_steer(
                                             &mut pool,
                                             &mut queue,
@@ -4480,6 +4482,16 @@ fn mode_gate_signal(
     }
 }
 
+/// Native steer is only an optimization for uncontracted events. Trusted
+/// inbound metadata and origin-reply proof both require a distinct ACP turn.
+fn native_steer_is_eligible(
+    requires_reply: bool,
+    trusted_inbound_envelope: bool,
+    signal: &ControlSignal,
+) -> bool {
+    !requires_reply && !trusted_inbound_envelope && matches!(signal, ControlSignal::Steer)
+}
+
 /// Send a control signal to the in-flight task for `channel_id`.
 /// Returns `true` if a signal was sent, `false` if no in-flight task was found.
 fn signal_in_flight_task(
@@ -4626,7 +4638,16 @@ fn dispatch_pending(
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     loop {
-        let batch = match queue.flush_next() {
+        let replay_state = ctx
+            .replay_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let batch = queue.flush_next_with_single_event_contract(|channel_id, event| {
+            ctx.trusted_inbound_envelope
+                || replay_state.requires_reply(channel_id, &event.id.to_hex())
+        });
+        drop(replay_state);
+        let batch = match batch {
             Some(b) => b,
             None => break,
         };
@@ -6440,6 +6461,30 @@ mod owner_control_command_tests {
             mode_gate_signal(MultipleEventHandling::OwnerInterrupt, &owner, None).is_none(),
             "owner-interrupt must not fire when the owner is unknown"
         );
+    }
+
+    #[test]
+    fn native_steer_never_bypasses_a_contracted_turn() {
+        assert!(native_steer_is_eligible(
+            false,
+            false,
+            &ControlSignal::Steer
+        ));
+        assert!(!native_steer_is_eligible(
+            true,
+            false,
+            &ControlSignal::Steer
+        ));
+        assert!(!native_steer_is_eligible(
+            false,
+            true,
+            &ControlSignal::Steer
+        ));
+        assert!(!native_steer_is_eligible(
+            false,
+            false,
+            &ControlSignal::Interrupt
+        ));
     }
 
     #[tokio::test]

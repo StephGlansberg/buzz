@@ -8521,6 +8521,155 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     }
 
     #[test]
+    fn reply_required_restart_serializes_envelope_reply_and_terminal_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-contract-restart-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("replay.json");
+        let channel_id = Uuid::new_v4();
+        let source_keys = Keys::generate();
+        let channel = channel_id.to_string();
+        let make_source = |issue: &str, created_at: u64| {
+            EventBuilder::new(Kind::Custom(9), format!("please handle {issue}"))
+                .custom_created_at(Timestamp::from(created_at))
+                .tags([Tag::parse(["h", channel.as_str()]).unwrap()])
+                .sign_with_keys(&source_keys)
+                .unwrap()
+        };
+        let first_source = make_source("AEO-401", 1_000);
+        let second_source = make_source("AEO-402", 2_000);
+
+        let mut initial = crate::replay_state::ReplayState::load(state_path.clone()).unwrap();
+        for source in [&first_source, &second_source] {
+            assert!(initial
+                .record_open(
+                    channel_id,
+                    source.id.to_hex(),
+                    source.created_at.as_secs(),
+                    source.created_at.as_secs(),
+                    true,
+                )
+                .unwrap());
+        }
+        drop(initial);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.max_turn_duration = Duration::from_secs(120);
+        ctx.trusted_inbound_envelope = true;
+        ctx.replay_state = Arc::new(Mutex::new(
+            crate::replay_state::ReplayState::load(state_path).unwrap(),
+        ));
+
+        // Relay replay is deliberately queued newest-first. The durable
+        // contract must still dispatch two distinct one-source turns without
+        // trusting sender timestamps as a scheduling authority.
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        for source in [&second_source, &first_source] {
+            queue.push(crate::queue::QueuedEvent {
+                channel_id,
+                event: source.clone(),
+                received_at: std::time::Instant::now(),
+                prompt_tag: "requires-reply".into(),
+            });
+        }
+
+        for (index, expected) in [&second_source, &first_source].iter().enumerate() {
+            let replay_state = ctx.replay_state.lock().unwrap();
+            let mut batch = queue
+                .flush_next_with_single_event_contract(|channel_id, event| {
+                    replay_state.requires_reply(channel_id, &event.id.to_hex())
+                })
+                .expect("open replay source must flush");
+            drop(replay_state);
+
+            if index == 0 {
+                // Simulate an interrupted first attempt after restart while the
+                // second source is already queued. The retry must remain one
+                // exact source rather than merge into the second request.
+                queue.requeue_as_cancelled(batch, CancelReason::Steer);
+                queue.mark_complete(channel_id);
+                let replay_state = ctx.replay_state.lock().unwrap();
+                batch = queue
+                    .flush_next_with_single_event_contract(|channel_id, event| {
+                        replay_state.requires_reply(channel_id, &event.id.to_hex())
+                    })
+                    .expect("cancelled open source must retry");
+                drop(replay_state);
+                assert_eq!(batch.cancel_reason, Some(CancelReason::Steer));
+            }
+
+            assert_eq!(batch.events.len(), 1);
+            assert!(batch.cancelled_events.is_empty());
+            assert_eq!(batch.events[0].event.id, expected.id);
+
+            let envelope = TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+                Some(&batch),
+                true,
+                ctx.max_turn_duration,
+            )
+            .expect("exact signed source must produce trusted envelope");
+            let envelope = serde_json::to_value(envelope).unwrap();
+            assert_eq!(envelope["eventId"], expected.id.to_hex());
+            assert_eq!(
+                envelope["turnEnvelope"]["source_event_id"],
+                expected.id.to_hex()
+            );
+            assert_eq!(envelope["turnEnvelope"]["requires_reply"], true);
+
+            let requirements = reply_requirements(&batch, &ctx);
+            assert_eq!(requirements.len(), 1);
+            assert_eq!(requirements[0].source_event_id, expected.id.to_hex());
+            let reply_content = format!("completed source {}", index + 1);
+            let direct = buzz_sdk::build_message(
+                channel_id,
+                &reply_content,
+                Some(&buzz_sdk::ThreadRef {
+                    root_event_id: expected.id,
+                    parent_event_id: expected.id,
+                }),
+                &[],
+                false,
+                &[],
+            )
+            .unwrap()
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+            let check = reply_contract_check_from_json(
+                &serde_json::json!([direct]),
+                &requirements,
+                channel_id,
+                ctx.agent_keys.public_key(),
+            );
+            assert!(check.missing_source_event_ids.is_empty());
+            assert_eq!(check.reply_event_ids.len(), 1);
+
+            close_replay_batch(Some(&batch), &ctx).unwrap();
+            let replay_state = ctx.replay_state.lock().unwrap();
+            assert!(replay_state.is_handled(channel_id, &expected.id.to_hex()));
+            let other = if index == 0 {
+                &first_source
+            } else {
+                &second_source
+            };
+            assert_eq!(
+                replay_state.is_handled(channel_id, &other.id.to_hex()),
+                index == 1,
+                "only completed source ids may become terminal"
+            );
+            drop(replay_state);
+            queue.mark_complete(channel_id);
+        }
+
+        assert!(queue
+            .flush_next_with_single_event_contract(|_, _| true)
+            .is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn reply_contract_rejects_untrusted_or_inexact_events() {
         let channel_id = Uuid::new_v4();
         let batch = one_event_batch(channel_id);

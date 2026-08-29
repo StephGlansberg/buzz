@@ -223,9 +223,6 @@ impl TrustedInboundEventEnvelope {
         max_turn_duration: std::time::Duration,
     ) -> Result<Self, &'static str> {
         let batch = batch.ok_or("missing_batch")?;
-        if batch.cancel_reason.is_some() {
-            return Err("cancelled_batch");
-        }
         if !batch.cancelled_events.is_empty() {
             return Err("cancelled_events_present");
         }
@@ -3790,18 +3787,17 @@ printf '%s\n' "$!" > "$1""#
             Some("cancelled_events_present")
         );
 
-        // Queue fallback re-dispatches cancelled events in the regular event
-        // slot while preserving the cancellation reason. That shape must not
-        // regain trusted inbound authority merely because cancelled_events is
-        // empty after the move.
+        // Queue fallback re-dispatches a cancelled source in the regular event
+        // slot while preserving its local cancellation reason. The reason is
+        // not authority: the exact signed, channel-bound source remains the
+        // trusted envelope on a singular retry.
         let mut cancelled_fallback = signed_batch(channel_id, vec![]);
         cancelled_fallback.cancel_reason = Some(crate::queue::CancelReason::Steer);
-        assert!(
-            TrustedInboundEventEnvelope::from_prompt_batch(Some(&cancelled_fallback)).is_none()
-        );
+        let retried = TrustedInboundEventEnvelope::try_from_prompt_batch(Some(&cancelled_fallback))
+            .expect("singular signed cancelled retry remains trusted");
         assert_eq!(
-            TrustedInboundEventEnvelope::try_from_prompt_batch(Some(&cancelled_fallback)).err(),
-            Some("cancelled_batch")
+            retried.event_id,
+            cancelled_fallback.events[0].event.id.to_hex()
         );
 
         assert!(TrustedInboundEventEnvelope::from_prompt_batch(None).is_none());
