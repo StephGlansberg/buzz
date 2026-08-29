@@ -706,9 +706,8 @@ pub struct PromptContext {
     /// from `heartbeat_prompt` (agent self-prompting).
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
-    /// Effective prompt tags for subscription rules that require an origin
-    /// reply before the turn can be considered complete.
-    pub requires_reply_prompt_tags: HashSet<String>,
+    /// Durable accepted/handled request state shared with the event loop.
+    pub replay_state: Arc<Mutex<crate::replay_state::ReplayState>>,
     pub system_prompt: Option<String>,
     /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
     /// on `session/new`. Never part of the prompt.
@@ -2817,6 +2816,28 @@ pub async fn run_prompt_task(
                             );
                             return;
                         }
+                        if let Err(error) = close_replay_batch(batch.as_ref(), &ctx) {
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &turn_id,
+                                Some(buzz_core::agent_turn_metric::StopReason::Error),
+                            )
+                            .await;
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_guard,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(AcpError::Protocol(error)),
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
                         if let PromptSource::Channel(cid) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             record_channel_delivery_success(
@@ -2893,6 +2914,28 @@ pub async fn run_prompt_task(
                         missing_reply_event_ids,
                         stop_reason: stop_reason.clone(),
                     },
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+            if let Err(error) = close_replay_batch(batch.as_ref(), &ctx) {
+                let usage = agent.acp.take_turn_usage();
+                publish_agent_turn_metric(
+                    &ctx,
+                    usage,
+                    observer_channel_id,
+                    &session_id,
+                    &turn_id,
+                    Some(buzz_core::agent_turn_metric::StopReason::Error),
+                )
+                .await;
+                send_prompt_result(
+                    &result_tx,
+                    &turn_guard,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(AcpError::Protocol(error)),
                     requeue_batch_if_queue(&ctx, batch),
                 );
                 return;
@@ -4284,7 +4327,6 @@ fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Opt
 #[derive(Debug)]
 struct ReplyRequirement {
     source_event_id: String,
-    created_at: nostr::Timestamp,
 }
 
 #[derive(Debug, Default)]
@@ -4294,17 +4336,18 @@ struct ReplyContractCheck {
 }
 
 fn reply_requirements(batch: &FlushBatch, ctx: &PromptContext) -> Vec<ReplyRequirement> {
+    let replay_state = ctx
+        .replay_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     batch
         .events
         .iter()
         .chain(batch.cancelled_events.iter())
-        .filter(|event| ctx.requires_reply_prompt_tags.contains(&event.prompt_tag))
+        .filter(|event| replay_state.requires_reply(batch.channel_id, &event.event.id.to_hex()))
         .map(|event| {
             let source_event_id = event.event.id.to_hex();
-            ReplyRequirement {
-                source_event_id,
-                created_at: event.event.created_at,
-            }
+            ReplyRequirement { source_event_id }
         })
         .collect()
 }
@@ -4323,17 +4366,15 @@ fn reply_contract_filters(
         .iter()
         .map(|requirement| {
             nostr::Filter::new()
-                .kinds([
-                    nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
-                    nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
-                ])
+                .kind(nostr::Kind::Custom(
+                    buzz_core::kind::KIND_STREAM_MESSAGE as u16,
+                ))
                 .author(agent_pubkey)
                 // The proof must name the exact triggering event, not merely
                 // another message under the same conversation root.
                 .custom_tags(e_tag, [requirement.source_event_id.as_str()])
                 .custom_tags(h_tag, [channel.as_str()])
-                .since(requirement.created_at)
-                .limit(1)
+                .limit(10)
         })
         .collect()
 }
@@ -4341,36 +4382,31 @@ fn reply_contract_filters(
 fn reply_contract_check_from_json(
     json: &serde_json::Value,
     requirements: &[ReplyRequirement],
+    channel_id: Uuid,
+    agent_pubkey: nostr::PublicKey,
 ) -> ReplyContractCheck {
     let events = json.as_array().map(Vec::as_slice).unwrap_or_default();
     let mut check = ReplyContractCheck::default();
 
     for requirement in requirements {
-        let reply = events.iter().find(|event| {
-            let created_at = event
-                .get("created_at")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            created_at >= requirement.created_at.as_secs()
-                && event
-                    .get("tags")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|tags| {
-                        tags.iter().any(|tag| {
-                            tag.as_array().is_some_and(|values| {
-                                values.first().and_then(serde_json::Value::as_str) == Some("e")
-                                    && values.get(1).and_then(serde_json::Value::as_str)
-                                        == Some(requirement.source_event_id.as_str())
-                            })
-                        })
-                    })
+        let reply_id = events.iter().find_map(|raw| {
+            let event = serde_json::from_value::<nostr::Event>(raw.clone()).ok()?;
+            event.verify().ok()?;
+            if event.pubkey != agent_pubkey
+                || event.kind != nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16)
+                || !crate::filter::has_exact_channel_tag(&event, channel_id)
+                || buzz_core::nip10::parse_thread_markers(&event.tags)
+                    .reply
+                    .as_deref()
+                    != Some(requirement.source_event_id.as_str())
+            {
+                return None;
+            }
+            Some(event.id.to_hex())
         });
-        if let Some(reply_id) = reply
-            .and_then(|event| event.get("id"))
-            .and_then(|id| id.as_str())
-        {
-            if !check.reply_event_ids.iter().any(|seen| seen == reply_id) {
-                check.reply_event_ids.push(reply_id.to_string());
+        if let Some(reply_id) = reply_id {
+            if !check.reply_event_ids.iter().any(|seen| seen == &reply_id) {
+                check.reply_event_ids.push(reply_id);
             }
         } else {
             check
@@ -4392,7 +4428,12 @@ async fn check_required_replies(batch: &FlushBatch, ctx: &PromptContext) -> Repl
     for attempt in 0..2 {
         match timeout(REPLY_READBACK_TIMEOUT, ctx.rest_client.query(&filters)).await {
             Ok(Ok(json)) => {
-                let check = reply_contract_check_from_json(&json, &requirements);
+                let check = reply_contract_check_from_json(
+                    &json,
+                    &requirements,
+                    batch.channel_id,
+                    ctx.agent_keys.public_key(),
+                );
                 if check.missing_source_event_ids.is_empty() || attempt == 1 {
                     return check;
                 }
@@ -4414,6 +4455,25 @@ async fn check_required_replies(batch: &FlushBatch, ctx: &PromptContext) -> Repl
             .map(|requirement| requirement.source_event_id)
             .collect(),
     }
+}
+
+fn close_replay_batch(batch: Option<&FlushBatch>, ctx: &PromptContext) -> Result<(), String> {
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+    let event_ids: Vec<String> = batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|event| event.event.id.to_hex())
+        .collect();
+    let mut replay_state = ctx
+        .replay_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    replay_state
+        .close(batch.channel_id, &event_ids)
+        .map_err(|error| format!("failed to persist closed ACP requests: {error}"))
 }
 
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
@@ -5152,6 +5212,85 @@ pub(crate) async fn post_failure_notice(
         Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
         Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
     }
+}
+
+/// Post a signed, sender-visible routing rejection directly under the source
+/// event. This reuses the normal kind:9 publisher; no separate control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutingNackCode {
+    ExactChannelTagRequired,
+    RecipientTagRequired,
+    UnauthorizedRoute,
+    WorkerStateUnavailable,
+}
+
+impl RoutingNackCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactChannelTagRequired => "exact_channel_tag_required",
+            Self::RecipientTagRequired => "recipient_tag_required",
+            Self::UnauthorizedRoute => "unauthorized_route",
+            Self::WorkerStateUnavailable => "worker_state_unavailable",
+        }
+    }
+}
+
+pub(crate) async fn post_routing_nack(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    source: &nostr::Event,
+    code: RoutingNackCode,
+) {
+    let event = match build_routing_nack(&rest.keys, channel_id, source, code) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, "routing NACK build failed: {error}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(channel = %channel_id, "routing NACK failed: {error}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "routing NACK timed out"),
+    }
+}
+
+fn build_routing_nack(
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    source: &nostr::Event,
+    code: RoutingNackCode,
+) -> Result<nostr::Event, String> {
+    let parsed = crate::queue::parse_thread_tags(source);
+    let root_event_id = parsed
+        .root_event_id
+        .as_deref()
+        .and_then(|root| nostr::EventId::from_hex(root).ok())
+        .unwrap_or(source.id);
+    let thread_ref = buzz_sdk::ThreadRef {
+        root_event_id,
+        parent_event_id: source.id,
+    };
+    let source_event_id = source.id.to_hex();
+    let content = serde_json::to_string(&serde_json::json!({
+        "type": "routing_nack",
+        "status": "refused",
+        "code": code.as_str(),
+        "source_event_id": source_event_id,
+    }))
+    .map_err(|error| error.to_string())?;
+    let author = source.pubkey.to_hex();
+    buzz_sdk::build_message(
+        channel_id,
+        &content,
+        Some(&thread_ref),
+        &[author.as_str()],
+        false,
+        &[],
+    )
+    .map_err(|error| error.to_string())?
+    .sign_with_keys(keys)
+    .map_err(|error| error.to_string())
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -7540,31 +7679,170 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let channel_id = Uuid::new_v4();
         let batch = one_event_batch(channel_id);
         let source = &batch.events[0].event;
-        let mut ctx = make_prompt_context_no_owner();
-        ctx.requires_reply_prompt_tags.insert("test".into());
+        let ctx = make_prompt_context_no_owner();
+        ctx.replay_state
+            .lock()
+            .unwrap()
+            .record_open(
+                channel_id,
+                source.id.to_hex(),
+                source.created_at.as_secs(),
+                true,
+            )
+            .unwrap();
 
         let requirements = reply_requirements(&batch, &ctx);
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0].source_event_id, source.id.to_hex());
 
-        let unrelated_thread_reply = serde_json::json!([{
-            "id": "wrong-reply",
-            "created_at": source.created_at.as_secs(),
-            "tags": [["e", "conversation-root-only"]],
-        }]);
-        let missing = reply_contract_check_from_json(&unrelated_thread_reply, &requirements);
+        let unrelated_id = nostr::EventId::all_zeros();
+        let unrelated = buzz_sdk::build_message(
+            channel_id,
+            "wrong thread",
+            Some(&buzz_sdk::ThreadRef {
+                root_event_id: unrelated_id,
+                parent_event_id: unrelated_id,
+            }),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .sign_with_keys(&ctx.agent_keys)
+        .unwrap();
+        let missing = reply_contract_check_from_json(
+            &serde_json::json!([unrelated]),
+            &requirements,
+            channel_id,
+            ctx.agent_keys.public_key(),
+        );
         assert_eq!(missing.missing_source_event_ids, vec![source.id.to_hex()]);
 
-        // Nostr timestamps have one-second precision. This is safe because no
-        // reply can name the signed triggering event id before it exists.
-        let direct_same_second_reply = serde_json::json!([{
-            "id": "direct-reply",
-            "created_at": source.created_at.as_secs(),
-            "tags": [["e", source.id.to_hex()]],
-        }]);
-        let closed = reply_contract_check_from_json(&direct_same_second_reply, &requirements);
+        let direct = buzz_sdk::build_message(
+            channel_id,
+            "direct reply",
+            Some(&buzz_sdk::ThreadRef {
+                root_event_id: source.id,
+                parent_event_id: source.id,
+            }),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .sign_with_keys(&ctx.agent_keys)
+        .unwrap();
+        let direct_id = direct.id.to_hex();
+        let closed = reply_contract_check_from_json(
+            &serde_json::json!([direct]),
+            &requirements,
+            channel_id,
+            ctx.agent_keys.public_key(),
+        );
         assert!(closed.missing_source_event_ids.is_empty());
-        assert_eq!(closed.reply_event_ids, vec!["direct-reply"]);
+        assert_eq!(closed.reply_event_ids, vec![direct_id]);
+    }
+
+    #[test]
+    fn reply_contract_rejects_untrusted_or_inexact_events() {
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let source = &batch.events[0].event;
+        let ctx = make_prompt_context_no_owner();
+        ctx.replay_state
+            .lock()
+            .unwrap()
+            .record_open(
+                channel_id,
+                source.id.to_hex(),
+                source.created_at.as_secs(),
+                true,
+            )
+            .unwrap();
+        let requirements = reply_requirements(&batch, &ctx);
+        let thread = buzz_sdk::ThreadRef {
+            root_event_id: source.id,
+            parent_event_id: source.id,
+        };
+
+        let valid = buzz_sdk::build_message(channel_id, "valid", Some(&thread), &[], false, &[])
+            .unwrap()
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+        let mut tampered = serde_json::to_value(valid).unwrap();
+        tampered["content"] = serde_json::json!("tampered after signing");
+
+        let wrong_author =
+            buzz_sdk::build_message(channel_id, "wrong author", Some(&thread), &[], false, &[])
+                .unwrap()
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+
+        let channel = channel_id.to_string();
+        let source_id = source.id.to_hex();
+        let duplicate_h = EventBuilder::new(Kind::Custom(9), "duplicate h")
+            .tags([
+                Tag::parse(["h", channel.as_str()]).unwrap(),
+                Tag::parse(["h", channel.as_str()]).unwrap(),
+                Tag::parse(["e", source_id.as_str(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+        let wrong_kind = EventBuilder::new(Kind::Custom(40002), "wrong kind")
+            .tags([
+                Tag::parse(["h", channel.as_str()]).unwrap(),
+                Tag::parse(["e", source_id.as_str(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+
+        for candidate in [
+            tampered,
+            serde_json::to_value(wrong_author).unwrap(),
+            serde_json::to_value(duplicate_h).unwrap(),
+            serde_json::to_value(wrong_kind).unwrap(),
+        ] {
+            let check = reply_contract_check_from_json(
+                &serde_json::json!([candidate]),
+                &requirements,
+                channel_id,
+                ctx.agent_keys.public_key(),
+            );
+            assert_eq!(check.missing_source_event_ids, vec![source_id.clone()]);
+        }
+    }
+
+    #[test]
+    fn routing_nack_is_signed_and_directly_anchored_to_sender() {
+        let channel_id = Uuid::new_v4();
+        let source = one_event_batch(channel_id).events.remove(0).event;
+        let keys = Keys::generate();
+        let nack = build_routing_nack(
+            &keys,
+            channel_id,
+            &source,
+            RoutingNackCode::ExactChannelTagRequired,
+        )
+        .unwrap();
+
+        nack.verify().unwrap();
+        assert_eq!(nack.pubkey, keys.public_key());
+        assert_eq!(nack.kind, Kind::Custom(9));
+        assert!(crate::filter::has_exact_channel_tag(&nack, channel_id));
+        assert_eq!(
+            buzz_core::nip10::parse_thread_markers(&nack.tags)
+                .reply
+                .as_deref(),
+            Some(source.id.to_hex().as_str())
+        );
+        assert!(nack.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("p")
+                && parts.get(1).map(String::as_str) == Some(source.pubkey.to_hex().as_str())
+        }));
+        let content: serde_json::Value = serde_json::from_str(&nack.content).unwrap();
+        assert_eq!(content["type"], "routing_nack");
+        assert_eq!(content["status"], "refused");
     }
 
     #[test]
@@ -8650,7 +8928,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
-            requires_reply_prompt_tags: HashSet::new(),
+            replay_state: Arc::new(Mutex::new(crate::replay_state::ReplayState::in_memory())),
             system_prompt: None,
             session_title: None,
             team_instructions: None,

@@ -1222,6 +1222,12 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
 
     let mut seen_names = std::collections::HashSet::new();
     for rule in &mut config.rules {
+        if rule.admit_invited_ephemeral {
+            return Err(ConfigError::ConfigFile(format!(
+                "rule '{}': admit_invited_ephemeral=true is not supported yet; refusing to widen channel scope",
+                rule.name,
+            )));
+        }
         if rule.name.trim().is_empty() {
             return Err(ConfigError::ConfigFile(
                 "rule name must not be empty".into(),
@@ -2038,6 +2044,27 @@ admit_invited_ephemeral = false
         assert!(rules[0].require_exact_channel_tag);
         assert!(rules[0].requires_reply);
         assert!(!rules[0].admit_invited_ephemeral);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_rules_rejects_unimplemented_invited_ephemeral_admission() {
+        let dir = std::env::temp_dir().join("buzz-acp-test-invited-ephemeral");
+        let path = dir.join("rules.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+name = "ephemeral"
+channels = "all"
+admit_invited_ephemeral = true
+"#,
+        )
+        .unwrap();
+
+        let error = load_rules(&path).unwrap_err();
+        assert!(error.to_string().contains("not supported yet"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

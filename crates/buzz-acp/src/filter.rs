@@ -101,8 +101,7 @@ pub struct SubscriptionRule {
     #[serde(default)]
     pub requires_reply: bool,
     /// Reserved mesh contract for membership-triggered ephemeral channels.
-    /// The ACP membership path owns admission; keeping the field typed makes
-    /// generated configs strict without silently accepting misspellings.
+    /// The strict loader rejects `true` until membership type can be proven.
     #[serde(default)]
     pub admit_invited_ephemeral: bool,
     /// Optional evalexpr boolean expression for fine-grained filtering.
@@ -182,6 +181,8 @@ pub struct MatchedRule {
 pub enum MatchRejection {
     /// The rule requires one canonical `h` tag and the event did not carry it.
     ExactChannelTagRequired,
+    /// The rule requires an explicit recipient `p` tag for this agent.
+    MentionRequired,
 }
 
 /// Detailed matcher result used by the harness for structured rejection.
@@ -409,6 +410,7 @@ pub async fn match_event_decision(
     agent_pubkey_hex: &str,
 ) -> MatchDecision {
     let filter_ctx = FilterContext::from_event(event, channel_id);
+    let mut rejection = None;
 
     for (index, rule) in rules.iter().enumerate() {
         // 1. Channel scope check.
@@ -425,7 +427,8 @@ pub async fn match_event_decision(
         // parseable `h` tag, but a signed event may carry extra or conflicting
         // `h` tags. Strict rules accept one canonical two-element tag only.
         if rule.require_exact_channel_tag && !has_exact_channel_tag(event, channel_id) {
-            return MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired);
+            rejection.get_or_insert(MatchRejection::ExactChannelTagRequired);
+            continue;
         }
 
         // 4. Mention check — look for a `p` tag whose first element equals
@@ -438,6 +441,7 @@ pub async fn match_event_decision(
                     && s.get(1).map(|v| v.as_str()) == Some(agent_pubkey_hex)
             });
             if !mentioned {
+                rejection.get_or_insert(MatchRejection::MentionRequired);
                 continue;
             }
         }
@@ -501,7 +505,7 @@ pub async fn match_event_decision(
         });
     }
 
-    MatchDecision::NoMatch
+    rejection.map_or(MatchDecision::NoMatch, MatchDecision::Rejected)
 }
 
 /// Match an event while preserving the historical `Option` API for callers
@@ -518,7 +522,7 @@ pub async fn match_event(
     }
 }
 
-fn has_exact_channel_tag(event: &nostr::Event, channel_id: uuid::Uuid) -> bool {
+pub(crate) fn has_exact_channel_tag(event: &nostr::Event, channel_id: uuid::Uuid) -> bool {
     let expected = channel_id.to_string();
     let mut h_tags = event
         .tags
@@ -794,6 +798,45 @@ mod tests {
 
         let matched = match_event(&event, channel_id, &[rule], "").await.unwrap();
         assert!(matched.requires_reply);
+    }
+
+    #[tokio::test]
+    async fn missing_recipient_is_rejected_only_when_no_later_rule_matches() {
+        let event = make_event(9, "hello");
+        let channel_id = any_channel();
+        let mention_rule = make_rule(
+            "mention",
+            ChannelScope::All("all".into()),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        assert!(matches!(
+            match_event_decision(
+                &event,
+                channel_id,
+                std::slice::from_ref(&mention_rule),
+                "agent",
+            )
+            .await,
+            MatchDecision::Rejected(MatchRejection::MentionRequired)
+        ));
+
+        let fallback = make_rule(
+            "fallback",
+            ChannelScope::All("all".into()),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        let matched =
+            match_event_decision(&event, channel_id, &[mention_rule, fallback], "agent").await;
+        assert!(matches!(
+            matched,
+            MatchDecision::Matched(MatchedRule { rule_index: 1, .. })
+        ));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
+mod replay_state;
 mod setup_mode;
 mod usage;
 
@@ -45,6 +46,7 @@ use pool::{
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
+use replay_state::ReplayState;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -439,6 +441,9 @@ const OBSERVER_BATCH_KIND: &str = "batch";
 #[derive(Default)]
 struct ObserverPublishQueue {
     coalescer: ObserverChunkCoalescer,
+    /// Process-local tool-call id → display name join used only to compact
+    /// later `tool_call_update` frames that omit the name.
+    tool_names: HashMap<String, String>,
     /// `(serialized_len, source_events, event)`, oldest first. Length is
     /// captured at enqueue (post-fit) so byte accounting never re-serializes
     /// on eviction; `source_events` is how many GENERATED observer events the
@@ -455,7 +460,8 @@ struct ObserverPublishQueue {
 }
 
 impl ObserverPublishQueue {
-    fn ingest(&mut self, event: observer::ObserverEvent) {
+    fn ingest(&mut self, mut event: observer::ObserverEvent) {
+        compact_observer_tool_frame(&mut event, &mut self.tool_names);
         // ObserverChunkCoalescer::ingest returns immediately-publishable events
         // (force-flushed pending chunks + non-chunk passthrough, or a pending
         // set displaced by the 60KB pre-flush); they join the queue in the
@@ -584,6 +590,83 @@ impl ObserverPublishQueue {
         self.events = kept;
         Some(seal_batch(picked))
     }
+}
+
+/// Project raw ACP tool frames to the only relay-observer facts consumers
+/// need. Arguments and results remain in the local desktop archive, never in
+/// the encrypted kind:24200 telemetry payload.
+fn compact_observer_tool_frame(
+    event: &mut observer::ObserverEvent,
+    tool_names: &mut HashMap<String, String>,
+) {
+    if event.kind != "acp_read" {
+        return;
+    }
+    let Some(update) = event.payload.pointer("/params/update") else {
+        return;
+    };
+    let Some(update_type) = update.get("sessionUpdate").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if !matches!(update_type, "tool_call" | "tool_call_update") {
+        return;
+    }
+    let tool_call_id = update
+        .get("toolCallId")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let direct_tool_name = [
+        update.get("title"),
+        update.get("name"),
+        update.get("toolName"),
+        update.pointer("/_meta/toolName"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(serde_json::Value::as_str)
+    .map(ToOwned::to_owned);
+    if update_type == "tool_call" {
+        if let (Some(tool_call_id), Some(tool_name)) = (&tool_call_id, &direct_tool_name) {
+            if tool_names.len() >= 1_024 && !tool_names.contains_key(tool_call_id) {
+                tool_names.clear();
+            }
+            tool_names.insert(tool_call_id.clone(), tool_name.clone());
+        }
+    }
+    let tool_name = direct_tool_name
+        .or_else(|| {
+            tool_call_id
+                .as_ref()
+                .and_then(|id| tool_names.get(id).cloned())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = update
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if update_type == "tool_call" {
+                "started".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+    if update_type == "tool_call_update"
+        && matches!(status.as_str(), "completed" | "failed" | "cancelled")
+    {
+        if let Some(tool_call_id) = &tool_call_id {
+            tool_names.remove(tool_call_id);
+        }
+    }
+    event.payload = serde_json::json!({
+        "params": {
+            "update": {
+                "sessionUpdate": update_type,
+                "toolName": tool_name,
+                "status": status,
+            }
+        }
+    });
 }
 
 /// A single event ships unwrapped; two or more get the batch envelope.
@@ -1997,6 +2080,15 @@ async fn tokio_main() -> Result<()> {
         .as_secs();
 
     let pubkey_hex = config.keys.public_key().to_hex();
+    let replay_state_path = ReplayState::path_for(&config.config_path, &pubkey_hex);
+    let replay_state = Arc::new(std::sync::Mutex::new(
+        ReplayState::load(replay_state_path.clone()).with_context(|| {
+            format!(
+                "failed to load ACP replay state {}",
+                replay_state_path.display()
+            )
+        })?,
+    ));
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
@@ -2149,7 +2241,14 @@ async fn tokio_main() -> Result<()> {
     }
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
     for (channel_id, filter) in &channel_filters {
-        if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
+        let replay_since = replay_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replay_since(*channel_id);
+        if let Err(e) = relay
+            .subscribe_channel_from(*channel_id, filter.clone(), replay_since)
+            .await
+        {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
             subscribed_channel_ids.insert(*channel_id);
@@ -2198,11 +2297,6 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let cwd = current_working_directory()?;
-    let requires_reply_prompt_tags = rules
-        .iter()
-        .filter(|rule| rule.requires_reply)
-        .map(|rule| rule.prompt_tag.clone().unwrap_or_else(|| rule.name.clone()))
-        .collect();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2210,7 +2304,7 @@ async fn tokio_main() -> Result<()> {
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
-        requires_reply_prompt_tags,
+        replay_state: replay_state.clone(),
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
@@ -2705,7 +2799,12 @@ async fn tokio_main() -> Result<()> {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
+                                        let replay_since = replay_state
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner())
+                                            .replay_since(ch)
+                                            .map_or(ts, |persisted| persisted.min(ts));
+                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(replay_since)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
                                         } else {
                                             subscribed_channel_ids.insert(ch);
@@ -2718,6 +2817,13 @@ async fn tokio_main() -> Result<()> {
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
+                                    }
+                                    if let Err(error) = replay_state
+                                        .lock()
+                                        .unwrap_or_else(|poison| poison.into_inner())
+                                        .remove_channel(ch)
+                                    {
+                                        tracing::error!(channel_id = %ch, "failed to clear replay state: {error}");
                                     }
                                     // Drain queued events and invalidate sessions for the
                                     // removed channel. Events already in-flight will
@@ -2868,6 +2974,44 @@ async fn tokio_main() -> Result<()> {
                                 // Not from owner — fall through to normal prompt handling.
                             }
 
+                            // Control commands above stay available even if the
+                            // replay file is unhealthy. Ordinary requests must
+                            // durably advance the receive cursor before admission.
+                            if let Err(error) = replay_state
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_cursor(
+                                    buzz_event.channel_id,
+                                    buzz_event.event.created_at.as_secs(),
+                                )
+                            {
+                                tracing::error!(
+                                    channel_id = %buzz_event.channel_id,
+                                    "failed to persist relay receive cursor: {error}"
+                                );
+                                spawn_routing_nack(
+                                    &ctx.rest_client,
+                                    buzz_event.channel_id,
+                                    &buzz_event.event,
+                                    pool::RoutingNackCode::WorkerStateUnavailable,
+                                );
+                                continue;
+                            }
+
+                            let event_id_hex = buzz_event.event.id.to_hex();
+                            if replay_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .is_handled(buzz_event.channel_id, &event_id_hex)
+                            {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    event_id = %event_id_hex,
+                                    "skipping replay of already handled request"
+                                );
+                                continue;
+                            }
+
                             // Coarse security policy: drop events from disallowed
                             // authors before they reach subscription rules or the
                             // agent. Must be AFTER !shutdown (owner can always
@@ -2903,13 +3047,25 @@ async fn tokio_main() -> Result<()> {
                                         is_dm,
                                         "inbound author gate — dropping event"
                                     );
+                                    spawn_routing_nack(
+                                        &ctx.rest_client,
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        pool::RoutingNackCode::UnauthorizedRoute,
+                                    );
                                     continue;
                                 }
                             }
 
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => {
+                            let matched = filter::match_event_decision(
+                                &buzz_event.event,
+                                buzz_event.channel_id,
+                                &rules,
+                                &pubkey_hex,
+                            )
+                            .await;
+                            let (prompt_tag, requires_reply) = match matched {
+                                filter::MatchDecision::Matched(m) => {
                                     if m.requires_reply {
                                         tracing::debug!(
                                             channel_id = %buzz_event.channel_id,
@@ -2917,9 +3073,26 @@ async fn tokio_main() -> Result<()> {
                                             "matched reply-required subscription rule"
                                         );
                                     }
-                                    m.prompt_tag
+                                    (m.prompt_tag, m.requires_reply)
                                 }
-                                None => {
+                                filter::MatchDecision::Rejected(reason) => {
+                                    let code = match reason {
+                                        filter::MatchRejection::ExactChannelTagRequired => {
+                                            pool::RoutingNackCode::ExactChannelTagRequired
+                                        }
+                                        filter::MatchRejection::MentionRequired => {
+                                            pool::RoutingNackCode::RecipientTagRequired
+                                        }
+                                    };
+                                    spawn_routing_nack(
+                                        &ctx.rest_client,
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        code,
+                                    );
+                                    continue;
+                                }
+                                filter::MatchDecision::NoMatch => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
                                 }
@@ -2927,7 +3100,43 @@ async fn tokio_main() -> Result<()> {
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
-                            let event_id_hex = buzz_event.event.id.to_hex();
+                            let should_dispatch = {
+                                let mut replay_state = ctx
+                                    .replay_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                replay_state.record_open(
+                                    buzz_event.channel_id,
+                                    event_id_hex.clone(),
+                                    buzz_event.event.created_at.as_secs(),
+                                    requires_reply,
+                                )
+                            };
+                            match should_dispatch {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %event_id_hex,
+                                        "skipping replay of already handled request"
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %event_id_hex,
+                                        "failed to persist accepted request: {error}"
+                                    );
+                                    spawn_routing_nack(
+                                        &ctx.rest_client,
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        pool::RoutingNackCode::WorkerStateUnavailable,
+                                    );
+                                    continue;
+                                }
+                            }
                             // Clone for the non-cancelling steer fork, which
                             // needs the event to render the steer body. The
                             // clone is unconditional because we don't know
@@ -2946,6 +3155,25 @@ async fn tokio_main() -> Result<()> {
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
                             });
+                            if !accepted {
+                                // `DedupMode::Drop` is an explicit terminal
+                                // disposition, not open work to resurrect after
+                                // a restart. Retire the pre-queue durable claim.
+                                if let Err(error) = replay_state
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .close(
+                                        buzz_event.channel_id,
+                                        std::slice::from_ref(&event_id_hex),
+                                    )
+                                {
+                                    tracing::error!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %event_id_hex,
+                                        "failed to persist dropped request disposition: {error}"
+                                    );
+                                }
+                            }
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -2984,7 +3212,12 @@ async fn tokio_main() -> Result<()> {
                                     // to the universal cancel+merge `Steer`
                                     // signal so the event still reaches the
                                     // agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
+                                    // A reply-required event must become part of a
+                                    // normal batch so terminal readback can prove
+                                    // its direct origin reply. Native steer has no
+                                    // independent terminal boundary.
+                                    let native_attempted = !requires_reply
+                                        && matches!(signal, ControlSignal::Steer)
                                         && try_native_steer(
                                             &mut pool,
                                             &mut queue,
@@ -3313,7 +3546,7 @@ async fn tokio_main() -> Result<()> {
                 //     pending_steer on every return path. If it does,
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
-                let (release_withheld, drop_withheld, signal_fallback) = match &ack {
+                let (mut release_withheld, mut drop_withheld, signal_fallback) = match &ack {
                     Ok(pool::SteerAck::Success { .. }) => (false, true, false),
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
@@ -3359,6 +3592,21 @@ async fn tokio_main() -> Result<()> {
                             event_id = %event_id,
                             "successful steer lost its in-flight delivery ledger"
                         );
+                    }
+                    if let Err(error) = replay_state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .close(channel_id, std::slice::from_ref(&event_id))
+                    {
+                        tracing::error!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            "failed to persist successful steer: {error}"
+                        );
+                        // Preserve the event for normal dispatch. Duplicate
+                        // delivery is safer than forgetting an unclosed request.
+                        release_withheld = true;
+                        drop_withheld = false;
                     }
                 }
                 if drop_withheld {
@@ -3892,6 +4140,19 @@ fn spawn_failure_notice(
             pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
         });
     }
+}
+
+fn spawn_routing_nack(
+    rest_client: &relay::RestClient,
+    channel_id: Uuid,
+    source: &nostr::Event,
+    code: pool::RoutingNackCode,
+) {
+    let rest = rest_client.clone();
+    let source = source.clone();
+    tokio::spawn(async move {
+        pool::post_routing_nack(&rest, channel_id, &source, code).await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5895,6 +6156,71 @@ mod observer_publish_queue_tests {
             Some(inner) => inner.iter().map(|e| e["seq"].as_u64().unwrap()).collect(),
             None => vec![frame.seq],
         }
+    }
+
+    #[test]
+    fn relay_observer_tool_frames_drop_arguments_and_results() {
+        let mut tool = event(1, "acp_read", Some("channel-1"));
+        tool.payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "title": "buzz_mechanon_reply",
+                    "status": "completed",
+                    "rawInput": {"credential": "must-not-leave-process"},
+                    "content": [{"text": "sensitive tool result"}],
+                }
+            }
+        });
+
+        let mut queue = queue_of(vec![tool]);
+        let projected = queue.next_frame().unwrap();
+        assert_eq!(
+            projected.payload,
+            serde_json::json!({
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolName": "buzz_mechanon_reply",
+                        "status": "completed",
+                    }
+                }
+            })
+        );
+        let serialized = serde_json::to_string(&projected).unwrap();
+        assert!(!serialized.contains("must-not-leave-process"));
+        assert!(!serialized.contains("sensitive tool result"));
+    }
+
+    #[test]
+    fn relay_observer_tool_update_recovers_name_without_forwarding_call_id() {
+        let mut started = event(1, "acp_read", Some("channel-1"));
+        started.payload = serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "secret-correlation-id",
+                "title": "buzz_mechanon_reply",
+                "rawInput": {"body": "private"},
+            }}
+        });
+        let mut completed = event(2, "acp_read", Some("channel-1"));
+        completed.payload = serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "secret-correlation-id",
+                "status": "completed",
+                "content": [{"text": "private result"}],
+            }}
+        });
+
+        let mut queue = queue_of(vec![started, completed]);
+        let serialized = serde_json::to_string(&queue.next_frame().unwrap()).unwrap();
+        assert_eq!(serialized.matches("buzz_mechanon_reply").count(), 2);
+        assert!(!serialized.contains("secret-correlation-id"));
+        assert!(!serialized.contains("private result"));
+        assert!(!serialized.contains("private"));
     }
 
     /// Retained bytes computed by WALKING the entries, independently of the
