@@ -205,6 +205,8 @@ pub enum MatchRejection {
     ExactChannelTagRequired,
     /// The rule requires an explicit recipient `p` tag for this agent.
     MentionRequired,
+    /// The signed event exceeds the trusted inbound projection limits.
+    InboundEventTooLarge,
 }
 
 /// Detailed matcher result used by the harness for structured rejection.
@@ -244,6 +246,17 @@ const EVAL_START_TIMEOUT: Duration = Duration::from_secs(5);
 /// fires. This truly bounds the number of live blocking evals even under repeated
 /// slow expressions.
 const MAX_CONCURRENT_FILTER_EVALS: usize = 4;
+
+/// Trusted inbound tag limits shared with the AEON Gateway projection.
+///
+/// These bounds are counted in Unicode scalar values, matching JavaScript's
+/// `Array.from(value).length` in the Gateway normalizer. Rejecting before ACP
+/// prompt delivery keeps an otherwise valid signed event from entering a
+/// permanent Gateway-rejection/retry loop.
+const MAX_TRUSTED_INBOUND_TAGS: usize = 64;
+const MAX_TRUSTED_INBOUND_TAG_PARTS: usize = 16;
+const MAX_TRUSTED_INBOUND_TAG_PART_CHARS: usize = 512;
+const MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS: usize = 8_192;
 
 /// Semaphore that bounds concurrent `spawn_blocking` filter evaluations.
 ///
@@ -484,6 +497,22 @@ pub async fn match_event_decision(
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
 ) -> MatchDecision {
+    match_event_decision_with_trusted_limits(event, channel_id, rules, agent_pubkey_hex, false)
+        .await
+}
+
+/// Match an event with optional AEON trusted-envelope projection bounds.
+///
+/// Ordinary Buzz ACP rules retain their historical, unbounded tag behavior.
+/// Only the explicitly configured trusted inbound envelope path opts into the
+/// cross-repository Gateway limits.
+pub async fn match_event_decision_with_trusted_limits(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+    enforce_trusted_inbound_limits: bool,
+) -> MatchDecision {
     let filter_ctx = FilterContext::from_event(event, channel_id);
     let mut rejection = None;
 
@@ -521,7 +550,16 @@ pub async fn match_event_decision(
             }
         }
 
-        // 4. Optional evalexpr filter expression.
+        // 5. Trusted envelope projection bounds. Apply only after the event is
+        // eligible for this rule's channel/kind/h/p constraints so unrelated
+        // traffic is not NACKed, but before evaluating filters or prompting.
+        // The limits are universal once a rule is eligible, so a later,
+        // looser rule must not bypass them.
+        if enforce_trusted_inbound_limits && !trusted_inbound_tags_within_limits(event) {
+            return MatchDecision::Rejected(MatchRejection::InboundEventTooLarge);
+        }
+
+        // 6. Optional evalexpr filter expression.
         if let Some(expr) = &rule.filter {
             // Skip rules that have timed out too many times — treat as disabled.
             let prior_timeouts = rule.consecutive_timeouts.load(Ordering::Relaxed);
@@ -611,6 +649,36 @@ pub(crate) fn has_exact_channel_tag(event: &nostr::Event, channel_id: uuid::Uuid
     values.len() == 2 && values[1] == expected && h_tags.next().is_none()
 }
 
+fn trusted_inbound_tags_within_limits(event: &nostr::Event) -> bool {
+    if event.tags.len() > MAX_TRUSTED_INBOUND_TAGS {
+        return false;
+    }
+
+    let mut total_chars = 0usize;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() > MAX_TRUSTED_INBOUND_TAG_PARTS {
+            return false;
+        }
+        for part in parts {
+            // Stop after max+1 scalars so a single untrusted, very large part
+            // does not need a complete traversal before it can be rejected.
+            let chars = part
+                .chars()
+                .take(MAX_TRUSTED_INBOUND_TAG_PART_CHARS + 1)
+                .count();
+            if chars > MAX_TRUSTED_INBOUND_TAG_PART_CHARS {
+                return false;
+            }
+            total_chars += chars;
+            if total_chars > MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +709,40 @@ mod tests {
             .tags(tags)
             .sign_with_keys(&Keys::generate())
             .unwrap()
+    }
+
+    fn trusted_tags_with_total_chars(
+        channel_id: Uuid,
+        agent_pubkey: &str,
+        total_chars: usize,
+    ) -> Vec<Tag> {
+        let mut raw_tags = vec![
+            vec!["h".to_string(), channel_id.to_string()],
+            vec!["p".to_string(), agent_pubkey.to_string()],
+        ];
+        while raw_tags.len() < MAX_TRUSTED_INBOUND_TAGS {
+            raw_tags.push(vec!["x".to_string()]);
+        }
+
+        let base_chars: usize = raw_tags
+            .iter()
+            .flatten()
+            .map(|part| part.chars().count())
+            .sum();
+        let mut remaining = total_chars.checked_sub(base_chars).unwrap();
+        for tag in raw_tags.iter_mut().skip(2) {
+            while remaining > 0 && tag.len() < MAX_TRUSTED_INBOUND_TAG_PARTS {
+                let chars = remaining.min(MAX_TRUSTED_INBOUND_TAG_PART_CHARS);
+                tag.push("a".repeat(chars));
+                remaining -= chars;
+            }
+        }
+        assert_eq!(remaining, 0, "test fixture exceeded tag capacity");
+
+        raw_tags
+            .into_iter()
+            .map(|parts| Tag::parse(parts).unwrap())
+            .collect()
     }
 
     fn any_channel() -> Uuid {
@@ -936,6 +1038,147 @@ mod tests {
         assert!(matches!(
             match_event_decision(&duplicate, channel_id, &[rule], "").await,
             MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_tag_limits_accept_every_exact_boundary() {
+        let channel_id = any_channel();
+        let agent_pubkey = Keys::generate().public_key().to_hex();
+        let tags = trusted_tags_with_total_chars(
+            channel_id,
+            &agent_pubkey,
+            MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS,
+        );
+        assert_eq!(tags.len(), MAX_TRUSTED_INBOUND_TAGS);
+        assert!(tags.iter().all(|tag| {
+            tag.as_slice().len() <= MAX_TRUSTED_INBOUND_TAG_PARTS
+                && tag
+                    .as_slice()
+                    .iter()
+                    .all(|part| part.chars().count() <= MAX_TRUSTED_INBOUND_TAG_PART_CHARS)
+        }));
+        assert!(tags.iter().any(|tag| {
+            tag.as_slice().len() == MAX_TRUSTED_INBOUND_TAG_PARTS
+                && tag
+                    .as_slice()
+                    .iter()
+                    .any(|part| part.chars().count() == MAX_TRUSTED_INBOUND_TAG_PART_CHARS)
+        }));
+
+        let event = make_event_with_tags(9, tags);
+        let mut rule = make_rule(
+            "trusted-boundary",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        assert!(matches!(
+            match_event_decision_with_trusted_limits(
+                &event,
+                channel_id,
+                &[rule],
+                &agent_pubkey,
+                true,
+            )
+            .await,
+            MatchDecision::Matched(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_tag_limits_reject_each_over_bound_shape() {
+        let channel_id = any_channel();
+        let agent_pubkey = Keys::generate().public_key().to_hex();
+        let channel = channel_id.to_string();
+        let h = || Tag::parse(["h", channel.as_str()]).unwrap();
+        let p = || Tag::parse(["p", agent_pubkey.as_str()]).unwrap();
+
+        let mut too_many_tags = vec![h(), p()];
+        while too_many_tags.len() <= MAX_TRUSTED_INBOUND_TAGS {
+            too_many_tags.push(Tag::parse(["x"]).unwrap());
+        }
+
+        let mut too_many_parts = vec!["x".to_string()];
+        too_many_parts
+            .extend((0..MAX_TRUSTED_INBOUND_TAG_PARTS).map(|index| format!("part-{index}")));
+        let too_many_parts = vec![h(), p(), Tag::parse(too_many_parts).unwrap()];
+
+        let too_many_part_chars = vec![
+            h(),
+            p(),
+            Tag::parse([
+                "x".to_string(),
+                "🐝".repeat(MAX_TRUSTED_INBOUND_TAG_PART_CHARS + 1),
+            ])
+            .unwrap(),
+        ];
+        let too_many_total = trusted_tags_with_total_chars(
+            channel_id,
+            &agent_pubkey,
+            MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS + 1,
+        );
+
+        let mut rule = make_rule(
+            "trusted-over-bound",
+            ChannelScope::List(vec![channel]),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        for tags in [
+            too_many_tags,
+            too_many_parts,
+            too_many_part_chars,
+            too_many_total,
+        ] {
+            let event = make_event_with_tags(9, tags);
+            assert!(matches!(
+                match_event_decision_with_trusted_limits(
+                    &event,
+                    channel_id,
+                    std::slice::from_ref(&rule),
+                    &agent_pubkey,
+                    true,
+                )
+                .await,
+                MatchDecision::Rejected(MatchRejection::InboundEventTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_rules_keep_accepting_oversized_signed_events() {
+        let channel_id = any_channel();
+        let agent_pubkey = Keys::generate().public_key().to_hex();
+        let event = make_event_with_tags(
+            9,
+            trusted_tags_with_total_chars(
+                channel_id,
+                &agent_pubkey,
+                MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS + 1,
+            ),
+        );
+        let mut rule = make_rule(
+            "ordinary-over-bound",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        assert!(matches!(
+            match_event_decision(&event, channel_id, &[rule], &agent_pubkey).await,
+            MatchDecision::Matched(_)
         ));
     }
 

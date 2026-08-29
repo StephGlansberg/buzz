@@ -5614,6 +5614,7 @@ pub(crate) async fn post_failure_notice(
 pub(crate) enum RoutingNackCode {
     ExactChannelTagRequired,
     RecipientTagRequired,
+    InboundEventTooLarge,
     UnauthorizedRoute,
     WorkerStateUnavailable,
 }
@@ -5623,6 +5624,7 @@ impl RoutingNackCode {
         match self {
             Self::ExactChannelTagRequired => "exact_channel_tag_required",
             Self::RecipientTagRequired => "recipient_tag_required",
+            Self::InboundEventTooLarge => "inbound_event_too_large",
             Self::UnauthorizedRoute => "unauthorized_route",
             Self::WorkerStateUnavailable => "worker_state_unavailable",
         }
@@ -8790,6 +8792,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             (
                 RoutingNackCode::RecipientTagRequired,
                 "recipient_tag_required",
+            ),
+            (
+                RoutingNackCode::InboundEventTooLarge,
+                "inbound_event_too_large",
             ),
             (RoutingNackCode::UnauthorizedRoute, "unauthorized_route"),
             (

@@ -3552,11 +3552,12 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
 
-                            let matched = filter::match_event_decision(
+                            let matched = filter::match_event_decision_with_trusted_limits(
                                 &buzz_event.event,
                                 buzz_event.channel_id,
                                 &rules,
                                 &pubkey_hex,
+                                config.trusted_inbound_envelope,
                             )
                             .await;
                             let (prompt_tag, requires_reply) = match matched {
@@ -3577,6 +3578,9 @@ async fn tokio_main() -> Result<()> {
                                         }
                                         filter::MatchRejection::MentionRequired => {
                                             pool::RoutingNackCode::RecipientTagRequired
+                                        }
+                                        filter::MatchRejection::InboundEventTooLarge => {
+                                            pool::RoutingNackCode::InboundEventTooLarge
                                         }
                                     };
                                     spawn_routing_nack(
@@ -4793,18 +4797,20 @@ fn spawn_routing_nack(
     source: &nostr::Event,
     code: pool::RoutingNackCode,
 ) {
-    let replay_state = Arc::clone(replay_state);
+    // Terminalize synchronously before the best-effort network publication.
+    // A rejected source must never enter the agent or resurrect after a crash,
+    // even when the relay is unavailable or its timestamp freshness policy
+    // refuses a deterministic NACK for an old catch-up event.
+    terminalize_source_best_effort(
+        replay_state,
+        channel_id,
+        &source.id.to_hex(),
+        "routing rejection",
+    );
     let rest = rest_client.clone();
     let source = source.clone();
     tokio::spawn(async move {
-        if pool::post_routing_nack(&rest, channel_id, &source, code).await {
-            terminalize_source_best_effort(
-                &replay_state,
-                channel_id,
-                &source.id.to_hex(),
-                "routing rejection",
-            );
-        }
+        pool::post_routing_nack(&rest, channel_id, &source, code).await;
     });
 }
 
@@ -4857,6 +4863,88 @@ fn terminalize_replay_batch(
             disposition,
             "failed to persist terminal batch disposition: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_nack_terminal_tests {
+    use super::*;
+    use nostr::{EventBuilder, Kind, Tag};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn oversized_nack_publish_failure_stays_terminal_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-over-bound-nack-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("replay.json");
+        let channel_id = Uuid::new_v4();
+        let channel = channel_id.to_string();
+        let source = EventBuilder::new(Kind::Custom(9), "oversized source")
+            .tags([Tag::parse(["h", channel.as_str()]).unwrap()])
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let event_id = source.id.to_hex();
+
+        // The local server proves both deterministic-NACK readback and submit
+        // fail. Durability must not depend on either network operation.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8_192];
+                let _ = socket.read(&mut request).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        let replay_state = Arc::new(std::sync::Mutex::new(
+            ReplayState::load(state_path.clone()).unwrap(),
+        ));
+
+        spawn_routing_nack(
+            &replay_state,
+            &rest,
+            channel_id,
+            &source,
+            pool::RoutingNackCode::InboundEventTooLarge,
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replay_state
+            .lock()
+            .unwrap()
+            .is_handled(channel_id, &event_id));
+        drop(replay_state);
+
+        let mut restarted = ReplayState::load(state_path).unwrap();
+        assert!(restarted.is_handled(channel_id, &event_id));
+        assert!(!restarted
+            .record_open(
+                channel_id,
+                event_id,
+                source.created_at.as_secs(),
+                source.created_at.as_secs(),
+                true,
+            )
+            .unwrap());
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 
