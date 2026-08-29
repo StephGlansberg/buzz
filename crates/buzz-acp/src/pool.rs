@@ -4315,13 +4315,14 @@ fn parse_nostr_dm_response(json: serde_json::Value, limit: u32) -> Option<Conver
     })
 }
 
-/// Return the batch for requeue only in Queue mode; drop it in Drop mode.
+/// Preserve a failed batch for the main-loop disposition owner.
+///
+/// Queue mode may retry it; Drop mode must still receive it so the durable
+/// replay ledger can mark every accepted source id terminal.
 #[inline]
 fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
-    match ctx.dedup_mode {
-        DedupMode::Queue => batch,
-        DedupMode::Drop => None,
-    }
+    let _disposition_mode = ctx.dedup_mode;
+    batch
 }
 
 #[derive(Debug)]
@@ -4477,10 +4478,11 @@ fn close_replay_batch(batch: Option<&FlushBatch>, ctx: &PromptContext) -> Result
 }
 
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
-/// the merged re-prompt, then requeue the batch (in `Queue` dedup mode) with
-/// that reason stamped onto [`FlushBatch::cancel_reason`]. `Cancel`/`Rotate`
-/// drop the batch entirely. The reason is consumed by the main loop at requeue
-/// time (`requeue_as_cancelled`) and ultimately by `format_prompt`.
+/// a possible merged re-prompt, with that reason stamped onto
+/// [`FlushBatch::cancel_reason`]. The main loop requeues in Queue mode and
+/// terminalizes in Drop mode. `Cancel`/`Rotate` terminalize here and discard
+/// the batch entirely. The reason is consumed by the main loop at requeue time
+/// (`requeue_as_cancelled`) and ultimately by `format_prompt`.
 #[inline]
 fn requeue_cancelled_batch(
     ctx: &PromptContext,
@@ -4490,8 +4492,14 @@ fn requeue_cancelled_batch(
     let reason = match signal {
         ControlSignal::Steer => CancelReason::Steer,
         ControlSignal::Interrupt | ControlSignal::SwitchModel { .. } => CancelReason::Interrupt,
-        // Cancel/Rotate discard the batch — no merged re-prompt.
-        ControlSignal::Cancel | ControlSignal::Rotate => return None,
+        // Cancel/Rotate discard the batch — no merged re-prompt — but the
+        // durable replay ledger must still record the accepted ids terminal.
+        ControlSignal::Cancel | ControlSignal::Rotate => {
+            if let Err(error) = close_replay_batch(batch.as_ref(), ctx) {
+                tracing::error!("failed to persist explicit-control batch drop: {error}");
+            }
+            return None;
+        }
     };
     requeue_batch_if_queue(ctx, batch).map(|mut b| {
         b.cancel_reason = Some(reason);
@@ -5240,18 +5248,38 @@ pub(crate) async fn post_routing_nack(
     channel_id: Uuid,
     source: &nostr::Event,
     code: RoutingNackCode,
-) {
+) -> bool {
     let event = match build_routing_nack(&rest.keys, channel_id, source, code) {
         Ok(event) => event,
         Err(error) => {
             tracing::warn!(channel = %channel_id, "routing NACK build failed: {error}");
-            return;
+            return false;
         }
     };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+    let filter = nostr::Filter::new().id(event.id);
+    match tokio::time::timeout(Duration::from_secs(5), rest.query(&[filter])).await {
+        Ok(Ok(json)) if contains_verified_event(&json, event.id) => {
+            tracing::debug!(channel = %channel_id, event_id = %event.id, "routing NACK already published");
+            return true;
+        }
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => tracing::warn!(channel = %channel_id, "routing NACK failed: {error}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "routing NACK timed out"),
+        Ok(Err(error)) => {
+            tracing::warn!(channel = %channel_id, "routing NACK readback failed; submitting deterministic event: {error}");
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "routing NACK readback timed out; submitting deterministic event");
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(channel = %channel_id, "routing NACK failed: {error}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "routing NACK timed out");
+            false
+        }
     }
 }
 
@@ -5289,8 +5317,21 @@ fn build_routing_nack(
         &[],
     )
     .map_err(|error| error.to_string())?
+    // The source timestamp is signed and already relay-admitted. Pinning it
+    // makes the NACK event id deterministic across reconnects/restarts, so a
+    // failed readback can safely resubmit the same relay-deduplicated event.
+    .custom_created_at(source.created_at)
     .sign_with_keys(keys)
     .map_err(|error| error.to_string())
+}
+
+fn contains_verified_event(json: &serde_json::Value, expected_id: nostr::EventId) -> bool {
+    json.as_array().is_some_and(|events| {
+        events.iter().any(|raw| {
+            serde_json::from_value::<nostr::Event>(raw.clone())
+                .is_ok_and(|event| event.id == expected_id && event.verify().is_ok())
+        })
+    })
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -7655,6 +7696,13 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         for (signal, expected_reason) in cases {
             let channel_id = Uuid::new_v4();
             let batch = one_event_batch(channel_id);
+            let event_id = batch.events[0].event.id.to_hex();
+            let created_at = batch.events[0].event.created_at.as_secs();
+            ctx.replay_state
+                .lock()
+                .unwrap()
+                .record_open(channel_id, event_id.clone(), created_at, created_at, false)
+                .unwrap();
             let result = requeue_cancelled_batch(&ctx, signal.clone(), Some(batch));
             match expected_reason {
                 Some(reason) => {
@@ -7665,11 +7713,23 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                         Some(reason),
                         "{signal:?} must stamp {reason:?}"
                     );
+                    assert!(!ctx
+                        .replay_state
+                        .lock()
+                        .unwrap()
+                        .is_handled(channel_id, &event_id));
                 }
-                None => assert!(
-                    result.is_none(),
-                    "{signal:?} must drop the batch, got {result:?}"
-                ),
+                None => {
+                    assert!(
+                        result.is_none(),
+                        "{signal:?} must drop the batch, got {result:?}"
+                    );
+                    assert!(ctx
+                        .replay_state
+                        .lock()
+                        .unwrap()
+                        .is_handled(channel_id, &event_id));
+                }
             }
         }
     }
@@ -7686,6 +7746,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .record_open(
                 channel_id,
                 source.id.to_hex(),
+                source.created_at.as_secs(),
                 source.created_at.as_secs(),
                 true,
             )
@@ -7755,6 +7816,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .record_open(
                 channel_id,
                 source.id.to_hex(),
+                source.created_at.as_secs(),
                 source.created_at.as_secs(),
                 true,
             )
@@ -7843,6 +7905,96 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         let content: serde_json::Value = serde_json::from_str(&nack.content).unwrap();
         assert_eq!(content["type"], "routing_nack");
         assert_eq!(content["status"], "refused");
+        assert!(contains_verified_event(
+            &serde_json::json!([&nack]),
+            nack.id
+        ));
+    }
+
+    #[test]
+    fn routing_nack_is_deterministic_for_every_rejection_branch() {
+        let channel_id = Uuid::new_v4();
+        let source = one_event_batch(channel_id).events.remove(0).event;
+        let keys = Keys::generate();
+
+        for (code, expected) in [
+            (
+                RoutingNackCode::ExactChannelTagRequired,
+                "exact_channel_tag_required",
+            ),
+            (
+                RoutingNackCode::RecipientTagRequired,
+                "recipient_tag_required",
+            ),
+            (RoutingNackCode::UnauthorizedRoute, "unauthorized_route"),
+            (
+                RoutingNackCode::WorkerStateUnavailable,
+                "worker_state_unavailable",
+            ),
+        ] {
+            let first = build_routing_nack(&keys, channel_id, &source, code).unwrap();
+            let second = build_routing_nack(&keys, channel_id, &source, code).unwrap();
+            assert_eq!(first.id, second.id, "{expected} must relay-deduplicate");
+            assert_eq!(first.created_at, source.created_at);
+            let content: serde_json::Value = serde_json::from_str(&first.content).unwrap();
+            assert_eq!(content["code"], expected);
+            assert!(contains_verified_event(
+                &serde_json::json!([&first]),
+                first.id
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_nack_verified_readback_avoids_duplicate_submit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel_id = Uuid::new_v4();
+        let source = one_event_batch(channel_id).events.remove(0).event;
+        let keys = Keys::generate();
+        let existing = build_routing_nack(
+            &keys,
+            channel_id,
+            &source,
+            RoutingNackCode::UnauthorizedRoute,
+        )
+        .unwrap();
+        let response_body = serde_json::json!([existing]).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8_192];
+                let _ = socket.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(), response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys,
+            auth_tag_json: None,
+        };
+
+        assert!(
+            post_routing_nack(
+                &rest,
+                channel_id,
+                &source,
+                RoutingNackCode::UnauthorizedRoute,
+            )
+            .await
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no /events submit");
+        server.abort();
     }
 
     #[test]

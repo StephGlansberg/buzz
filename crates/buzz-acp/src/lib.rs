@@ -2871,6 +2871,20 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
+                            let event_id_hex = buzz_event.event.id.to_hex();
+                            if replay_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .is_handled(buzz_event.channel_id, &event_id_hex)
+                            {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    event_id = %event_id_hex,
+                                    "skipping replay of terminal request"
+                                );
+                                continue;
+                            }
+
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
                                 &buzz_event.event,
@@ -2882,6 +2896,12 @@ async fn tokio_main() -> Result<()> {
                                 let owner = owner_cache.get();
                                 if let Some(owner) = owner {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        terminalize_source_best_effort(
+                                            &replay_state,
+                                            buzz_event.channel_id,
+                                            &event_id_hex,
+                                            "shutdown control",
+                                        );
                                         tracing::info!(
                                             channel_id = %buzz_event.channel_id,
                                             sender = %buzz_event.event.pubkey.to_hex(),
@@ -2912,6 +2932,12 @@ async fn tokio_main() -> Result<()> {
                             if is_cancel {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        terminalize_source_best_effort(
+                                            &replay_state,
+                                            buzz_event.channel_id,
+                                            &event_id_hex,
+                                            "cancel control",
+                                        );
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2950,6 +2976,12 @@ async fn tokio_main() -> Result<()> {
                             if is_rotate {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        terminalize_source_best_effort(
+                                            &replay_state,
+                                            buzz_event.channel_id,
+                                            &event_id_hex,
+                                            "rotate control",
+                                        );
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2972,44 +3004,6 @@ async fn tokio_main() -> Result<()> {
                                     }
                                 }
                                 // Not from owner — fall through to normal prompt handling.
-                            }
-
-                            // Control commands above stay available even if the
-                            // replay file is unhealthy. Ordinary requests must
-                            // durably advance the receive cursor before admission.
-                            if let Err(error) = replay_state
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .record_cursor(
-                                    buzz_event.channel_id,
-                                    buzz_event.event.created_at.as_secs(),
-                                )
-                            {
-                                tracing::error!(
-                                    channel_id = %buzz_event.channel_id,
-                                    "failed to persist relay receive cursor: {error}"
-                                );
-                                spawn_routing_nack(
-                                    &ctx.rest_client,
-                                    buzz_event.channel_id,
-                                    &buzz_event.event,
-                                    pool::RoutingNackCode::WorkerStateUnavailable,
-                                );
-                                continue;
-                            }
-
-                            let event_id_hex = buzz_event.event.id.to_hex();
-                            if replay_state
-                                .lock()
-                                .unwrap_or_else(|error| error.into_inner())
-                                .is_handled(buzz_event.channel_id, &event_id_hex)
-                            {
-                                tracing::debug!(
-                                    channel_id = %buzz_event.channel_id,
-                                    event_id = %event_id_hex,
-                                    "skipping replay of already handled request"
-                                );
-                                continue;
                             }
 
                             // Coarse security policy: drop events from disallowed
@@ -3048,6 +3042,7 @@ async fn tokio_main() -> Result<()> {
                                         "inbound author gate — dropping event"
                                     );
                                     spawn_routing_nack(
+                                        &replay_state,
                                         &ctx.rest_client,
                                         buzz_event.channel_id,
                                         &buzz_event.event,
@@ -3085,6 +3080,7 @@ async fn tokio_main() -> Result<()> {
                                         }
                                     };
                                     spawn_routing_nack(
+                                        &replay_state,
                                         &ctx.rest_client,
                                         buzz_event.channel_id,
                                         &buzz_event.event,
@@ -3093,6 +3089,12 @@ async fn tokio_main() -> Result<()> {
                                     continue;
                                 }
                                 filter::MatchDecision::NoMatch => {
+                                    terminalize_source_best_effort(
+                                        &replay_state,
+                                        buzz_event.channel_id,
+                                        &event_id_hex,
+                                        "unmatched event",
+                                    );
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
                                 }
@@ -3109,6 +3111,7 @@ async fn tokio_main() -> Result<()> {
                                     buzz_event.channel_id,
                                     event_id_hex.clone(),
                                     buzz_event.event.created_at.as_secs(),
+                                    nostr::Timestamp::now().as_secs(),
                                     requires_reply,
                                 )
                             };
@@ -3129,6 +3132,7 @@ async fn tokio_main() -> Result<()> {
                                         "failed to persist accepted request: {error}"
                                     );
                                     spawn_routing_nack(
+                                        &replay_state,
                                         &ctx.rest_client,
                                         buzz_event.channel_id,
                                         &buzz_event.event,
@@ -3404,7 +3408,7 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                if handle_prompt_result_with_replay(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3416,6 +3420,7 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    &replay_state,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -3431,6 +3436,7 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    &replay_state,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -3443,7 +3449,7 @@ async fn tokio_main() -> Result<()> {
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                recover_panicked_agent_with_replay(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3455,6 +3461,7 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    &replay_state,
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
@@ -4026,10 +4033,10 @@ fn dispatch_pending(
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, affinity_hit, "agent_claimed");
 
-        let recoverable_batch = match ctx.dedup_mode {
-            DedupMode::Queue => Some(batch.clone()),
-            DedupMode::Drop => None,
-        };
+        // Keep a metadata copy even in Drop mode so a panic can durably mark
+        // the accepted source ids terminal instead of resurrecting them after
+        // restart. Queue mode still uses the same copy for bounded requeue.
+        let recoverable_batch = Some(batch.clone());
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -4143,20 +4150,81 @@ fn spawn_failure_notice(
 }
 
 fn spawn_routing_nack(
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
     rest_client: &relay::RestClient,
     channel_id: Uuid,
     source: &nostr::Event,
     code: pool::RoutingNackCode,
 ) {
+    let replay_state = Arc::clone(replay_state);
     let rest = rest_client.clone();
     let source = source.clone();
     tokio::spawn(async move {
-        pool::post_routing_nack(&rest, channel_id, &source, code).await;
+        if pool::post_routing_nack(&rest, channel_id, &source, code).await {
+            terminalize_source_best_effort(
+                &replay_state,
+                channel_id,
+                &source.id.to_hex(),
+                "routing rejection",
+            );
+        }
     });
 }
 
+fn terminalize_source_best_effort(
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
+    channel_id: Uuid,
+    event_id: &str,
+    disposition: &'static str,
+) -> bool {
+    match replay_state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .terminalize(channel_id, &[event_id.to_string()])
+    {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::error!(
+                channel_id = %channel_id,
+                event_id,
+                disposition,
+                "failed to persist terminal request disposition: {error}"
+            );
+            false
+        }
+    }
+}
+
+fn terminalize_replay_batch(
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
+    batch: &FlushBatch,
+    disposition: &'static str,
+) {
+    let event_ids: Vec<String> = batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|event| event.event.id.to_hex())
+        .collect();
+    if event_ids.is_empty() {
+        return;
+    }
+    if let Err(error) = replay_state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .terminalize(batch.channel_id, &event_ids)
+    {
+        tracing::error!(
+            channel_id = %batch.channel_id,
+            events = event_ids.len(),
+            disposition,
+            "failed to persist terminal batch disposition: {error}"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn handle_prompt_result(
+fn handle_prompt_result_with_replay(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -4168,6 +4236,7 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
@@ -4211,9 +4280,11 @@ fn handle_prompt_result(
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
     if let Some(batch) = result.batch.take() {
+        if matches!(config.dedup_mode, DedupMode::Drop) {
+            terminalize_replay_batch(replay_state, &batch, "dedup drop");
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
-        if !removed_channels.contains(&batch.channel_id) {
+        } else if !removed_channels.contains(&batch.channel_id) {
             if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
@@ -4251,6 +4322,7 @@ fn handle_prompt_result(
                     config.max_turn_duration_secs
                 );
                 spawn_failure_notice(rest_client, &batch, content);
+                terminalize_replay_batch(replay_state, &batch, "hard-timeout dead letter");
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
             } else if matches!(
                 result.outcome,
@@ -4269,6 +4341,7 @@ fn handle_prompt_result(
                         config.max_turn_duration_secs
                     );
                     spawn_failure_notice(rest_client, &dead, content);
+                    terminalize_replay_batch(replay_state, &dead, "retry-budget dead letter");
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
@@ -4288,6 +4361,7 @@ fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
+                terminalize_replay_batch(replay_state, &batch, "authentication dead letter");
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -4306,6 +4380,7 @@ fn handle_prompt_result(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
                 spawn_failure_notice(rest_client, &dead, content);
+                terminalize_replay_batch(replay_state, &dead, "retry-budget dead letter");
             }
         } else {
             tracing::debug!(
@@ -4314,6 +4389,7 @@ fn handle_prompt_result(
                 "dropping failed batch for removed channel"
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
+            terminalize_replay_batch(replay_state, &batch, "removed-channel drop");
         }
     }
 
@@ -4573,8 +4649,40 @@ fn handle_prompt_result(
     LoopAction::Continue
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn recover_panicked_agent(
+fn handle_prompt_result(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    result: PromptResult,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+) -> LoopAction {
+    let replay_state = Arc::new(std::sync::Mutex::new(ReplayState::in_memory()));
+    handle_prompt_result_with_replay(
+        pool,
+        queue,
+        config,
+        result,
+        heartbeat_in_flight,
+        removed_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        rest_client,
+        &replay_state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_panicked_agent_with_replay(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -4586,6 +4694,7 @@ fn recover_panicked_agent(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
 ) {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
@@ -4597,15 +4706,19 @@ fn recover_panicked_agent(
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
-            if !removed_channels.contains(&ch) {
+            if matches!(config.dedup_mode, DedupMode::Queue) && !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
-                tracing::warn!("requeued batch for panicked agent {i}");
+                if let Some(dead) = queue.requeue(batch) {
+                    terminalize_replay_batch(replay_state, &dead, "panic retry-budget dead letter");
+                } else {
+                    tracing::warn!("requeued batch for panicked agent {i}");
+                }
             } else {
+                terminalize_replay_batch(replay_state, &batch, "panic terminal drop");
                 tracing::debug!(
                     channel_id = %ch,
-                    "dropping panicked batch for removed channel"
+                    "terminally dropping panicked batch"
                 );
             }
         }
@@ -4672,6 +4785,38 @@ fn recover_panicked_agent(
     });
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn recover_panicked_agent(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    join_error: tokio::task::JoinError,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) {
+    let replay_state = Arc::new(std::sync::Mutex::new(ReplayState::in_memory()));
+    recover_panicked_agent_with_replay(
+        pool,
+        queue,
+        config,
+        join_error,
+        heartbeat_in_flight,
+        removed_channels,
+        typing_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        &replay_state,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_ready_join_results(
     pool: &mut AgentPool,
@@ -4684,11 +4829,12 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            recover_panicked_agent_with_replay(
                 pool,
                 queue,
                 config,
@@ -4700,6 +4846,7 @@ fn drain_ready_join_results(
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
+                replay_state,
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                 return LoopAction::Exit;
@@ -8296,12 +8443,26 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
+        let replay_state = Arc::new(std::sync::Mutex::new(ReplayState::in_memory()));
+        let source_event = EventBuilder::new(Kind::Custom(9), "final-attempt")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let source_event_id = source_event.id.to_hex();
+        replay_state
+            .lock()
+            .unwrap()
+            .record_open(
+                channel_id,
+                source_event_id.clone(),
+                source_event.created_at.as_secs(),
+                source_event.created_at.as_secs(),
+                false,
+            )
+            .unwrap();
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
-                event: EventBuilder::new(Kind::Custom(9), "final-attempt")
-                    .sign_with_keys(&Keys::generate())
-                    .unwrap(),
+                event: source_event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
             }],
@@ -8317,7 +8478,7 @@ mod error_outcome_emission_tests {
             }),
             batch: Some(batch),
         };
-        handle_prompt_result(
+        handle_prompt_result_with_replay(
             &mut pool,
             &mut queue,
             &config,
@@ -8329,6 +8490,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &replay_state,
         );
 
         let events = observer.snapshot();
@@ -8347,6 +8509,13 @@ mod error_outcome_emission_tests {
             queue.queued_event_count(&channel_id),
             0,
             "batch with an exhausted retry budget must be dead-lettered, not requeued"
+        );
+        assert!(
+            replay_state
+                .lock()
+                .unwrap()
+                .is_handled(channel_id, &source_event_id),
+            "dead-lettered accepted work must not resurrect after restart"
         );
     }
 

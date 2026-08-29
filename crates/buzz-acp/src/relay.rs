@@ -1185,8 +1185,12 @@ impl BgState {
             return false;
         }
 
-        // Update last_seen timestamp.
-        let ts = event.created_at.as_secs();
+        // A relay-admitted event can still carry a sender-controlled future
+        // timestamp. Clamp it to the local receive wall clock so reconnect's
+        // five-second skew never becomes `future - 5s` and skips legitimate
+        // events published in the meantime.
+        let ts =
+            crate::replay_state::safe_replay_timestamp(event.created_at.as_secs(), unix_now_secs());
         self.last_seen
             .entry(channel_id)
             .and_modify(|t| *t = (*t).max(ts))
@@ -2187,7 +2191,10 @@ async fn handle_ws_message(
                             );
                             return true;
                         }
-                        let ts = event.created_at.as_secs();
+                        let ts = crate::replay_state::safe_replay_timestamp(
+                            event.created_at.as_secs(),
+                            unix_now_secs(),
+                        );
                         let buzz_event = BuzzEvent {
                             channel_id: channel_uuid,
                             event: *event,
@@ -2226,7 +2233,10 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
-                        let ts = event.created_at.as_secs();
+                        let ts = crate::replay_state::safe_replay_timestamp(
+                            event.created_at.as_secs(),
+                            unix_now_secs(),
+                        );
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
                             let buzz_event = BuzzEvent {
@@ -4740,6 +4750,23 @@ mod tests {
         let event = make_test_event(&keys, 1_700_000);
         state.record_event(channel_id, &event);
         assert_eq!(state.last_seen.get(&channel_id).copied(), Some(1_700_000));
+    }
+
+    #[test]
+    fn bg_state_future_timestamp_cannot_poison_reconnect_cursor() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let keys = nostr::Keys::generate();
+        let received_at = unix_now_secs();
+        let event = make_test_event(&keys, received_at + 3_600);
+
+        state.record_event(channel_id, &event);
+        let stored = state.last_seen.get(&channel_id).copied().unwrap();
+        assert!(stored <= unix_now_secs());
+        assert!(
+            stored.saturating_sub(SINCE_SKEW_SECS) <= received_at,
+            "future-5s subscription must not skip legitimate events"
+        );
     }
 
     #[test]
