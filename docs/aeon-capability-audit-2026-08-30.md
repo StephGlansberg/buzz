@@ -113,6 +113,42 @@ remain source-only:
   relay-member mention indexes commit in the owning transaction.
 - `aaf95a6844f284b7f3f0d7b0e2669d2efdbba08c` — deterministic CLI version and
   machine-readable command schema.
+- `b1faa0a4e2d42210c74f3b03126cf6ff034ae6ef` — render the manifest's
+  `throttleSeconds` as launchd `ThrottleInterval` for every Aspect worker.
+
+## Readiness proof and live-projection hold
+
+- The focused trigger-backed PostgreSQL rollback test passed against a
+  disposable loopback-only PostgreSQL 14 cluster. An injected
+  `event_mentions` failure rolled back the event, mention index, and thread
+  metadata together. No production database or Docker service was touched.
+- The complete mobile test suite passed: 2,007 tests, zero failures. Mobile
+  formatting and analysis also pass.
+- Release `buzz`, `buzz-acp`, and `buzz-relay` builds pass. Desktop frontend,
+  Tauri checks, and Tauri tests pass; the pre-push Rust suite and 3,005 Desktop
+  Rust tests are green.
+- The fork-main message deletion, signed event readback, actionable mention
+  disposition, and channel-scoped lifecycle-reaction capabilities are already
+  present in the integrated branch through newer equivalent implementations.
+  Merging the older duplicate commits would introduce ACP conflicts and is not
+  required to preserve those capabilities.
+
+The read-only generated-versus-live comparison found one hard deployment hold:
+the checked-in six private-office TOMLs are deliberately minimal, while live
+AEON-v6 supplies a richer mention/huddle mesh. Mechanon additionally separates
+trusted kind-9 replies from kind-40002 delivery-only traffic, and Mechanon and
+Sapientis have live operational prompt additions. A cutover MUST bind the new
+binary and indivisible publisher tuple to Fleet-rendered mesh configs and the
+preserved prompt deltas. It MUST NOT install the checked-in minimal TOMLs over
+the live generated configs. The source renderer accepts absolute `configPath`
+and `systemPromptPath` inputs for this projection. All ten candidate argv shapes
+parse through the real Clap parser; all ten live labels were running when the
+comparison was made. Installed Opulentis and FAMA plists were unloaded with no
+worker process, so no unexpected activation was present. The four frontier
+manifests also require an intentional candidate binary-SHA update; Claude and
+Grok otherwise match their rendered plists, Codex differs only in XML format,
+and Cursor deliberately drops the live `--no-base-prompt` override so it keeps
+the compiled Buzz contract.
 
 ## Cutover acceptance
 
@@ -124,7 +160,9 @@ Before installing or switching anything:
    Desktop, and mobile analysis/tests.
 3. Render all existing workers from clean source and compare complete argv,
    sessions, identities, tokens, prompts, supervisor fields, and running/off
-   parity with live state.
+   parity with live state. Preserve the Fleet-rendered AEON mention/huddle mesh
+   and the Mechanon/Sapientis prompt additions; do not replace them with the
+   minimal checked-in private-office fixtures.
 4. Back up the Desktop application data and persistent relay volumes. Do not
    migrate the community or keys.
 5. Produce immutable binaries/images and a rollback manifest with source and
