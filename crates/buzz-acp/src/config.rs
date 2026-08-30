@@ -1499,12 +1499,6 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
 
     let mut seen_names = std::collections::HashSet::new();
     for rule in &mut config.rules {
-        if rule.admit_invited_ephemeral {
-            return Err(ConfigError::ConfigFile(format!(
-                "rule '{}': admit_invited_ephemeral=true is not supported yet; refusing to widen channel scope",
-                rule.name,
-            )));
-        }
         if rule.name.trim().is_empty() {
             return Err(ConfigError::ConfigFile(
                 "rule name must not be empty".into(),
@@ -2374,7 +2368,9 @@ require_exact_channel_tag = false
         )
         .expect("write temp config");
         let error = load_rules(&path).expect_err("unsafe huddle rule must fail");
-        assert!(error.to_string().contains("not supported yet"));
+        assert!(error
+            .to_string()
+            .contains("requires require_exact_channel_tag=true"));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -2402,13 +2398,16 @@ require_exact_channel_tag = true
         )
         .expect("write temp config");
         let error = load_rules(&path).expect_err("static huddle scope must fail");
-        assert!(error.to_string().contains("not supported yet"));
+        assert!(error.to_string().contains("requires an empty channel list"));
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn invited_ephemeral_rule_requires_only_durable_kinds() {
-        for kinds in ["", "kinds = [20001]"] {
+        for (kinds, expected) in [
+            ("", "requires durable event kinds"),
+            ("kinds = [20001]", "rejects ephemeral event kinds"),
+        ] {
             let dir = std::env::temp_dir()
                 .join(format!("buzz-acp-invited-kinds-{}", uuid::Uuid::new_v4()));
             let path = dir.join("rules.toml");
@@ -2429,7 +2428,7 @@ require_exact_channel_tag = true
             )
             .expect("write temp config");
             let error = load_rules(&path).expect_err("unsafe huddle kinds must fail");
-            assert!(error.to_string().contains("not supported yet"));
+            assert!(error.to_string().contains(expected));
             std::fs::remove_dir_all(dir).ok();
         }
     }
@@ -2533,7 +2532,7 @@ admit_invited_ephemeral = false
     }
 
     #[test]
-    fn test_load_rules_rejects_unimplemented_invited_ephemeral_admission() {
+    fn test_load_rules_accepts_fail_closed_invited_ephemeral_admission() {
         let dir = std::env::temp_dir().join("buzz-acp-test-invited-ephemeral");
         let path = dir.join("rules.toml");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2542,14 +2541,25 @@ admit_invited_ephemeral = false
             r#"
 [[rules]]
 name = "ephemeral"
-channels = "all"
+channels = []
+kinds = [9]
+require_mention = true
+require_exact_channel_tag = true
 admit_invited_ephemeral = true
 "#,
         )
         .unwrap();
 
-        let error = load_rules(&path).unwrap_err();
-        assert!(error.to_string().contains("not supported yet"));
+        let rules = load_rules(&path).expect("safe dynamic admission rule must load");
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].admit_invited_ephemeral);
+        assert!(matches!(
+            &rules[0].channels,
+            ChannelScope::List(channels) if channels.is_empty()
+        ));
+        assert_eq!(rules[0].kinds, [9]);
+        assert!(rules[0].require_mention);
+        assert!(rules[0].require_exact_channel_tag);
         std::fs::remove_dir_all(&dir).ok();
     }
 

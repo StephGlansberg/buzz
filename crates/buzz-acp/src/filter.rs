@@ -122,8 +122,8 @@ pub struct SubscriptionRule {
     /// published a reply in the triggering event's origin thread.
     #[serde(default)]
     pub requires_reply: bool,
-    /// Reserved mesh contract for membership-triggered ephemeral channels.
-    /// The strict loader rejects `true` until membership type can be proven.
+    /// Admit membership-triggered channels only after their relay metadata
+    /// proves a positive TTL; `load_rules` enforces the fail-closed rule shape.
     #[serde(default)]
     pub admit_invited_ephemeral: bool,
     /// Optional evalexpr boolean expression for fine-grained filtering.
