@@ -29,7 +29,7 @@
     <string>--allowed-respond-to</string>
     <string>owner-only</string>
     <string>--no-memory</string>
-    <string>--base-prompt-file</string>
+    <string>--system-prompt-file</string>
     <string>/Volumes/AEON/Projects/buzz/deploy/local/aeon-aspects/prompts/mechanon-private-office.md</string>
     <string>--dedup</string>
     <string>queue</string>

@@ -37,8 +37,9 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
     assert.equal(rendered.supervisor.runAtLoad, true);
     assert.equal(rendered.supervisor.restartOnFailure, true);
     assert.match(argv, /--no-memory/);
-    assert.match(argv, new RegExp(`--base-prompt-file ${worker.basePromptFile}`));
+    assert.match(argv, new RegExp(`--system-prompt-file ${worker.systemPromptFile}`));
     assert.doesNotMatch(argv, /--no-base-prompt/);
+    assert.doesNotMatch(argv, /--base-prompt-file/);
     assert.match(argv, /--respond-to owner-only/);
     assert.match(argv, /--allowed-respond-to owner-only/);
     assert.match(argv, /--agents 1/);
@@ -56,7 +57,7 @@ test("every rendered worker is disabled and binds an existing fixed session", ()
     assert.match(argv, /--max-turns-per-session 0/);
     assert.match(argv, /--turn-receipts/);
     assert.doesNotMatch(argv, /--no-presence|--no-typing|--no-ignore-self/);
-    assert.doesNotMatch(argv, /--mcp-command|--model|--system-prompt|--team-instructions|--initial-message/);
+    assert.doesNotMatch(argv, /--mcp-command|--model|--system-prompt(?:\s|$)|--team-instructions|--initial-message/);
     assert.match(argv, new RegExp(`--expected-gateway-session-key ${worker.sessionKey}`));
     assert.match(argv, new RegExp(`--private-key-file ${identityMap.members[worker.aspect].secret_ref}`));
     assert.match(argv, new RegExp(`--expected-public-key ${worker.pubkey}`));
@@ -71,7 +72,7 @@ test("one shared contract renders exact trusted publisher prompts for all six of
   assert.equal((template.match(/\{\{/g) ?? []).length, 3);
   for (const worker of manifest.workers) {
     const rendered = renderWorker(manifest, identityMap, worker.aspect);
-    const promptPath = join(here, "..", "..", "..", worker.basePromptFile);
+    const promptPath = join(here, "..", "..", "..", worker.systemPromptFile);
     const prompt = fs.readFileSync(promptPath, "utf8");
     const tool = `buzz_${worker.aspect}_reply`;
     assert.equal(prompt, renderPrivateOfficePrompt(template, worker.aspect));
@@ -110,25 +111,56 @@ test("credential isolation, trusted envelope, receipt, and exact prompt are indi
   for (const worker of manifest.workers) {
     const rendered = renderWorker(manifest, identityMap, worker.aspect);
     assert.doesNotThrow(() =>
-      assertTrustedPublisherContract(rendered.args, worker.aspect, worker.basePromptFile),
+      assertTrustedPublisherContract(
+        rendered.args,
+        worker.aspect,
+        worker.systemPromptFile,
+        worker.sessionKey,
+      ),
     );
     for (const required of [
       "--no-agent-publisher-credentials",
       "--trusted-inbound-envelope",
-      "--base-prompt-file",
+      "--system-prompt-file",
       "--turn-receipts",
+      "--expected-gateway-session-key",
     ]) {
       const broken = rendered.args.filter((value) => value !== required);
       assert.throws(
-        () => assertTrustedPublisherContract(broken, worker.aspect, worker.basePromptFile),
+        () =>
+          assertTrustedPublisherContract(
+            broken,
+            worker.aspect,
+            worker.systemPromptFile,
+            worker.sessionKey,
+          ),
         new RegExp(required.replaceAll("-", "\\-")),
       );
     }
     const wrongPrompt = [...rendered.args];
-    wrongPrompt[wrongPrompt.indexOf("--base-prompt-file") + 1] = "/wrong/prompt.md";
+    wrongPrompt[wrongPrompt.indexOf("--system-prompt-file") + 1] = "/wrong/prompt.md";
     assert.throws(
-      () => assertTrustedPublisherContract(wrongPrompt, worker.aspect, worker.basePromptFile),
-      /base prompt drift/,
+      () =>
+        assertTrustedPublisherContract(
+          wrongPrompt,
+          worker.aspect,
+          worker.systemPromptFile,
+          worker.sessionKey,
+        ),
+      /system prompt drift/,
+    );
+    const wrongSession = [...rendered.args];
+    wrongSession[wrongSession.indexOf("--expected-gateway-session-key") + 1] =
+      "agent:wrong:buzz-private";
+    assert.throws(
+      () =>
+        assertTrustedPublisherContract(
+          wrongSession,
+          worker.aspect,
+          worker.systemPromptFile,
+          worker.sessionKey,
+        ),
+      /expected session drift/,
     );
   }
 });
@@ -153,7 +185,7 @@ test("Nexus uses the uniform publisher contract without changing its fixed sessi
   const rendered = renderWorker(manifest, identityMap, "nexus", "/owned/gateway.token");
   assert.match(
     rendered.args.join(" "),
-    /--base-prompt-file deploy\/local\/aeon-aspects\/prompts\/nexus-private-office\.md/,
+    /--system-prompt-file deploy\/local\/aeon-aspects\/prompts\/nexus-private-office\.md/,
   );
   assert.match(rendered.args.join(" "), /--session,agent:main:buzz-private,--require-existing/);
 });
@@ -179,9 +211,10 @@ test("six deterministic LaunchAgent previews are disabled and secret-free", () =
     assert.match(first.plist, /\/REQUIRES_FLEET\/owned-token-file/);
     assert.doesNotMatch(first.plist, /nsec1|BUZZ_PRIVATE_KEY=/);
     assert.match(first.plist, /--no-agent-publisher-credentials/);
-    assert.match(first.plist, /--base-prompt-file/);
-    assert.match(first.plist, new RegExp(`/Volumes/AEON/Projects/buzz/${worker.basePromptFile}`));
+    assert.match(first.plist, /--system-prompt-file/);
+    assert.match(first.plist, new RegExp(`/Volumes/AEON/Projects/buzz/${worker.systemPromptFile}`));
     assert.doesNotMatch(first.plist, /--no-base-prompt/);
+    assert.doesNotMatch(first.plist, /--base-prompt-file/);
     assert.deepEqual(first.rollback, ["launchctl", "bootout", `gui/<uid>/${first.label}`]);
     labels.add(first.label);
   }
@@ -224,11 +257,11 @@ test("LaunchAgent rendering rejects unsafe or relative runtime paths", () => {
     /must be absolute/,
   );
   assert.throws(
-    () => renderDisabledLaunchAgent(manifest, identityMap, "viatica", { basePromptPath: "relative.md" }),
+    () => renderDisabledLaunchAgent(manifest, identityMap, "viatica", { systemPromptPath: "relative.md" }),
     /must be absolute/,
   );
   assert.throws(
-    () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { basePromptPath: "relative.md" }),
+    () => renderDisabledLaunchAgent(manifest, identityMap, "nexus", { systemPromptPath: "relative.md" }),
     /must be absolute/,
   );
   assert.throws(
@@ -346,10 +379,10 @@ test("Fleet can keep launchd-owned paths local while Buzz reads its canonical co
 test("Fleet can install a trusted private-office prompt outside the working directory", () => {
   const rendered = renderDisabledLaunchAgent(manifest, identityMap, "viatica", {
     workingDirectory: "/Users/operator",
-    basePromptPath: "/owned/prompts/viatica-private-office.md",
+    systemPromptPath: "/owned/prompts/viatica-private-office.md",
   });
   assert.equal(
-    rendered.argv[rendered.argv.indexOf("--base-prompt-file") + 1],
+    rendered.argv[rendered.argv.indexOf("--system-prompt-file") + 1],
     "/owned/prompts/viatica-private-office.md",
   );
   assert.doesNotMatch(rendered.plist, /--no-base-prompt/);
@@ -381,16 +414,15 @@ test("Nexus activation is not coupled to the legacy aeon-buzz bridge", () => {
   assert.equal(rendered.sessionKey, "agent:main:buzz-private");
 });
 
-test("each room config enforces Architect-only private and huddle rules", () => {
+test("each room config enforces the exact Architect-only private office", () => {
   for (const worker of manifest.workers) {
     const source = fs.readFileSync(join(here, "config", `${worker.aspect}.toml`), "utf8");
     assert.match(source, new RegExp(worker.privateChannelId));
-    assert.equal((source.match(/kinds = \[9, 40002\]/g) ?? []).length, 2);
-    assert.equal((source.match(/require_exact_channel_tag = true/g) ?? []).length, 2);
+    assert.equal((source.match(/kinds = \[9, 40002\]/g) ?? []).length, 1);
+    assert.equal((source.match(/require_exact_channel_tag = true/g) ?? []).length, 1);
     assert.match(source, /require_mention = false/);
-    assert.match(source, /admit_invited_ephemeral = true/);
-    assert.match(source, /require_mention = true/);
-    assert.equal((source.match(new RegExp(manifest.buzz.architectPubkey, "g")) ?? []).length, 2);
+    assert.doesNotMatch(source, /admit_invited_ephemeral = true/);
+    assert.equal((source.match(new RegExp(manifest.buzz.architectPubkey, "g")) ?? []).length, 1);
     assert.doesNotMatch(source, new RegExp(manifest.buzz.conciliumChannelId));
   }
 });

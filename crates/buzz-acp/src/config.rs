@@ -1067,6 +1067,7 @@ impl Config {
             ));
         }
 
+        let system_prompt_file_requested = args.system_prompt_file.is_some();
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
         } else if let Some(ref path) = args.system_prompt_file {
@@ -1319,11 +1320,16 @@ impl Config {
             && (!args.trusted_inbound_envelope
                 || !args.turn_receipts
                 || args.no_base_prompt
-                || args.base_prompt_file.is_none())
+                || args.base_prompt_file.is_some()
+                || !system_prompt_file_requested
+                || system_prompt
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
         {
             return Err(ConfigError::ConfigFile(
                 "--no-agent-publisher-credentials requires --trusted-inbound-envelope, \
-                 --turn-receipts, and --base-prompt-file as one fail-closed publisher contract"
+                 --turn-receipts, --expected-gateway-session-key, the compiled base prompt, \
+                 and a non-empty --system-prompt-file as one fail-closed publisher contract"
                     .into(),
             ));
         }
@@ -3773,6 +3779,91 @@ process.stdout.write(JSON.stringify(workers));
             .agent_spawn_env()
             .iter()
             .any(|(key, _)| matches!(key.as_str(), "BUZZ_RELAY_URL" | "BUZZ_PRIVATE_KEY")));
+    }
+
+    #[test]
+    fn trusted_publisher_contract_layers_system_prompt_over_compiled_base() {
+        let dir = std::env::temp_dir().join(format!("buzz-acp-system-prompt-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let prompt_path = dir.join("nexus-private-office.md");
+        std::fs::write(&prompt_path, "Use exactly one trusted Nexus reply tool.\n").unwrap();
+        let owner = Keys::parse(TEST_PRIVATE_KEY).unwrap().public_key().to_hex();
+        let prompt = prompt_path.to_str().unwrap();
+
+        let valid = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-command",
+            "openclaw",
+            "--agent-owner",
+            owner.as_str(),
+            "--relay-observer",
+            "--turn-receipts",
+            "--expected-gateway-session-key",
+            "agent:main:buzz-private",
+            "--trusted-inbound-envelope",
+            "--no-agent-publisher-credentials",
+            "--system-prompt-file",
+            prompt,
+        ])
+        .unwrap();
+        let config = Config::from_args(valid).expect("complete trusted publisher contract");
+        assert!(!config.no_base_prompt);
+        assert_eq!(config.base_prompt_content, None);
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some("Use exactly one trusted Nexus reply tool.\n")
+        );
+        assert!(!config.agent_publisher_credentials);
+
+        let missing_system_prompt = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-command",
+            "openclaw",
+            "--agent-owner",
+            owner.as_str(),
+            "--relay-observer",
+            "--turn-receipts",
+            "--expected-gateway-session-key",
+            "agent:main:buzz-private",
+            "--trusted-inbound-envelope",
+            "--no-agent-publisher-credentials",
+        ])
+        .unwrap();
+        assert!(matches!(
+            Config::from_args(missing_system_prompt),
+            Err(ConfigError::ConfigFile(message)) if message.contains("--system-prompt-file")
+        ));
+
+        let custom_base_prompt = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--agent-command",
+            "openclaw",
+            "--agent-owner",
+            owner.as_str(),
+            "--relay-observer",
+            "--turn-receipts",
+            "--expected-gateway-session-key",
+            "agent:main:buzz-private",
+            "--trusted-inbound-envelope",
+            "--no-agent-publisher-credentials",
+            "--system-prompt-file",
+            prompt,
+            "--base-prompt-file",
+            prompt,
+        ])
+        .unwrap();
+        assert!(matches!(
+            Config::from_args(custom_base_prompt),
+            Err(ConfigError::ConfigFile(message)) if message.contains("compiled base prompt")
+        ));
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

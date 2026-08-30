@@ -5,14 +5,16 @@ settings aligned to the live deployment. It renders and validates configuration
 only; it does not install, load, start, restart, or switch any live service.
 
 Each worker uses Buzz only as the conversation transport. `--no-memory` keeps
-Gateway as the sole memory and compaction owner. All six workers use the
-existing `--base-prompt-file` facility with one shared contract rendered using
-only the private-office room and trusted `buzz_<aspect>_reply` tool names. The
-contract explicitly preserves each Aspect's full existing OpenClaw tools,
-skills, memory, identity, and fixed session. These custom prompts replace
-Buzz's generic `buzz messages send` doctrine, which is intentionally
-incompatible with `--no-agent-publisher-credentials`. Fleet may supply an
-absolute installed `basePromptPath`; no prompt content is embedded in a plist.
+Gateway as the sole memory and compaction owner. All six workers retain Buzz's
+compiled base prompt, including the shared collaboration contract, and layer
+one narrow `--system-prompt-file` rendered using only the private-office room
+and trusted `buzz_<aspect>_reply` tool names. The system layer explicitly
+preserves each Aspect's full existing OpenClaw tools, skills, memory, identity,
+and fixed session. When publisher credentials are withheld, the compiled base
+prompt yields its generic `buzz messages send` guidance to this caller-bound
+trusted reply tool; it never teaches the worker to recover a raw signer. Fleet
+may supply an absolute installed `systemPromptPath`; no prompt content is
+embedded in a plist.
 The adapter binds to a pre-created session with
 `openclaw acp --require-existing --session ...`. Existing Buzz ACP controls
 are pinned rather than inherited from changing defaults: heartbeat prompting
@@ -33,21 +35,10 @@ inside `buzz-acp`; the spawned ACP agent receives neither `BUZZ_RELAY_URL` nor
 `BUZZ_PRIVATE_KEY`. This makes the trusted reply tool the only outbound
 publisher authority for AEON managed workers.
 
-Room admission uses two config rules per worker:
-
-- the fixed private-office UUID accepts Architect-authored kind-9 and
-  kind-40002 stream posts without
-  requiring a mention;
-- a newly invited channel is added to the huddle rule only after canonical
-  kind-39000 metadata proves it is private, has a positive `ttl`, and has a
-  valid future `ttl_deadline`; huddle messages must mention the Aspect.
-
-Therefore Concilium and other ordinary rooms remain excluded. A metadata query
-failure also denies admission. The canonical addressable metadata winner is
-selected by newest `created_at`, then lowest event ID on a same-second tie.
-Eligibility is rechecked before every dynamic-room dispatch and periodically;
-expiry, archive, membership removal, or lookup failure unsubscribes the room,
-drains queued work, invalidates its session, and cancels an in-flight turn.
+Room admission uses one exact config rule per worker: the fixed private-office
+UUID accepts Architect-authored kind-9 and kind-40002 stream posts without
+requiring a mention. Concilium, huddles, and all other rooms remain excluded;
+their activation requires a separate admission contract and proof.
 
 Run the source validation without changing live state:
 
@@ -162,11 +153,12 @@ remains an explicit blocker before broad UI rollout.
 | profiles and avatars | native Desktop kind-0 rendering | six approved profile events; avatars are missing from the identity contract |
 | canvas and scoped search | native Buzz context/CLI surfaces | caller-bound Gateway Buzz read tool on the fixed Aspect session |
 | media and authored reactions | native relay/Desktop surfaces | caller-bound Gateway publisher and bounded mutation authority |
-| huddle STT/TTS | private text path is admitted by the invited-huddle rule | canonical kind-48106 guideline replay before spoken use |
+| huddle STT/TTS | excluded from this private-office package | separate admission plus canonical kind-48106 guideline replay before spoken use |
 | workflows | native Buzz workflow surface, intentionally not subscribed here | upstream approval/multi-room behavior and explicit AEON authority |
 
-The worker intentionally sets no Buzz MCP, model, system prompt, team
-instructions, or initial message. The narrow base prompt governs only the
-required final Buzz publication; Gateway continues to own tools, skills,
-memory, model, and Aspect identity. Concilium, workflows, raw audio, media
-mutations, and broad A2A speech remain independently gated.
+The worker intentionally sets no Buzz MCP, model, inline system prompt, team
+instructions, or initial message. The compiled Buzz base prompt remains the
+platform collaboration layer; the narrow per-Aspect system-prompt file governs
+only the required final Buzz publication. Gateway continues to own tools,
+skills, memory, model, and Aspect identity. Concilium, workflows, raw audio,
+media mutations, and broad A2A speech remain independently gated.

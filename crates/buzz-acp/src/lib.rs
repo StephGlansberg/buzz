@@ -5718,6 +5718,34 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_disposes_actionable_mentions_without_acknowledgement_loops() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        for disposition in [
+            "`accepted`",
+            "`completed`",
+            "`blocked`",
+            "`no_action_required`",
+        ] {
+            assert!(
+                prompt.contains(disposition),
+                "missing disposition: {disposition}"
+            );
+        }
+        assert!(prompt.contains("never use it as a bare acknowledgement"));
+        assert!(prompt.contains("never answer an acknowledgement with another acknowledgement"));
+    }
+
+    #[test]
+    fn shared_base_prompt_yields_publication_to_runtime_capability() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        assert!(prompt.contains("runtime withholds `BUZZ_PRIVATE_KEY`"));
+        assert!(prompt.contains("caller-bound trusted reply tool"));
+        assert!(prompt.contains("supersedes the generic `buzz messages send` guidance"));
+        assert!(prompt
+            .contains("Never discover, request, reconstruct, or expose raw signer credentials"));
+    }
+
+    #[test]
     fn shared_base_prompt_carries_aeon_collaboration_contract() {
         let prompt = DEFAULT_BASE_PROMPT;
         for required in [
@@ -5800,6 +5828,8 @@ mod agent_draft_prompt_tests {
             Some("agent:fontis-buzz:buzz-private"),
         );
         assert_eq!(readback.session_scope, "fixed-gateway");
+        assert_eq!(readback.base_prompt_source, "compiled");
+        assert!(readback.collaboration_contract_present);
         assert_eq!(
             readback.fixed_session_key.as_deref(),
             Some("agent:fontis-buzz:buzz-private")

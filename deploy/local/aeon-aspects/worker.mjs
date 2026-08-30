@@ -35,7 +35,7 @@ export function validateManifest(manifest, identityMap) {
   if (manifest.workers?.length !== 6) errors.push("exactly six Aspect workers are required");
   if (manifest.buzz?.relayUrl !== "ws://localhost:3000") errors.push("Buzz relay must use localhost");
   if (manifest.posture?.memory !== false) errors.push("Buzz memory injection must be disabled");
-  if (manifest.posture?.basePrompt !== false) errors.push("compiled generic Buzz base prompt must be disabled");
+  if (manifest.posture?.basePrompt !== true) errors.push("compiled Buzz base prompt must remain enabled");
   if (manifest.posture?.respondTo !== "owner-only") errors.push("respondTo must be owner-only");
   if (manifest.posture?.agents !== 1) errors.push("each worker must have one ACP subprocess");
   if (manifest.posture?.dedup !== "queue") errors.push("dedup must be queue");
@@ -84,8 +84,8 @@ export function validateManifest(manifest, identityMap) {
     if (worker.sessionKey !== `agent:${worker.gatewayAgentId}:buzz-private`) errors.push(`${worker.aspect}: unstable session key`);
     if (!member.secret_ref) errors.push(`${worker.aspect}: missing private-key reference`);
     const expectedPromptFile = `${PRIVATE_OFFICE_PROMPT_PREFIX}/${worker.aspect}-private-office.md`;
-    if (worker.basePromptFile !== expectedPromptFile) {
-      errors.push(`${worker.aspect}: trusted private-office base prompt drift`);
+    if (worker.systemPromptFile !== expectedPromptFile) {
+      errors.push(`${worker.aspect}: trusted private-office system prompt drift`);
     }
   }
   warnings.push("avatar metadata is absent from identity-map.json; live profile avatar validation remains open");
@@ -97,9 +97,9 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
   if (!worker) throw new Error(`unknown Aspect: ${aspect}`);
   const member = identityMap.members[aspect];
   const configPath = `deploy/local/aeon-aspects/config/${aspect}.toml`;
-  const basePromptArgs = worker.basePromptFile
-    ? ["--base-prompt-file", worker.basePromptFile]
-    : ["--no-base-prompt"];
+  const systemPromptArgs = worker.systemPromptFile
+    ? ["--system-prompt-file", worker.systemPromptFile]
+    : [];
   const rendered = {
     enabled: false,
     label: `org.aeon.buzz-acp.${aspect}`,
@@ -113,7 +113,7 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
       "--agent-args", ["acp", "--session", worker.sessionKey, "--require-existing", "--token-file", tokenFile, "--url", manifest.gateway.url, "--provenance", manifest.gateway.provenance, "--no-prefix-cwd"].join(","),
       "--agents", "1", "--subscribe", "config", "--config", configPath,
       "--respond-to", "owner-only", "--allowed-respond-to", "owner-only",
-      "--no-memory", ...basePromptArgs, "--dedup", "queue", "--multiple-event-handling", "queue", "--relay-observer", "--trusted-inbound-envelope", "--no-agent-publisher-credentials",
+      "--no-memory", ...systemPromptArgs, "--dedup", "queue", "--multiple-event-handling", "queue", "--relay-observer", "--trusted-inbound-envelope", "--no-agent-publisher-credentials",
       "--permission-mode", manifest.posture.permissionMode,
       "--heartbeat-interval", String(manifest.posture.heartbeatIntervalSecs),
       "--turn-liveness-secs", String(manifest.posture.turnLivenessSecs),
@@ -127,7 +127,12 @@ export function renderWorker(manifest, identityMap, aspect, tokenFile = "${AEON_
     sessionKey: worker.sessionKey,
     supervisor: manifest.supervisor
   };
-  assertTrustedPublisherContract(rendered.args, aspect, worker.basePromptFile);
+  assertTrustedPublisherContract(
+    rendered.args,
+    aspect,
+    worker.systemPromptFile,
+    worker.sessionKey,
+  );
   return rendered;
 }
 
@@ -147,25 +152,41 @@ function countArg(argv, expected) {
   return argv.filter((value) => value === expected).length;
 }
 
-export function assertTrustedPublisherContract(argv, aspect, expectedBasePromptFile) {
+export function assertTrustedPublisherContract(
+  argv,
+  aspect,
+  expectedSystemPromptFile,
+  expectedGatewaySessionKey,
+) {
   if (!Array.isArray(argv)) throw new Error(`${aspect}: worker argv must be an array`);
   for (const flag of [
     "--no-agent-publisher-credentials",
     "--trusted-inbound-envelope",
-    "--base-prompt-file",
+    "--system-prompt-file",
     "--turn-receipts",
+    "--expected-gateway-session-key",
   ]) {
     const count = countArg(argv, flag);
     if (count !== 1) {
       throw new Error(`${aspect}: trusted publisher contract requires exactly one ${flag}; found ${count}`);
     }
   }
-  if (argv.includes("--no-base-prompt")) {
-    throw new Error(`${aspect}: trusted publisher contract forbids --no-base-prompt`);
+  for (const forbidden of [
+    "--no-base-prompt",
+    "--base-prompt-file",
+    "--agent-publisher-credentials",
+  ]) {
+    if (argv.includes(forbidden)) {
+      throw new Error(`${aspect}: trusted publisher contract forbids ${forbidden}`);
+    }
   }
-  const basePromptIndex = argv.indexOf("--base-prompt-file");
-  if (argv[basePromptIndex + 1] !== expectedBasePromptFile) {
-    throw new Error(`${aspect}: trusted publisher contract base prompt drift`);
+  const systemPromptIndex = argv.indexOf("--system-prompt-file");
+  if (argv[systemPromptIndex + 1] !== expectedSystemPromptFile) {
+    throw new Error(`${aspect}: trusted publisher contract system prompt drift`);
+  }
+  const expectedSessionIndex = argv.indexOf("--expected-gateway-session-key");
+  if (argv[expectedSessionIndex + 1] !== expectedGatewaySessionKey) {
+    throw new Error(`${aspect}: trusted publisher contract expected session drift`);
   }
 }
 
@@ -212,7 +233,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   const privateKeyFile = options.privateKeyFile ?? identityMap.members[aspect].secret_ref;
   const workingDirectory = options.workingDirectory ?? "/Volumes/AEON/Projects/buzz";
   const configPath = options.configPath ?? null;
-  const basePromptPath = options.basePromptPath ?? null;
+  const systemPromptPath = options.systemPromptPath ?? null;
   const stdoutPath = options.stdoutPath ?? null;
   const stderrPath = options.stderrPath ?? null;
   const launcherPath = options.launcherPath ?? null;
@@ -277,7 +298,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
     privateKeyFile,
     workingDirectory,
     ...(configPath !== null ? { configPath } : {}),
-    ...(basePromptPath !== null ? { basePromptPath } : {}),
+    ...(systemPromptPath !== null ? { systemPromptPath } : {}),
     ...(stdoutPath !== null ? { stdoutPath } : {}),
     ...(stderrPath !== null ? { stderrPath } : {}),
     ...(launcherPath !== null ? { launcherPath } : {}),
@@ -326,17 +347,18 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
   }
   const configIndex = rendered.args.indexOf("--config") + 1;
   rendered.args[configIndex] = configPath ?? `${workingDirectory}/${rendered.args[configIndex]}`;
-  const basePromptIndex = rendered.args.indexOf("--base-prompt-file") + 1;
-  if (basePromptIndex > 0) {
-    rendered.args[basePromptIndex] =
-      basePromptPath ?? `${workingDirectory}/${rendered.args[basePromptIndex]}`;
-  } else if (basePromptPath !== null) {
-    throw new Error(`${aspect}: basePromptPath supplied for worker without a custom base prompt`);
+  const systemPromptIndex = rendered.args.indexOf("--system-prompt-file") + 1;
+  if (systemPromptIndex > 0) {
+    rendered.args[systemPromptIndex] =
+      systemPromptPath ?? `${workingDirectory}/${rendered.args[systemPromptIndex]}`;
+  } else if (systemPromptPath !== null) {
+    throw new Error(`${aspect}: systemPromptPath supplied for worker without a system prompt`);
   }
   assertTrustedPublisherContract(
     rendered.args,
     aspect,
-    rendered.args[rendered.args.indexOf("--base-prompt-file") + 1],
+    rendered.args[rendered.args.indexOf("--system-prompt-file") + 1],
+    rendered.sessionKey,
   );
   // launchd may reject direct execution of provenance-marked development binaries.
   // A Fleet-owned system launcher keeps the binary and its digest explicit in argv.
