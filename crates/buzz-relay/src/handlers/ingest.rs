@@ -546,6 +546,80 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
     }
 }
 
+/// Maximum number of distinct people one human-visible event may address.
+///
+/// This mirrors the client-side mention cap, but is enforced independently at
+/// the relay trust boundary so a hand-built signed event cannot create an
+/// unbounded notification/fan-out set.
+const MAX_ADDRESSING_P_TAGS: usize = 50;
+
+/// Whether a kind uses `p` tags as human-facing recipients/mentions.
+///
+/// Deliberately exclude kinds where `p` tags describe authority, ownership,
+/// membership, or a roster (notably NIP-29 kind 39002). Those shapes have
+/// separate per-kind contracts and may legitimately contain large sets.
+fn has_addressing_p_tags(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_TEXT_NOTE
+            | KIND_LONG_FORM
+            | KIND_STREAM_MESSAGE
+            | KIND_STREAM_MESSAGE_V2
+            | KIND_STREAM_MESSAGE_EDIT
+            | KIND_STREAM_MESSAGE_SCHEDULED
+            | KIND_STREAM_MESSAGE_DIFF
+            | KIND_FORUM_POST
+            | KIND_FORUM_COMMENT
+            | KIND_GIT_PATCH
+            | KIND_GIT_PULL_REQUEST
+            | KIND_GIT_PR_UPDATE
+            | KIND_GIT_ISSUE
+            | KIND_GIT_STATUS_OPEN
+            | KIND_GIT_STATUS_MERGED
+            | KIND_GIT_STATUS_CLOSED
+            | KIND_GIT_STATUS_DRAFT
+    )
+}
+
+/// Validate human-facing recipient tags without rewriting the signed event.
+///
+/// Addressing values are canonical identifiers, not loose hex: exactly 32
+/// bytes rendered as 64 lowercase hexadecimal characters. Duplicate tags are
+/// rejected rather than silently deduplicated because the relay cannot mutate
+/// signed input. Validation runs before any database write or subscription
+/// fan-out.
+fn validate_addressing_p_tags(event: &Event, kind: u32) -> Result<(), &'static str> {
+    if !has_addressing_p_tags(kind) {
+        return Ok(());
+    }
+
+    let mut recipients = std::collections::HashSet::new();
+    for tag in event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind().to_string() == "p")
+    {
+        let Some(value) = tag.content() else {
+            return Err("addressing p tag is missing a pubkey");
+        };
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("addressing p tag must be exactly 64 lowercase hexadecimal characters");
+        }
+        if !recipients.insert(value) {
+            return Err("duplicate addressing p tag");
+        }
+        if recipients.len() > MAX_ADDRESSING_P_TAGS {
+            return Err("addressing p tags exceed the maximum of 50 recipients");
+        }
+    }
+
+    Ok(())
+}
+
 /// Extract a channel UUID from the `"h"` NIP-29 group tag.
 pub(crate) fn extract_channel_id(event: &Event) -> Option<Uuid> {
     for tag in event.tags.iter() {
@@ -2239,6 +2313,9 @@ async fn ingest_event_inner(
         )));
     }
 
+    validate_addressing_p_tags(&event, kind_u32)
+        .map_err(|reason| IngestError::Rejected(format!("invalid: {reason}")))?;
+
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
     if event.pubkey != *auth.pubkey() && !is_gift_wrap {
         return Err(IngestError::AuthFailed(
@@ -3282,10 +3359,91 @@ mod tests {
     use buzz_conformance::{TraceStep, Tracer};
     use buzz_core::kind::{
         KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
-        KIND_MANAGED_AGENT, KIND_PERSONA, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE,
-        KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
+        KIND_MANAGED_AGENT, KIND_NIP29_GROUP_MEMBERS, KIND_PERSONA, KIND_PRESENCE_UPDATE,
+        KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
+
+    fn event_with_p_tags(kind: u32, pubkeys: impl IntoIterator<Item = String>) -> Event {
+        let tags = pubkeys
+            .into_iter()
+            .map(|pubkey| nostr::Tag::parse(["p", pubkey.as_str()]).expect("p tag"));
+        EventBuilder::new(Kind::Custom(kind as u16), "message")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign event")
+    }
+
+    #[test]
+    fn addressing_p_tags_accept_fifty_canonical_recipients() {
+        let event = event_with_p_tags(
+            KIND_STREAM_MESSAGE,
+            (0..MAX_ADDRESSING_P_TAGS).map(|index| format!("{index:064x}")),
+        );
+
+        assert_eq!(
+            validate_addressing_p_tags(&event, KIND_STREAM_MESSAGE),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn addressing_p_tags_reject_fifty_one_recipients() {
+        let event = event_with_p_tags(
+            KIND_STREAM_MESSAGE,
+            (0..=MAX_ADDRESSING_P_TAGS).map(|index| format!("{index:064x}")),
+        );
+
+        assert_eq!(
+            validate_addressing_p_tags(&event, KIND_STREAM_MESSAGE),
+            Err("addressing p tags exceed the maximum of 50 recipients")
+        );
+    }
+
+    #[test]
+    fn addressing_p_tags_reject_malformed_pubkeys() {
+        for malformed in ["a".repeat(63), "g".repeat(64)] {
+            let event = event_with_p_tags(KIND_STREAM_MESSAGE, [malformed]);
+            assert_eq!(
+                validate_addressing_p_tags(&event, KIND_STREAM_MESSAGE),
+                Err("addressing p tag must be exactly 64 lowercase hexadecimal characters")
+            );
+        }
+    }
+
+    #[test]
+    fn addressing_p_tags_reject_uppercase_pubkeys() {
+        let event = event_with_p_tags(KIND_STREAM_MESSAGE, ["A".repeat(64)]);
+
+        assert_eq!(
+            validate_addressing_p_tags(&event, KIND_STREAM_MESSAGE),
+            Err("addressing p tag must be exactly 64 lowercase hexadecimal characters")
+        );
+    }
+
+    #[test]
+    fn addressing_p_tags_reject_duplicates() {
+        let pubkey = "a".repeat(64);
+        let event = event_with_p_tags(KIND_STREAM_MESSAGE, [pubkey.clone(), pubkey]);
+
+        assert_eq!(
+            validate_addressing_p_tags(&event, KIND_STREAM_MESSAGE),
+            Err("duplicate addressing p tag")
+        );
+    }
+
+    #[test]
+    fn large_membership_rosters_are_not_addressing_tags() {
+        let event = event_with_p_tags(
+            KIND_NIP29_GROUP_MEMBERS,
+            (0..500).map(|index| format!("{index:064x}")),
+        );
+
+        assert_eq!(
+            validate_addressing_p_tags(&event, KIND_NIP29_GROUP_MEMBERS),
+            Ok(())
+        );
+    }
 
     #[test]
     fn missing_huddle_backing_channel_is_a_client_rejection() {
