@@ -68,7 +68,7 @@ test("manifest binds external codex_cli identity without changing Aspect semanti
 
 test("all external workers pin the same shared Data-volume buzz-acp release", () => {
   const binary = "/Users/architect/Library/Application Support/AEON/aeon-v6/bin/buzz-acp";
-  const sha256 = "02a1750186261cf2ab1e71b6c249ea4120fb4e9e1b8e9ffc9006f25be86a9ae4";
+  const sha256 = "0b82c07fec099742ccee1509a1e2bcbc419cbd322bfa0d6967a1e43dd0c146fd";
   assert.equal(manifest.runtime.buzzAcpBinary, binary);
   assert.equal(claudeManifest.runtime.buzzAcpBinary, binary);
   assert.equal(cursorManifest.runtime.buzzAcpBinary, binary);
