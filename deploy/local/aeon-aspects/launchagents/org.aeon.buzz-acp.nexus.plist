@@ -59,6 +59,7 @@
   <key>WorkingDirectory</key><string>/Volumes/AEON/Projects/buzz</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>/Volumes/AEON/Projects/buzz-data/logs/nexus.buzz-acp.log</string>
   <key>StandardErrorPath</key><string>/Volumes/AEON/Projects/buzz-data/logs/nexus.buzz-acp.err.log</string>

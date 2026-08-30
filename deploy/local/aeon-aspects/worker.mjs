@@ -385,6 +385,7 @@ export function renderDisabledLaunchAgent(manifest, identityMap, aspect, options
     enabled: false,
     runAtLoad: manifest.supervisor.runAtLoad,
     keepAlive: manifest.supervisor.restartOnFailure,
+    throttleInterval: manifest.supervisor.throttleSeconds,
     argv,
     privateKeyFile,
     tokenFile,
@@ -403,6 +404,7 @@ ${argsXml}
   <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>${environmentXml}
   <key>RunAtLoad</key><${manifest.supervisor.runAtLoad}/>
   <key>KeepAlive</key><${manifest.supervisor.restartOnFailure}/>
+  <key>ThrottleInterval</key><integer>${manifest.supervisor.throttleSeconds}</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${xml(stdout)}</string>
   <key>StandardErrorPath</key><string>${xml(stderr)}</string>
