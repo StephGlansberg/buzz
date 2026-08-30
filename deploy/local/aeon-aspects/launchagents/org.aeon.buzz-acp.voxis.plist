@@ -60,6 +60,7 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>AbandonProcessGroup</key><false/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>/Volumes/AEON/Projects/buzz-data/logs/voxis.buzz-acp.log</string>
   <key>StandardErrorPath</key><string>/Volumes/AEON/Projects/buzz-data/logs/voxis.buzz-acp.err.log</string>
