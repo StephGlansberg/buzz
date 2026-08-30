@@ -405,6 +405,7 @@ ${argsXml}
   <key>RunAtLoad</key><${manifest.supervisor.runAtLoad}/>
   <key>KeepAlive</key><${manifest.supervisor.restartOnFailure}/>
   <key>ThrottleInterval</key><integer>${manifest.supervisor.throttleSeconds}</integer>
+  <key>AbandonProcessGroup</key><false/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${xml(stdout)}</string>
   <key>StandardErrorPath</key><string>${xml(stderr)}</string>

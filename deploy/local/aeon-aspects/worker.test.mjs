@@ -209,6 +209,7 @@ test("six deterministic LaunchAgent previews are disabled and secret-free", () =
     assert.match(first.plist, /<key>RunAtLoad<\/key><true\/>/);
     assert.match(first.plist, /<key>KeepAlive<\/key><true\/>/);
     assert.match(first.plist, /<key>ThrottleInterval<\/key><integer>10<\/integer>/);
+    assert.match(first.plist, /<key>AbandonProcessGroup<\/key><false\/>/);
     assert.match(first.plist, /\/REQUIRES_FLEET\/immutable-openclaw\/bin\/openclaw/);
     assert.match(first.plist, /\/REQUIRES_FLEET\/owned-token-file/);
     assert.doesNotMatch(first.plist, /nsec1|BUZZ_PRIVATE_KEY=/);
