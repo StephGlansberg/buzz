@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
