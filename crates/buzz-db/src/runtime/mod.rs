@@ -14,10 +14,10 @@ use buzz_core::{CommunityId, StoredEvent};
 
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
-/// This pool-owning wrapper propagates failures to its caller. Replacement writes
-/// use the transaction-bound helper below so event storage and mention indexing
-/// commit or roll back together. Duplicate inserts are silently skipped with
-/// `INSERT ... ON CONFLICT DO NOTHING`.
+/// This pool-owning wrapper propagates failures to its caller. Authoritative event
+/// writes use the transaction-bound helper below so event storage and mention
+/// indexing commit or roll back together. Duplicate inserts are silently skipped
+/// with `INSERT ... ON CONFLICT DO NOTHING`.
 pub async fn insert_mentions(
     pool: &PgPool,
     community_id: CommunityId,
@@ -30,9 +30,8 @@ pub async fn insert_mentions(
     Ok(())
 }
 
-/// Insert mention rows on the caller's transaction. Replacement writes use
-/// this so the authoritative event and its discovery index commit or roll back
-/// as one unit.
+/// Insert mention rows on the caller's transaction so the authoritative event
+/// and its discovery index commit or roll back as one unit.
 pub(crate) async fn insert_mentions_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community_id: CommunityId,
@@ -941,11 +940,6 @@ impl Db {
         )
         .await?;
         tx.commit().await?;
-        if result.1 {
-            if let Err(e) = insert_mentions(&self.pool, community_id, event, channel_id).await {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
         Ok(result)
     }
 

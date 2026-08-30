@@ -527,7 +527,7 @@ impl Db {
         actor_pubkey: &[u8],
         emoji: &str,
     ) -> Result<ReactionEventInsertOutcome> {
-        let outcome = crate::reaction::insert_reaction_event_with_thread_metadata(
+        crate::reaction::insert_reaction_event_with_thread_metadata(
             &self.pool,
             community_id,
             event,
@@ -537,18 +537,7 @@ impl Db {
             actor_pubkey,
             emoji,
         )
-        .await?;
-        if let ReactionEventInsertOutcome::Inserted {
-            was_inserted: true, ..
-        } = &outcome
-        {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
-        Ok(outcome)
+        .await
     }
 
     /// Add (or re-activate) a reaction.
