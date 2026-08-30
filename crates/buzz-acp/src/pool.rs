@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport,
+    ModelSwitchMethod, StopReason, SystemPromptTransport, TrustedInboundEventEnvelope,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -514,6 +514,13 @@ pub enum TimeoutKind {
 #[allow(dead_code)]
 pub enum PromptOutcome {
     Ok(StopReason),
+    /// ACP completed normally, but a rule-level origin reply contract was not
+    /// satisfied. The agent process remains healthy; Queue mode retries the
+    /// triggering batch rather than reporting a false success.
+    Incomplete {
+        missing_reply_event_ids: Vec<String>,
+        stop_reason: StopReason,
+    },
     Error(AcpError),
     /// Local relay state could not establish project authority. The ACP
     /// process is healthy; preserve the batch for bounded retry.
@@ -699,6 +706,8 @@ pub struct PromptContext {
     /// from `heartbeat_prompt` (agent self-prompting).
     pub turn_liveness_interval: Duration,
     pub dedup_mode: DedupMode,
+    /// Durable accepted/handled request state shared with the event loop.
+    pub replay_state: Arc<Mutex<crate::replay_state::ReplayState>>,
     pub system_prompt: Option<String>,
     /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
     /// on `session/new`. Never part of the prompt.
@@ -738,6 +747,13 @@ pub struct PromptContext {
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
+    /// Opt-in durable-evidence readback for OpenClaw-authored Buzz replies.
+    pub turn_receipts: bool,
+    /// Fixed Gateway session key that ACP lineage evidence must match.
+    pub expected_gateway_session_key: Option<String>,
+    /// Attach one verified triggering event as non-model ACP metadata.
+    pub trusted_inbound_envelope: bool,
+
     /// Relay URL this harness is connected to. Rides in observer payloads that
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
@@ -1036,6 +1052,11 @@ const CONTEXT_COUNT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Delay between the first failed context fetch and the single retry.
 const CONTEXT_FETCH_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// Reply-contract readback is intentionally shorter than conversation context:
+/// the agent just published the reply, so two bounded probes are sufficient.
+const REPLY_READBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const REPLY_READBACK_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Timeout for model-switch requests (`session/set_config_option`, `session/set_model`).
 const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1048,6 +1069,223 @@ const CONTROL_CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 /// Timeout for permission-mode requests (`session/set_config_option` with `configId: "mode"`).
 const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Number of relay readbacks used to resolve an out-of-band Buzz CLI reply.
+const RECEIPT_REPLY_READBACK_ATTEMPTS: usize = 5;
+/// Delay between successful relay queries that have not observed the reply yet.
+const RECEIPT_REPLY_READBACK_DELAY: Duration = Duration::from_millis(200);
+
+fn merge_anchored_replies(
+    accumulated: &mut Vec<crate::relay::AnchoredReply>,
+    observed: Vec<crate::relay::AnchoredReply>,
+) {
+    for reply in observed {
+        if !accumulated
+            .iter()
+            .any(|existing| existing.event_id == reply.event_id)
+        {
+            accumulated.push(reply);
+        }
+    }
+    accumulated.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+}
+
+fn closed_receipt_payload(
+    request_event_ids: &[String],
+    reply_events: &[crate::relay::AnchoredReply],
+    gateway_session_key: Option<&str>,
+    expected_gateway_session_key: Option<&str>,
+    run_id: Option<&str>,
+    acp_session_id: &str,
+    turn_id: &str,
+) -> serde_json::Value {
+    let observed_at_unix_ms = chrono::Utc::now().timestamp_millis();
+    let failure = |reason: &str| {
+        serde_json::json!({
+            "status": "failed",
+            "reason": reason,
+            "requestEventIds": request_event_ids,
+            "schemaVersion": 1,
+            "acpSessionId": acp_session_id,
+            "turnId": turn_id,
+        })
+    };
+    if request_event_ids.len() != 1 {
+        return failure("receipt_requires_exactly_one_request");
+    }
+    if reply_events.len() != 1 {
+        return failure(if reply_events.is_empty() {
+            "receipt_requires_one_anchored_reply_found_zero"
+        } else {
+            "receipt_requires_one_anchored_reply_found_multiple"
+        });
+    }
+    let Some(gateway_session_key) = gateway_session_key.filter(|value| !value.is_empty()) else {
+        return failure("gateway_session_key_evidence_missing");
+    };
+    let Some(expected_gateway_session_key) =
+        expected_gateway_session_key.filter(|value| !value.is_empty())
+    else {
+        return failure("expected_gateway_session_key_missing");
+    };
+    if gateway_session_key != expected_gateway_session_key {
+        return failure("gateway_session_key_mismatch");
+    }
+    let Some(run_id) = run_id.filter(|value| !value.is_empty()) else {
+        return failure("gateway_run_id_evidence_missing");
+    };
+    serde_json::json!({
+        "status": "closed",
+        "schemaVersion": 1,
+        "requestEventId": request_event_ids[0],
+        "replyEventId": reply_events[0].event_id,
+        "replyAnchor": reply_events[0].reply_to,
+        "gatewaySessionKey": gateway_session_key,
+        "expectedGatewaySessionKey": expected_gateway_session_key,
+        "runId": run_id,
+        "acpSessionId": acp_session_id,
+        "turnId": turn_id,
+        "observedAtUnixMs": observed_at_unix_ms,
+    })
+}
+
+struct ReplyReadbackScope<'a> {
+    expected_reply_anchor: Option<&'a str>,
+    prior_reply_event_ids: Result<&'a HashSet<String>, &'a str>,
+}
+
+async fn observe_closed_turn_receipt(
+    agent: &AcpClient,
+    ctx: &PromptContext,
+    channel_id: Uuid,
+    request_event_ids: &[String],
+    readback_scope: ReplyReadbackScope<'_>,
+    acp_session_id: &str,
+    turn_id: &str,
+) {
+    let mut replies = Vec::new();
+    if request_event_ids.len() == 1 {
+        let Some(expected_reply_anchor) =
+            receipt_query_anchor(request_event_ids, readback_scope.expected_reply_anchor)
+        else {
+            agent.observe(
+                "turn_receipt",
+                closed_receipt_payload(
+                    request_event_ids,
+                    &replies,
+                    agent.active_session_key(),
+                    ctx.expected_gateway_session_key.as_deref(),
+                    agent.active_run_id(),
+                    acp_session_id,
+                    turn_id,
+                ),
+            );
+            return;
+        };
+        let prior_reply_event_ids = match readback_scope.prior_reply_event_ids {
+            Ok(ids) => ids,
+            Err(error) => {
+                agent.observe(
+                    "turn_receipt",
+                    serde_json::json!({
+                        "status": "failed",
+                        "reason": "reply_evidence_baseline_query_failed",
+                        "requestEventIds": request_event_ids,
+                        "error": error,
+                    }),
+                );
+                return;
+            }
+        };
+        for attempt in 0..RECEIPT_REPLY_READBACK_ATTEMPTS {
+            match ctx
+                .rest_client
+                .query_anchored_replies(
+                    channel_id,
+                    ctx.agent_keys.public_key(),
+                    expected_reply_anchor,
+                )
+                .await
+            {
+                Ok(found) => {
+                    let found = replies_for_current_turn(found, prior_reply_event_ids);
+                    merge_anchored_replies(&mut replies, found);
+                    // Multiple distinct replies can never recover to a valid
+                    // receipt, so fail early. A single reply must remain under
+                    // observation for the complete bounded quiescence window
+                    // so a delayed duplicate cannot escape cardinality checks.
+                    if replies.len() > 1 {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    agent.observe(
+                        "turn_receipt",
+                        serde_json::json!({
+                            "status": "failed",
+                            "reason": "reply_evidence_query_failed",
+                            "requestEventIds": request_event_ids,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    return;
+                }
+            }
+            if attempt + 1 < RECEIPT_REPLY_READBACK_ATTEMPTS {
+                tokio::time::sleep(RECEIPT_REPLY_READBACK_DELAY).await;
+            }
+        }
+    }
+    agent.observe(
+        "turn_receipt",
+        closed_receipt_payload(
+            request_event_ids,
+            &replies,
+            agent.active_session_key(),
+            ctx.expected_gateway_session_key.as_deref(),
+            agent.turn_run_id(),
+            acp_session_id,
+            turn_id,
+        ),
+    );
+}
+
+fn replies_for_current_turn(
+    mut replies: Vec<crate::relay::AnchoredReply>,
+    prior_reply_event_ids: &HashSet<String>,
+) -> Vec<crate::relay::AnchoredReply> {
+    replies.retain(|reply| !prior_reply_event_ids.contains(&reply.event_id));
+    replies
+}
+
+async fn capture_prior_reply_event_ids(
+    ctx: &PromptContext,
+    source: &PromptSource,
+    request_event_ids: &[String],
+    expected_reply_anchor: Option<&str>,
+) -> Result<HashSet<String>, String> {
+    let PromptSource::Channel(channel_id) = source else {
+        return Ok(HashSet::new());
+    };
+    let Some(anchor) = receipt_query_anchor(request_event_ids, expected_reply_anchor) else {
+        return Ok(HashSet::new());
+    };
+    ctx.rest_client
+        .query_anchored_replies(*channel_id, ctx.agent_keys.public_key(), anchor)
+        .await
+        .map(|replies| replies.into_iter().map(|reply| reply.event_id).collect())
+        .map_err(|error| error.to_string())
+}
+
+fn receipt_query_anchor<'a>(
+    request_event_ids: &[String],
+    expected_reply_anchor: Option<&'a str>,
+) -> Option<&'a str> {
+    (request_event_ids.len() == 1)
+        .then_some(expected_reply_anchor)
+        .flatten()
+        .filter(|anchor| !anchor.is_empty())
+}
 
 /// Placeholder [`fetch_channel_info`] substitutes when a channel's metadata
 /// event carries no `name` tag. Not a real channel name — consumers that need
@@ -1838,12 +2076,15 @@ fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
 /// On the happy path the read loop has already called `take()`, so this is a no-op.
 fn send_prompt_result(
     result_tx: &mpsc::UnboundedSender<PromptResult>,
+    completion: &TurnCompletionGuard,
     turn_id: &str,
     mut agent: OwnedAgent,
     source: PromptSource,
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
+    completion.set_publisher_invoked(agent.acp.reply_publisher_invoked());
+    completion.finish(&outcome);
     agent.acp.clear_steer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
@@ -1891,6 +2132,7 @@ pub async fn run_prompt_task(
         turn_id.clone(),
         turn_started_at.clone(),
     ));
+    agent.acp.reset_reply_publisher_invoked();
     let triggering_event_ids: Vec<String> = batch
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
@@ -1910,12 +2152,108 @@ pub async fn run_prompt_task(
     // metadata now, before the agent is moved into PromptResult. It must be
     // declared before `liveness_guard`: Rust drops locals in reverse order, so
     // liveness is aborted before completion makes the turn terminal.
-    let _turn_guard = TurnCompletionGuard::new(
+    let turn_guard = TurnCompletionGuard::new(
         agent.acp.observer_handle(),
         agent.acp.observer_agent_index(),
         observer_channel_id,
         turn_id.clone(),
+        triggering_event_ids.clone(),
     );
+
+    // Install reaction cleanup before trusted admission can return. Refused
+    // events are terminal and must not retain a stale seen/typing marker.
+    let reaction_ids: Vec<String> = batch
+        .as_ref()
+        .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
+        .unwrap_or_default();
+    let _reaction_guard = observer_channel_id.map(|channel_id| {
+        ReactionGuard::new(ctx.rest_client.clone(), channel_id, reaction_ids.clone())
+    });
+
+    let trusted_inbound_envelope = if ctx.trusted_inbound_envelope {
+        match &source {
+            PromptSource::Heartbeat => None,
+            PromptSource::Channel(_) => {
+                let requires_reply = batch
+                    .as_ref()
+                    .filter(|batch| batch.events.len() == 1)
+                    .and_then(|batch| {
+                        batch.events.first().map(|event| {
+                            ctx.replay_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .requires_reply(batch.channel_id, &event.event.id.to_hex())
+                        })
+                    })
+                    .unwrap_or(false);
+                match TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+                    batch.as_ref(),
+                    requires_reply,
+                    ctx.max_turn_duration,
+                ) {
+                    Ok(envelope) => Some(envelope),
+                    Err(reason) => {
+                        tracing::warn!(
+                            refusal_code = reason,
+                            "trusted inbound event envelope refused"
+                        );
+                        agent.acp.observe(
+                            "trusted_inbound_event_refused",
+                            serde_json::json!({ "refusalCode": reason }),
+                        );
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_guard,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(AcpError::TrustedInboundEventRefused(reason)),
+                            None,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    // Trusted turns defer 👀 until signed-event admission succeeds. Awaiting
+    // it here orders the add before ReactionGuard can remove it.
+    if trusted_inbound_envelope.is_some() {
+        for event_id in &reaction_ids {
+            if let Some(channel_id) = observer_channel_id {
+                reaction_add(&ctx.rest_client, channel_id, event_id, REACTION_SEEN).await;
+            }
+        }
+    }
+
+    // Resolve project authority before creating an ACP session. An
+    // indeterminate relay read must not cross the trusted execution boundary.
+    let resolved_channel_info = match &source {
+        PromptSource::Channel(channel_id) => match ctx.channel_info.resolve(*channel_id).await {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    "project context is indeterminate; requeueing turn before ACP session creation: {}",
+                    error.0
+                );
+                send_prompt_result(
+                    &result_tx,
+                    &turn_guard,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::ProjectContextIndeterminate(error.0),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+        },
+        PromptSource::Heartbeat => None,
+    };
 
     // Start liveness with `turn_started`, not the final session/prompt call:
     // session creation, context fetches, and an initial message can themselves
@@ -1944,44 +2282,6 @@ pub async fn run_prompt_task(
     );
     let liveness_handle = tokio::spawn(liveness);
     let liveness_guard = LivenessGuard::new(liveness_handle, liveness_state);
-
-    // Collects event IDs up front. On drop (any exit path — normal, early
-    // return, or panic), spawns best-effort cleanup of both 👀 and 💬.
-    // See `ReactionGuard` docs for ordering guarantees and known edge cases.
-    let reaction_ids: Vec<String> = batch
-        .as_ref()
-        .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
-        .unwrap_or_default();
-    let _reaction_guard = observer_channel_id.map(|channel_id| {
-        ReactionGuard::new(ctx.rest_client.clone(), channel_id, reaction_ids.clone())
-    });
-
-    // Resolve project authority exactly once, before any ACP session creation or
-    // initial-message delivery. An indeterminate result is a local relay-state
-    // outcome: fail closed and preserve the batch without poisoning the healthy
-    // ACP process.
-    let resolved_channel_info = match &source {
-        PromptSource::Channel(channel_id) => match ctx.channel_info.resolve(*channel_id).await {
-            Ok(info) => info,
-            Err(error) => {
-                tracing::warn!(
-                    channel_id = %channel_id,
-                    "project context is indeterminate; requeueing turn before ACP session creation: {}",
-                    error.0
-                );
-                send_prompt_result(
-                    &result_tx,
-                    &turn_id,
-                    agent,
-                    source,
-                    PromptOutcome::ProjectContextIndeterminate(error.0),
-                    requeue_batch_if_queue(&ctx, batch),
-                );
-                return;
-            }
-        },
-        PromptSource::Heartbeat => None,
-    };
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2152,6 +2452,7 @@ pub async fn run_prompt_task(
                         agent.state.invalidate_all();
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2165,6 +2466,7 @@ pub async fn run_prompt_task(
                         // so the next retry will re-fetch a fresh revision.
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2209,6 +2511,7 @@ pub async fn run_prompt_task(
                         agent.state.invalidate_all();
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2220,6 +2523,7 @@ pub async fn run_prompt_task(
                     Err(e) => {
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2241,6 +2545,7 @@ pub async fn run_prompt_task(
     // Backfill liveness's shared session ID so ticks after this point carry
     // it too, matching every other observer frame for this turn.
     liveness_guard.set_session_id(session_id.clone());
+    turn_guard.set_session_id(session_id.clone());
     agent.acp.observe(
         "session_resolved",
         serde_json::json!({
@@ -2329,6 +2634,7 @@ pub async fn run_prompt_task(
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2365,6 +2671,7 @@ pub async fn run_prompt_task(
                             agent.state.invalidate_all();
                             send_prompt_result(
                                 &result_tx,
+                                &turn_guard,
                                 &turn_id,
                                 agent,
                                 source,
@@ -2383,6 +2690,7 @@ pub async fn run_prompt_task(
                     }
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2401,6 +2709,7 @@ pub async fn run_prompt_task(
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2417,6 +2726,7 @@ pub async fn run_prompt_task(
                     agent.state.invalidate(&source);
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2435,8 +2745,8 @@ pub async fn run_prompt_task(
     // (`prompt[0].text.startsWith("/")`) fires; the wrapped Buzz context
     // follows as a second block.
     let mut slash_command: Option<String> = None;
-    // Event IDs represented by this prompt. Commit only after ACP reports a
-    // successful turn; failed/cancelled prompts must be retryable without loss.
+    let mut expected_reply_anchor: Option<String> = None;
+    // Commit delivery state only after ACP reports a successful turn.
     let mut pending_delivered_event_ids = HashSet::new();
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
@@ -2516,29 +2826,30 @@ pub async fn run_prompt_task(
             );
         }
 
-        crate::queue::format_prompt(
-            b,
-            &crate::queue::FormatPromptArgs {
-                agent_core: standing.agent_core,
-                huddle_instructions: standing.huddle_instructions,
-                channel_info: channel_info.as_ref(),
-                conversation_context: conversation_context.as_ref(),
-                conversation_context_had_delivered_events,
-                profile_lookup: profile_lookup.as_ref(),
-                has_system_prompt_support: agent.has_system_prompt_support(),
-                base_prompt: standing.base_prompt,
-                system_prompt: standing.system_prompt,
-                team_instructions: standing.team_instructions,
-                agent_canvas: standing.agent_canvas,
-                standing_context_sent,
-            },
-        )
+        let format_args = crate::queue::FormatPromptArgs {
+            agent_core: standing.agent_core,
+            huddle_instructions: standing.huddle_instructions,
+            channel_info: channel_info.as_ref(),
+            conversation_context: conversation_context.as_ref(),
+            conversation_context_had_delivered_events,
+            profile_lookup: profile_lookup.as_ref(),
+            turn_receipts: ctx.turn_receipts,
+            has_system_prompt_support: agent.has_system_prompt_support(),
+            base_prompt: standing.base_prompt,
+            system_prompt: standing.system_prompt,
+            team_instructions: standing.team_instructions,
+            agent_canvas: standing.agent_canvas,
+            standing_context_sent,
+        };
+        expected_reply_anchor = crate::queue::resolve_turn_reply_anchor(b, &format_args);
+        crate::queue::format_prompt(b, &format_args)
     } else {
         // Should not happen — batch is None only for heartbeats which have prompt_text.
         // Return the agent to the pool to prevent a permanent slot leak.
         tracing::error!("run_prompt_task: no batch and no prompt_text — returning agent");
         send_prompt_result(
             &result_tx,
+            &turn_guard,
             &turn_id,
             agent,
             source,
@@ -2596,6 +2907,23 @@ pub async fn run_prompt_task(
         }),
     );
 
+    // Snapshot replies that already exist at this turn's effective anchor.
+    // Thread-root follow-ups intentionally reuse a stable NIP-10 anchor, so
+    // anchor-only readback would otherwise count replies from earlier turns.
+    // The post-turn receipt subtracts this exact baseline and closes only over
+    // reply events first observed for the current turn.
+    let prior_reply_event_ids = if ctx.turn_receipts {
+        capture_prior_reply_event_ids(
+            &ctx,
+            &source,
+            &triggering_event_ids,
+            expected_reply_anchor.as_deref(),
+        )
+        .await
+    } else {
+        Ok(HashSet::new())
+    };
+
     // Turn start, labelled exactly as `log_stop_reason` labels the end, so a
     // log reads as start/stop pairs. Purely observational: an unpaired start is
     // the only durable evidence that a turn was entered and never returned, and
@@ -2608,31 +2936,53 @@ pub async fn run_prompt_task(
         prompt_label(&source)
     );
 
+    // Resolve bounded media before entering the cancellable select. The prompt
+    // future must set its request id on its first poll so a queued control
+    // signal cannot mistake pre-send work for a naturally completed turn.
+    let media_started = tokio::time::Instant::now();
+    let inbound_images = agent
+        .acp
+        .prepare_trusted_inbound_images(
+            trusted_inbound_envelope.as_ref(),
+            &ctx.rest_client,
+            ctx.max_turn_duration,
+        )
+        .await;
+    let prompt_max_duration = ctx
+        .max_turn_duration
+        .saturating_sub(media_started.elapsed())
+        .max(std::time::Duration::from_millis(1));
+
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    agent.acp.begin_turn_evidence();
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_blocks_with_idle_timeout_and_meta(
                     &session_id,
                     &prompt_blocks,
+                    trusted_inbound_envelope.as_ref(),
+                    &inbound_images,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    prompt_max_duration,
                 ) => result,
             }
         }
         Some(rx) => {
             tokio::select! {
                 biased;
-                result = agent.acp.session_prompt_blocks_with_idle_timeout(
+                result = agent.acp.session_prompt_blocks_with_idle_timeout_and_meta(
                     &session_id,
                     &prompt_blocks,
+                    trusted_inbound_envelope.as_ref(),
+                    &inbound_images,
                     ctx.idle_timeout,
-                    ctx.max_turn_duration,
+                    prompt_max_duration,
                 ) => result,
                 mode = rx => {
                     let control_signal = mode.unwrap_or(ControlSignal::Cancel);
@@ -2677,6 +3027,7 @@ pub async fn run_prompt_task(
                                 .await;
                                 send_prompt_result(
                                     &result_tx,
+                                    &turn_guard,
                                     &turn_id,
                                     agent,
                                     source,
@@ -2713,6 +3064,7 @@ pub async fn run_prompt_task(
                                 .await;
                                 send_prompt_result(
                                     &result_tx,
+                                    &turn_guard,
                                     &turn_id,
                                     agent,
                                     source,
@@ -2752,6 +3104,64 @@ pub async fn run_prompt_task(
                             );
                         }
                         log_stop_reason(&source, &StopReason::EndTurn);
+                        let reply_check = match batch.as_ref() {
+                            Some(batch) => check_required_replies(batch, &ctx).await,
+                            None => ReplyContractCheck::default(),
+                        };
+                        turn_guard.set_reply_event_ids(reply_check.reply_event_ids);
+                        if !reply_check.missing_source_event_ids.is_empty() {
+                            let missing_reply_event_ids = reply_check.missing_source_event_ids;
+                            tracing::warn!(
+                                target: "pool::prompt",
+                                missing = ?missing_reply_event_ids,
+                                "turn completed without required origin reply"
+                            );
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &turn_id,
+                                Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+                            )
+                            .await;
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_guard,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Incomplete {
+                                    missing_reply_event_ids,
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
+                        if let Err(error) = close_replay_batch(batch.as_ref(), &ctx) {
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &turn_id,
+                                Some(buzz_core::agent_turn_metric::StopReason::Error),
+                            )
+                            .await;
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_guard,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(AcpError::Protocol(error)),
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
                         if let PromptSource::Channel(cid) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             record_channel_delivery_success(
@@ -2766,6 +3176,25 @@ pub async fn run_prompt_task(
                             &source,
                             &control_signal,
                         );
+                        if ctx.turn_receipts {
+                            if let PromptSource::Channel(channel_id) = &source {
+                                observe_closed_turn_receipt(
+                                    &agent.acp,
+                                    &ctx,
+                                    *channel_id,
+                                    &triggering_event_ids,
+                                    ReplyReadbackScope {
+                                        expected_reply_anchor: expected_reply_anchor.as_deref(),
+                                        prior_reply_event_ids: prior_reply_event_ids
+                                            .as_ref()
+                                            .map_err(String::as_str),
+                                    },
+                                    &session_id,
+                                    &turn_id,
+                                )
+                                .await;
+                            }
+                        }
                         let usage = agent.acp.take_turn_usage();
                         publish_agent_turn_metric(
                             &ctx,
@@ -2778,6 +3207,7 @@ pub async fn run_prompt_task(
                         .await;
                         send_prompt_result(
                             &result_tx,
+                            &turn_guard,
                             &turn_id,
                             agent,
                             source,
@@ -2794,6 +3224,89 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            // OpenClaw publishes its Buzz reply out of band through buzz-cli.
+            // Close the observer receipt from durable relay evidence before the
+            // agent is returned to the pool. Other ACP adapters retain their
+            // existing behavior and do not pay for this readback.
+            if ctx.turn_receipts {
+                if let PromptSource::Channel(channel_id) = &source {
+                    observe_closed_turn_receipt(
+                        &agent.acp,
+                        &ctx,
+                        *channel_id,
+                        &triggering_event_ids,
+                        ReplyReadbackScope {
+                            expected_reply_anchor: expected_reply_anchor.as_deref(),
+                            prior_reply_event_ids: prior_reply_event_ids
+                                .as_ref()
+                                .map_err(String::as_str),
+                        },
+                        &session_id,
+                        &turn_id,
+                    )
+                    .await;
+                }
+            }
+
+            let reply_check = match batch.as_ref() {
+                Some(batch) => check_required_replies(batch, &ctx).await,
+                None => ReplyContractCheck::default(),
+            };
+            turn_guard.set_reply_event_ids(reply_check.reply_event_ids);
+            if !reply_check.missing_source_event_ids.is_empty() {
+                let missing_reply_event_ids = reply_check.missing_source_event_ids;
+                tracing::warn!(
+                    target: "pool::prompt",
+                    missing = ?missing_reply_event_ids,
+                    "turn completed without required origin reply"
+                );
+                let usage = agent.acp.take_turn_usage();
+                publish_agent_turn_metric(
+                    &ctx,
+                    usage,
+                    observer_channel_id,
+                    &session_id,
+                    &turn_id,
+                    Some(acp_stop_to_core(&stop_reason)),
+                )
+                .await;
+                send_prompt_result(
+                    &result_tx,
+                    &turn_guard,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Incomplete {
+                        missing_reply_event_ids,
+                        stop_reason: stop_reason.clone(),
+                    },
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
+            if let Err(error) = close_replay_batch(batch.as_ref(), &ctx) {
+                let usage = agent.acp.take_turn_usage();
+                publish_agent_turn_metric(
+                    &ctx,
+                    usage,
+                    observer_channel_id,
+                    &session_id,
+                    &turn_id,
+                    Some(buzz_core::agent_turn_metric::StopReason::Error),
+                )
+                .await;
+                send_prompt_result(
+                    &result_tx,
+                    &turn_guard,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(AcpError::Protocol(error)),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
 
             if let PromptSource::Channel(cid) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -2853,6 +3366,7 @@ pub async fn run_prompt_task(
 
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -2875,6 +3389,7 @@ pub async fn run_prompt_task(
             .await;
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -2909,6 +3424,7 @@ pub async fn run_prompt_task(
                     // session state will be discarded with the old agent.
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2935,6 +3451,7 @@ pub async fn run_prompt_task(
                     .await;
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2960,6 +3477,7 @@ pub async fn run_prompt_task(
                     .await;
                     send_prompt_result(
                         &result_tx,
+                        &turn_guard,
                         &turn_id,
                         agent,
                         source,
@@ -2989,6 +3507,7 @@ pub async fn run_prompt_task(
             .await;
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -3016,6 +3535,7 @@ pub async fn run_prompt_task(
             .await;
             send_prompt_result(
                 &result_tx,
+                &turn_guard,
                 &turn_id,
                 agent,
                 source,
@@ -4162,20 +4682,174 @@ fn parse_nostr_dm_response(json: serde_json::Value, limit: u32) -> Option<Conver
     })
 }
 
-/// Return the batch for requeue only in Queue mode; drop it in Drop mode.
+/// Preserve a failed batch for the main-loop disposition owner.
+///
+/// Queue mode may retry it; Drop mode must still receive it so the durable
+/// replay ledger can mark every accepted source id terminal.
 #[inline]
 fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
-    match ctx.dedup_mode {
-        DedupMode::Queue => batch,
-        DedupMode::Drop => None,
+    let _disposition_mode = ctx.dedup_mode;
+    batch
+}
+
+#[derive(Debug)]
+struct ReplyRequirement {
+    source_event_id: String,
+}
+
+#[derive(Debug, Default)]
+struct ReplyContractCheck {
+    reply_event_ids: Vec<String>,
+    missing_source_event_ids: Vec<String>,
+}
+
+fn reply_requirements(batch: &FlushBatch, ctx: &PromptContext) -> Vec<ReplyRequirement> {
+    let replay_state = ctx
+        .replay_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .filter(|event| replay_state.requires_reply(batch.channel_id, &event.event.id.to_hex()))
+        .map(|event| {
+            let source_event_id = event.event.id.to_hex();
+            ReplyRequirement { source_event_id }
+        })
+        .collect()
+}
+
+fn reply_contract_filters(
+    channel_id: Uuid,
+    requirements: &[ReplyRequirement],
+    agent_pubkey: nostr::PublicKey,
+) -> Vec<nostr::Filter> {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let e_tag = SingleLetterTag::lowercase(Alphabet::E);
+    let h_tag = SingleLetterTag::lowercase(Alphabet::H);
+    let channel = channel_id.to_string();
+    requirements
+        .iter()
+        .map(|requirement| {
+            nostr::Filter::new()
+                .kind(nostr::Kind::Custom(
+                    buzz_core::kind::KIND_STREAM_MESSAGE as u16,
+                ))
+                .author(agent_pubkey)
+                // The proof must name the exact triggering event, not merely
+                // another message under the same conversation root.
+                .custom_tags(e_tag, [requirement.source_event_id.as_str()])
+                .custom_tags(h_tag, [channel.as_str()])
+                .limit(10)
+        })
+        .collect()
+}
+
+fn reply_contract_check_from_json(
+    json: &serde_json::Value,
+    requirements: &[ReplyRequirement],
+    channel_id: Uuid,
+    agent_pubkey: nostr::PublicKey,
+) -> ReplyContractCheck {
+    let events = json.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut check = ReplyContractCheck::default();
+
+    for requirement in requirements {
+        let reply_id = events.iter().find_map(|raw| {
+            let event = serde_json::from_value::<nostr::Event>(raw.clone()).ok()?;
+            event.verify().ok()?;
+            if event.pubkey != agent_pubkey
+                || event.kind != nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16)
+                || !crate::filter::has_exact_channel_tag(&event, channel_id)
+                || buzz_core::nip10::parse_thread_markers(&event.tags)
+                    .reply
+                    .as_deref()
+                    != Some(requirement.source_event_id.as_str())
+            {
+                return None;
+            }
+            Some(event.id.to_hex())
+        });
+        if let Some(reply_id) = reply_id {
+            if !check.reply_event_ids.iter().any(|seen| seen == &reply_id) {
+                check.reply_event_ids.push(reply_id);
+            }
+        } else {
+            check
+                .missing_source_event_ids
+                .push(requirement.source_event_id.clone());
+        }
+    }
+    check
+}
+
+async fn check_required_replies(batch: &FlushBatch, ctx: &PromptContext) -> ReplyContractCheck {
+    let requirements = reply_requirements(batch, ctx);
+    if requirements.is_empty() {
+        return ReplyContractCheck::default();
+    }
+    let filters =
+        reply_contract_filters(batch.channel_id, &requirements, ctx.agent_keys.public_key());
+
+    for attempt in 0..2 {
+        match timeout(REPLY_READBACK_TIMEOUT, ctx.rest_client.query(&filters)).await {
+            Ok(Ok(json)) => {
+                let check = reply_contract_check_from_json(
+                    &json,
+                    &requirements,
+                    batch.channel_id,
+                    ctx.agent_keys.public_key(),
+                );
+                if check.missing_source_event_ids.is_empty() || attempt == 1 {
+                    return check;
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(attempt, "required reply readback failed: {error}");
+            }
+            Err(_) => {
+                tracing::warn!(attempt, "required reply readback timed out");
+            }
+        }
+        tokio::time::sleep(REPLY_READBACK_RETRY_DELAY).await;
+    }
+
+    ReplyContractCheck {
+        reply_event_ids: Vec::new(),
+        missing_source_event_ids: requirements
+            .into_iter()
+            .map(|requirement| requirement.source_event_id)
+            .collect(),
     }
 }
 
+fn close_replay_batch(batch: Option<&FlushBatch>, ctx: &PromptContext) -> Result<(), String> {
+    let Some(batch) = batch else {
+        return Ok(());
+    };
+    let event_ids: Vec<String> = batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|event| event.event.id.to_hex())
+        .collect();
+    let mut replay_state = ctx
+        .replay_state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    replay_state
+        .close(batch.channel_id, &event_ids)
+        .map_err(|error| format!("failed to persist closed ACP requests: {error}"))
+}
+
 /// Map a cancelling [`ControlSignal`] to the [`CancelReason`] that should frame
-/// the merged re-prompt, then requeue the batch (in `Queue` dedup mode) with
-/// that reason stamped onto [`FlushBatch::cancel_reason`]. `Cancel`/`Rotate`
-/// drop the batch entirely. The reason is consumed by the main loop at requeue
-/// time (`requeue_as_cancelled`) and ultimately by `format_prompt`.
+/// a possible merged re-prompt, with that reason stamped onto
+/// [`FlushBatch::cancel_reason`]. The main loop requeues in Queue mode and
+/// terminalizes in Drop mode. `Cancel`/`Rotate` terminalize here and discard
+/// the batch entirely. The reason is consumed by the main loop at requeue time
+/// (`requeue_as_cancelled`) and ultimately by `format_prompt`.
 #[inline]
 fn requeue_cancelled_batch(
     ctx: &PromptContext,
@@ -4185,8 +4859,14 @@ fn requeue_cancelled_batch(
     let reason = match signal {
         ControlSignal::Steer => CancelReason::Steer,
         ControlSignal::Interrupt | ControlSignal::SwitchModel { .. } => CancelReason::Interrupt,
-        // Cancel/Rotate discard the batch — no merged re-prompt.
-        ControlSignal::Cancel | ControlSignal::Rotate => return None,
+        // Cancel/Rotate discard the batch — no merged re-prompt — but the
+        // durable replay ledger must still record the accepted ids terminal.
+        ControlSignal::Cancel | ControlSignal::Rotate => {
+            if let Err(error) = close_replay_batch(batch.as_ref(), ctx) {
+                tracing::error!("failed to persist explicit-control batch drop: {error}");
+            }
+            return None;
+        }
     };
     requeue_batch_if_queue(ctx, batch).map(|mut b| {
         b.cancel_reason = Some(reason);
@@ -4331,11 +5011,9 @@ fn record_channel_delivery_success(
 /// 💬 (`react_working`) is fire-and-forget (spawned before the prompt fires).
 /// A brief race where 💬 appears slightly after the agent starts is acceptable.
 ///
-/// 👀 (`react_seen`) is fire-and-forget from `main.rs` at queue-push time.
-/// On rare fast-failure paths (e.g., `session_new` error on an idle agent),
-/// the cleanup spawn may race with the 👀 add, leaving a stale 👀. This is
-/// accepted as a cosmetic edge case — the message will be retried and the
-/// stale 👀 is harmless.
+/// 👀 (`react_seen`) is normally fire-and-forget from `main.rs` at queue-push
+/// time. Trusted-envelope turns defer and await the add after admission so a
+/// terminal authority refusal cannot leave a stale reaction.
 struct ReactionGuard {
     rest: Option<crate::relay::RestClient>,
     channel_id: Uuid,
@@ -4494,11 +5172,25 @@ impl Drop for LivenessGuard {
 // observer handle and metadata at creation time so it remains valid even after
 // the agent is moved into `PromptResult`.
 
+const TERMINAL_CORRELATION_ID_CAP: usize = 8;
+
+struct TurnCompletionState {
+    session_id: Option<String>,
+    outcome: Option<&'static str>,
+    stop_reason: Option<&'static str>,
+    publisher_invoked: bool,
+    reply_event_ids: Vec<String>,
+    reply_event_count: usize,
+}
+
 struct TurnCompletionGuard {
     observer: Option<observer::ObserverHandle>,
     agent_index: Option<usize>,
     channel_id: Option<uuid::Uuid>,
     turn_id: String,
+    source_event_ids: Vec<String>,
+    source_event_count: usize,
+    state: Arc<Mutex<TurnCompletionState>>,
 }
 
 impl TurnCompletionGuard {
@@ -4507,27 +5199,121 @@ impl TurnCompletionGuard {
         agent_index: Option<usize>,
         channel_id: Option<uuid::Uuid>,
         turn_id: String,
+        source_event_ids: Vec<String>,
     ) -> Self {
+        let source_event_count = source_event_ids.len();
         Self {
             observer,
             agent_index,
             channel_id,
             turn_id,
+            source_event_ids: source_event_ids
+                .into_iter()
+                .take(TERMINAL_CORRELATION_ID_CAP)
+                .collect(),
+            source_event_count,
+            state: Arc::new(Mutex::new(TurnCompletionState {
+                session_id: None,
+                outcome: None,
+                stop_reason: None,
+                publisher_invoked: false,
+                reply_event_ids: Vec::new(),
+                reply_event_count: 0,
+            })),
         }
+    }
+
+    fn set_session_id(&self, session_id: String) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.session_id = Some(session_id);
+    }
+
+    fn finish(&self, outcome: &PromptOutcome) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.outcome = Some(outcome.observer_label());
+        state.stop_reason = outcome.observer_stop_reason();
+    }
+
+    fn set_publisher_invoked(&self, invoked: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.publisher_invoked = invoked;
+    }
+
+    fn set_reply_event_ids(&self, reply_event_ids: Vec<String>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.reply_event_count = reply_event_ids.len();
+        state.reply_event_ids = reply_event_ids
+            .into_iter()
+            .take(TERMINAL_CORRELATION_ID_CAP)
+            .collect();
     }
 }
 
 impl Drop for TurnCompletionGuard {
     fn drop(&mut self) {
         if let Some(observer) = self.observer.take() {
-            let context = observer::context_for(self.channel_id, None, Some(self.turn_id.clone()));
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let context = observer::context_for(
+                self.channel_id,
+                state.session_id.clone(),
+                Some(self.turn_id.clone()),
+            );
             observer.emit(
                 "turn_completed",
                 self.agent_index,
                 &context,
-                serde_json::json!({}),
+                serde_json::json!({
+                    "v": 1,
+                    "outcome": state.outcome.unwrap_or("panicked"),
+                    "stopReason": state.stop_reason,
+                    "triggeringEventIds": self.source_event_ids,
+                    "triggeringEventCount": self.source_event_count,
+                    "triggeringEventIdsTruncated": self.source_event_count > self.source_event_ids.len(),
+                    "replyEventIds": state.reply_event_ids,
+                    "replyEventCount": state.reply_event_count,
+                    "replyEventIdsTruncated": state.reply_event_count > state.reply_event_ids.len(),
+                    "publisherInvoked": state.publisher_invoked,
+                }),
             );
         }
+    }
+}
+
+impl PromptOutcome {
+    fn observer_label(&self) -> &'static str {
+        match self {
+            Self::Ok(_) => "ok",
+            Self::Incomplete { .. } => "incomplete",
+            Self::Error(_) => "error",
+            Self::ProjectContextIndeterminate(_) => "project_context_indeterminate",
+            Self::AgentExited => "exited",
+            Self::Timeout(TimeoutKind::Idle) => "idle_timeout",
+            Self::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
+            Self::Cancelled => "cancelled",
+            Self::CancelDrainTimeout(_) => "cancel_drain_timeout",
+        }
+    }
+
+    fn observer_stop_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Ok(reason)
+            | Self::Incomplete {
+                stop_reason: reason,
+                ..
+            } => Some(stop_reason_label(reason)),
+            Self::Cancelled => Some("cancelled"),
+            _ => None,
+        }
+    }
+}
+
+fn stop_reason_label(reason: &StopReason) -> &'static str {
+    match reason {
+        StopReason::EndTurn => "end_turn",
+        StopReason::Cancelled => "cancelled",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurnRequests => "max_turn_requests",
+        StopReason::Refusal => "refusal",
     }
 }
 
@@ -4823,6 +5609,120 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+/// Post a signed, sender-visible routing rejection directly under the source
+/// event. This reuses the normal kind:9 publisher; no separate control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutingNackCode {
+    ExactChannelTagRequired,
+    RecipientTagRequired,
+    InboundEventTooLarge,
+    UnauthorizedRoute,
+    WorkerStateUnavailable,
+}
+
+impl RoutingNackCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactChannelTagRequired => "exact_channel_tag_required",
+            Self::RecipientTagRequired => "recipient_tag_required",
+            Self::InboundEventTooLarge => "inbound_event_too_large",
+            Self::UnauthorizedRoute => "unauthorized_route",
+            Self::WorkerStateUnavailable => "worker_state_unavailable",
+        }
+    }
+}
+
+pub(crate) async fn post_routing_nack(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    source: &nostr::Event,
+    code: RoutingNackCode,
+) -> bool {
+    let event = match build_routing_nack(&rest.keys, channel_id, source, code) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, "routing NACK build failed: {error}");
+            return false;
+        }
+    };
+    let filter = nostr::Filter::new().id(event.id);
+    match tokio::time::timeout(Duration::from_secs(5), rest.query(&[filter])).await {
+        Ok(Ok(json)) if contains_verified_event(&json, event.id) => {
+            tracing::debug!(channel = %channel_id, event_id = %event.id, "routing NACK already published");
+            return true;
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(channel = %channel_id, "routing NACK readback failed; submitting deterministic event: {error}");
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "routing NACK readback timed out; submitting deterministic event");
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(channel = %channel_id, "routing NACK failed: {error}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "routing NACK timed out");
+            false
+        }
+    }
+}
+
+fn build_routing_nack(
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    source: &nostr::Event,
+    code: RoutingNackCode,
+) -> Result<nostr::Event, String> {
+    let parsed = crate::queue::parse_thread_tags(source);
+    let root_event_id = parsed
+        .root_event_id
+        .as_deref()
+        .and_then(|root| nostr::EventId::from_hex(root).ok())
+        .unwrap_or(source.id);
+    let thread_ref = buzz_sdk::ThreadRef {
+        root_event_id,
+        parent_event_id: source.id,
+    };
+    let source_event_id = source.id.to_hex();
+    let content = serde_json::to_string(&serde_json::json!({
+        "type": "routing_nack",
+        "status": "refused",
+        "code": code.as_str(),
+        "source_event_id": source_event_id,
+    }))
+    .map_err(|error| error.to_string())?;
+    let author = source.pubkey.to_hex();
+    buzz_sdk::build_message(
+        channel_id,
+        &content,
+        Some(&thread_ref),
+        &[author.as_str()],
+        false,
+        &[],
+    )
+    .map_err(|error| error.to_string())?
+    // The source timestamp is signed and already relay-admitted. Pinning it
+    // makes the NACK event id deterministic across reconnects/restarts, so a
+    // failed readback can safely resubmit the same relay-deduplicated event.
+    .custom_created_at(source.created_at)
+    .sign_with_keys(keys)
+    .map_err(|error| error.to_string())
+}
+
+fn contains_verified_event(json: &serde_json::Value, expected_id: nostr::EventId) -> bool {
+    json.as_array().is_some_and(|events| {
+        events.iter().any(|raw| {
+            serde_json::from_value::<nostr::Event>(raw.clone())
+                .is_ok_and(|event| event.id == expected_id && event.verify().is_ok())
+        })
+    })
+}
+
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
@@ -4932,7 +5832,11 @@ async fn react_working(rest: &crate::relay::RestClient, channel_id: Uuid, event_
 /// Fire-and-forget: remove both 👀 and 💬 from all events. Spawned on turn complete.
 /// Capped at `REACTION_CONCURRENCY` concurrent requests per chunk to avoid
 /// unbounded HTTP fan-out on large batches.
-async fn clear_reactions(rest: crate::relay::RestClient, channel_id: Uuid, event_ids: Vec<String>) {
+pub(crate) async fn clear_reactions(
+    rest: crate::relay::RestClient,
+    channel_id: Uuid,
+    event_ids: Vec<String>,
+) {
     // Each event needs two removals (👀 and 💬); pair them and chunk by
     // REACTION_CONCURRENCY pairs so the total concurrent requests stay bounded.
     for chunk in event_ids.chunks(REACTION_CONCURRENCY) {
@@ -5039,6 +5943,218 @@ mod tests {
             .env
             .iter()
             .any(|entry| entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID"));
+    }
+
+    #[test]
+    fn receipt_closes_only_with_one_request_reply_and_gateway_evidence() {
+        let payload = closed_receipt_payload(
+            &["a".repeat(64)],
+            &[crate::relay::AnchoredReply {
+                event_id: "b".repeat(64),
+                reply_to: "a".repeat(64),
+            }],
+            Some("agent:main:buzz-private"),
+            Some("agent:main:buzz-private"),
+            Some("run-1"),
+            "acp-1",
+            "turn-1",
+        );
+        assert_eq!(payload["status"], "closed");
+        assert_eq!(payload["requestEventId"], "a".repeat(64));
+        assert_eq!(payload["replyEventId"], "b".repeat(64));
+        assert_eq!(payload["replyAnchor"], "a".repeat(64));
+        assert_eq!(payload["gatewaySessionKey"], "agent:main:buzz-private");
+        assert_eq!(payload["runId"], "run-1");
+        assert!(payload["observedAtUnixMs"]
+            .as_i64()
+            .is_some_and(|value| value > 0));
+    }
+
+    #[test]
+    fn threaded_second_turn_receipt_queries_the_same_root_anchor_as_the_prompt() {
+        let root_id = "a".repeat(64);
+        let parent_id = "b".repeat(64);
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "second turn")
+            .tags([
+                Tag::parse(["e", root_id.as_str(), "", "root"]).expect("root tag"),
+                Tag::parse(["e", parent_id.as_str(), "", "reply"]).expect("reply tag"),
+            ])
+            .sign_with_keys(&keys)
+            .expect("signed request");
+        let request_id = event.id.to_hex();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "private-office".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let args = crate::queue::FormatPromptArgs::default();
+        let expected_anchor = crate::queue::resolve_turn_reply_anchor(&batch, &args);
+        let prompt = crate::queue::format_prompt(&batch, &args).join("\n\n");
+
+        assert_eq!(expected_anchor.as_deref(), Some(root_id.as_str()));
+        assert!(prompt.contains(&format!("--reply-to {root_id}")));
+        assert_eq!(
+            receipt_query_anchor(&[request_id], expected_anchor.as_deref()),
+            Some(root_id.as_str())
+        );
+    }
+
+    #[test]
+    fn top_level_dm_receipt_anchors_to_the_current_request() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "first DM turn")
+            .sign_with_keys(&keys)
+            .expect("signed request");
+        let request_id = event.id.to_hex();
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "private-office".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let channel_info = PromptChannelInfo {
+            name: "Nexus private".into(),
+            channel_type: "dm".into(),
+            description: None,
+            project: None,
+        };
+        let args = crate::queue::FormatPromptArgs {
+            channel_info: Some(&channel_info),
+            turn_receipts: true,
+            ..Default::default()
+        };
+        let expected_anchor = crate::queue::resolve_turn_reply_anchor(&batch, &args);
+        let prompt = crate::queue::format_prompt(&batch, &args).join("\n\n");
+
+        assert_eq!(expected_anchor.as_deref(), Some(request_id.as_str()));
+        assert!(prompt.contains(&format!("--reply-to {request_id}")));
+        assert_eq!(
+            receipt_query_anchor(
+                std::slice::from_ref(&request_id),
+                expected_anchor.as_deref()
+            ),
+            Some(request_id.as_str())
+        );
+    }
+
+    #[test]
+    fn receipt_fails_closed_on_cardinality_or_missing_evidence() {
+        let request = vec!["a".repeat(64)];
+        assert_eq!(
+            closed_receipt_payload(
+                &request,
+                &[],
+                Some("session"),
+                Some("session"),
+                Some("run"),
+                "acp",
+                "turn"
+            )["reason"],
+            "receipt_requires_one_anchored_reply_found_zero"
+        );
+        let duplicate = vec![
+            crate::relay::AnchoredReply {
+                event_id: "b".repeat(64),
+                reply_to: request[0].clone(),
+            },
+            crate::relay::AnchoredReply {
+                event_id: "c".repeat(64),
+                reply_to: request[0].clone(),
+            },
+        ];
+        assert_eq!(
+            closed_receipt_payload(
+                &request,
+                &duplicate,
+                Some("session"),
+                Some("session"),
+                Some("run"),
+                "acp",
+                "turn"
+            )["reason"],
+            "receipt_requires_one_anchored_reply_found_multiple"
+        );
+        assert_eq!(
+            closed_receipt_payload(
+                &request,
+                &duplicate[..1],
+                None,
+                Some("session"),
+                Some("run"),
+                "acp",
+                "turn"
+            )["reason"],
+            "gateway_session_key_evidence_missing"
+        );
+        assert_eq!(
+            closed_receipt_payload(
+                &request,
+                &duplicate[..1],
+                Some("session"),
+                Some("session"),
+                None,
+                "acp",
+                "turn"
+            )["reason"],
+            "gateway_run_id_evidence_missing"
+        );
+    }
+
+    #[test]
+    fn delayed_duplicate_reply_is_retained_for_fail_closed_receipt() {
+        let request = vec!["a".repeat(64)];
+        let first = crate::relay::AnchoredReply {
+            event_id: "b".repeat(64),
+            reply_to: request[0].clone(),
+        };
+        let delayed = crate::relay::AnchoredReply {
+            event_id: "c".repeat(64),
+            reply_to: request[0].clone(),
+        };
+        let mut replies = Vec::new();
+        merge_anchored_replies(&mut replies, vec![first.clone()]);
+        merge_anchored_replies(&mut replies, vec![first, delayed]);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            closed_receipt_payload(
+                &request,
+                &replies,
+                Some("session"),
+                Some("session"),
+                Some("run"),
+                "acp",
+                "turn"
+            )["reason"],
+            "receipt_requires_one_anchored_reply_found_multiple"
+        );
+    }
+
+    #[test]
+    fn stable_thread_anchor_excludes_replies_from_prior_turns() {
+        let stable_root = "a".repeat(64);
+        let prior = crate::relay::AnchoredReply {
+            event_id: "b".repeat(64),
+            reply_to: stable_root.clone(),
+        };
+        let current = crate::relay::AnchoredReply {
+            event_id: "c".repeat(64),
+            reply_to: stable_root,
+        };
+        let prior_ids = HashSet::from([prior.event_id.clone()]);
+
+        let current_turn = replies_for_current_turn(vec![prior, current.clone()], &prior_ids);
+
+        assert_eq!(current_turn, vec![current]);
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
@@ -6278,7 +7394,7 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, false)
             .await
             .expect("spawn lifecycle ACP script");
         let mut agent = OwnedAgent {
@@ -6287,10 +7403,10 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
-            model_overridden: false,
             desired_model_request_id: None,
             desired_model_pending_ack: false,
             startup_effort: None,
+            model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
@@ -6377,7 +7493,7 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, false)
             .await
             .expect("spawn channel lifecycle ACP script");
         let channel_id = Uuid::new_v4();
@@ -6553,7 +7669,7 @@ while IFS= read -r line; do
   count=$((count + 1))
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false, false)
             .await
             .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
@@ -6589,6 +7705,10 @@ done"#
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             )]),
             RestClient {
@@ -6706,7 +7826,7 @@ done"#
 printf '%s\n' "$line" > '{quoted_capture}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false, false)
             .await
             .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
@@ -6754,6 +7874,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             )]),
             RestClient {
@@ -6977,7 +8101,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             assert!(event
                 .tags
                 .iter()
-                .any(|tag| { tag.as_slice() == ["h", channel_id.to_string().as_str()] }));
+                .any(|tag| tag.as_slice() == ["h", channel_id.to_string().as_str()]));
         }
     }
 
@@ -7212,6 +8336,64 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         }
     }
 
+    #[tokio::test]
+    async fn trusted_channel_refusal_stops_before_session_prompt() {
+        let marker = std::env::temp_dir().join(format!(
+            "buzz-acp-unexpected-prompt-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            "IFS= read -r _line && : > '{}' ; sleep 10",
+            marker.display()
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, true)
+            .await
+            .expect("spawn test agent");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            model_overridden: false,
+            agent_name: "test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let mut context = make_prompt_context_no_owner();
+        context.trusted_inbound_envelope = true;
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        run_prompt_task(
+            agent,
+            Some(batch),
+            Some("must not reach the agent".into()),
+            Arc::new(context),
+            result_tx,
+            None,
+            "trusted-refusal-turn".into(),
+        )
+        .await;
+
+        let result = result_rx.recv().await.expect("terminal prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Error(AcpError::TrustedInboundEventRefused(
+                "invalid_channel_binding"
+            ))
+        ));
+        assert!(result.batch.is_none(), "refused authority must not requeue");
+        assert!(
+            !marker.exists(),
+            "session/prompt must not be written after trusted admission refusal"
+        );
+    }
+
     #[test]
     fn test_requeue_cancelled_batch_maps_control_signal_to_cancel_reason() {
         let cases = [
@@ -7233,6 +8415,13 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         for (signal, expected_reason) in cases {
             let channel_id = Uuid::new_v4();
             let batch = one_event_batch(channel_id);
+            let event_id = batch.events[0].event.id.to_hex();
+            let created_at = batch.events[0].event.created_at.as_secs();
+            ctx.replay_state
+                .lock()
+                .unwrap()
+                .record_open(channel_id, event_id.clone(), created_at, created_at, false)
+                .unwrap();
             let result = requeue_cancelled_batch(&ctx, signal.clone(), Some(batch));
             match expected_reason {
                 Some(reason) => {
@@ -7243,13 +8432,489 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                         Some(reason),
                         "{signal:?} must stamp {reason:?}"
                     );
+                    assert!(!ctx
+                        .replay_state
+                        .lock()
+                        .unwrap()
+                        .is_handled(channel_id, &event_id));
                 }
-                None => assert!(
-                    result.is_none(),
-                    "{signal:?} must drop the batch, got {result:?}"
-                ),
+                None => {
+                    assert!(
+                        result.is_none(),
+                        "{signal:?} must drop the batch, got {result:?}"
+                    );
+                    assert!(ctx
+                        .replay_state
+                        .lock()
+                        .unwrap()
+                        .is_handled(channel_id, &event_id));
+                }
             }
         }
+    }
+
+    #[test]
+    fn reply_contract_requires_direct_triggering_event_proof() {
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let source = &batch.events[0].event;
+        let ctx = make_prompt_context_no_owner();
+        ctx.replay_state
+            .lock()
+            .unwrap()
+            .record_open(
+                channel_id,
+                source.id.to_hex(),
+                source.created_at.as_secs(),
+                source.created_at.as_secs(),
+                true,
+            )
+            .unwrap();
+
+        let requirements = reply_requirements(&batch, &ctx);
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].source_event_id, source.id.to_hex());
+
+        let unrelated_id = nostr::EventId::all_zeros();
+        let unrelated = buzz_sdk::build_message(
+            channel_id,
+            "wrong thread",
+            Some(&buzz_sdk::ThreadRef {
+                root_event_id: unrelated_id,
+                parent_event_id: unrelated_id,
+            }),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .sign_with_keys(&ctx.agent_keys)
+        .unwrap();
+        let missing = reply_contract_check_from_json(
+            &serde_json::json!([unrelated]),
+            &requirements,
+            channel_id,
+            ctx.agent_keys.public_key(),
+        );
+        assert_eq!(missing.missing_source_event_ids, vec![source.id.to_hex()]);
+
+        let direct = buzz_sdk::build_message(
+            channel_id,
+            "direct reply",
+            Some(&buzz_sdk::ThreadRef {
+                root_event_id: source.id,
+                parent_event_id: source.id,
+            }),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap()
+        .sign_with_keys(&ctx.agent_keys)
+        .unwrap();
+        let direct_id = direct.id.to_hex();
+        let closed = reply_contract_check_from_json(
+            &serde_json::json!([direct]),
+            &requirements,
+            channel_id,
+            ctx.agent_keys.public_key(),
+        );
+        assert!(closed.missing_source_event_ids.is_empty());
+        assert_eq!(closed.reply_event_ids, vec![direct_id]);
+    }
+
+    #[test]
+    fn reply_required_restart_serializes_envelope_reply_and_terminal_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-contract-restart-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("replay.json");
+        let channel_id = Uuid::new_v4();
+        let source_keys = Keys::generate();
+        let channel = channel_id.to_string();
+        let make_source = |issue: &str, created_at: u64| {
+            EventBuilder::new(Kind::Custom(9), format!("please handle {issue}"))
+                .custom_created_at(Timestamp::from(created_at))
+                .tags([Tag::parse(["h", channel.as_str()]).unwrap()])
+                .sign_with_keys(&source_keys)
+                .unwrap()
+        };
+        let first_source = make_source("AEO-401", 1_000);
+        let second_source = make_source("AEO-402", 2_000);
+
+        let mut initial = crate::replay_state::ReplayState::load(state_path.clone()).unwrap();
+        for source in [&first_source, &second_source] {
+            assert!(initial
+                .record_open(
+                    channel_id,
+                    source.id.to_hex(),
+                    source.created_at.as_secs(),
+                    source.created_at.as_secs(),
+                    true,
+                )
+                .unwrap());
+        }
+        drop(initial);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.max_turn_duration = Duration::from_secs(120);
+        ctx.trusted_inbound_envelope = true;
+        ctx.replay_state = Arc::new(Mutex::new(
+            crate::replay_state::ReplayState::load(state_path).unwrap(),
+        ));
+
+        // Relay replay is deliberately queued newest-first. The durable
+        // contract must still dispatch two distinct one-source turns without
+        // trusting sender timestamps as a scheduling authority.
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        for source in [&second_source, &first_source] {
+            queue.push(crate::queue::QueuedEvent {
+                channel_id,
+                event: source.clone(),
+                received_at: std::time::Instant::now(),
+                prompt_tag: "requires-reply".into(),
+            });
+        }
+
+        for (index, expected) in [&second_source, &first_source].iter().enumerate() {
+            let replay_state = ctx.replay_state.lock().unwrap();
+            let mut batch = queue
+                .flush_next_with_single_event_contract(|channel_id, event| {
+                    replay_state.requires_reply(channel_id, &event.id.to_hex())
+                })
+                .expect("open replay source must flush");
+            drop(replay_state);
+
+            if index == 0 {
+                // Simulate an interrupted first attempt after restart while the
+                // second source is already queued. The retry must remain one
+                // exact source rather than merge into the second request.
+                queue.requeue_as_cancelled(batch, CancelReason::Steer);
+                queue.mark_complete(channel_id);
+                let replay_state = ctx.replay_state.lock().unwrap();
+                batch = queue
+                    .flush_next_with_single_event_contract(|channel_id, event| {
+                        replay_state.requires_reply(channel_id, &event.id.to_hex())
+                    })
+                    .expect("cancelled open source must retry");
+                drop(replay_state);
+                assert_eq!(batch.cancel_reason, Some(CancelReason::Steer));
+            }
+
+            assert_eq!(batch.events.len(), 1);
+            assert!(batch.cancelled_events.is_empty());
+            assert_eq!(batch.events[0].event.id, expected.id);
+
+            let envelope = TrustedInboundEventEnvelope::try_from_prompt_batch_with_turn_contract(
+                Some(&batch),
+                true,
+                ctx.max_turn_duration,
+            )
+            .expect("exact signed source must produce trusted envelope");
+            let envelope = serde_json::to_value(envelope).unwrap();
+            assert_eq!(envelope["eventId"], expected.id.to_hex());
+            assert_eq!(
+                envelope["turnEnvelope"]["source_event_id"],
+                expected.id.to_hex()
+            );
+            assert_eq!(envelope["turnEnvelope"]["requires_reply"], true);
+
+            let requirements = reply_requirements(&batch, &ctx);
+            assert_eq!(requirements.len(), 1);
+            assert_eq!(requirements[0].source_event_id, expected.id.to_hex());
+            let reply_content = format!("completed source {}", index + 1);
+            let direct = buzz_sdk::build_message(
+                channel_id,
+                &reply_content,
+                Some(&buzz_sdk::ThreadRef {
+                    root_event_id: expected.id,
+                    parent_event_id: expected.id,
+                }),
+                &[],
+                false,
+                &[],
+            )
+            .unwrap()
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+            let check = reply_contract_check_from_json(
+                &serde_json::json!([direct]),
+                &requirements,
+                channel_id,
+                ctx.agent_keys.public_key(),
+            );
+            assert!(check.missing_source_event_ids.is_empty());
+            assert_eq!(check.reply_event_ids.len(), 1);
+
+            close_replay_batch(Some(&batch), &ctx).unwrap();
+            let replay_state = ctx.replay_state.lock().unwrap();
+            assert!(replay_state.is_handled(channel_id, &expected.id.to_hex()));
+            let other = if index == 0 {
+                &first_source
+            } else {
+                &second_source
+            };
+            assert_eq!(
+                replay_state.is_handled(channel_id, &other.id.to_hex()),
+                index == 1,
+                "only completed source ids may become terminal"
+            );
+            drop(replay_state);
+            queue.mark_complete(channel_id);
+        }
+
+        assert!(queue
+            .flush_next_with_single_event_contract(|_, _| true)
+            .is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn reply_contract_rejects_untrusted_or_inexact_events() {
+        let channel_id = Uuid::new_v4();
+        let batch = one_event_batch(channel_id);
+        let source = &batch.events[0].event;
+        let ctx = make_prompt_context_no_owner();
+        ctx.replay_state
+            .lock()
+            .unwrap()
+            .record_open(
+                channel_id,
+                source.id.to_hex(),
+                source.created_at.as_secs(),
+                source.created_at.as_secs(),
+                true,
+            )
+            .unwrap();
+        let requirements = reply_requirements(&batch, &ctx);
+        let thread = buzz_sdk::ThreadRef {
+            root_event_id: source.id,
+            parent_event_id: source.id,
+        };
+
+        let valid = buzz_sdk::build_message(channel_id, "valid", Some(&thread), &[], false, &[])
+            .unwrap()
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+        let mut tampered = serde_json::to_value(valid).unwrap();
+        tampered["content"] = serde_json::json!("tampered after signing");
+
+        let wrong_author =
+            buzz_sdk::build_message(channel_id, "wrong author", Some(&thread), &[], false, &[])
+                .unwrap()
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+
+        let channel = channel_id.to_string();
+        let source_id = source.id.to_hex();
+        let duplicate_h = EventBuilder::new(Kind::Custom(9), "duplicate h")
+            .tags([
+                Tag::parse(["h", channel.as_str()]).unwrap(),
+                Tag::parse(["h", channel.as_str()]).unwrap(),
+                Tag::parse(["e", source_id.as_str(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+        let wrong_kind = EventBuilder::new(Kind::Custom(40002), "wrong kind")
+            .tags([
+                Tag::parse(["h", channel.as_str()]).unwrap(),
+                Tag::parse(["e", source_id.as_str(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&ctx.agent_keys)
+            .unwrap();
+
+        for candidate in [
+            tampered,
+            serde_json::to_value(wrong_author).unwrap(),
+            serde_json::to_value(duplicate_h).unwrap(),
+            serde_json::to_value(wrong_kind).unwrap(),
+        ] {
+            let check = reply_contract_check_from_json(
+                &serde_json::json!([candidate]),
+                &requirements,
+                channel_id,
+                ctx.agent_keys.public_key(),
+            );
+            assert_eq!(check.missing_source_event_ids, vec![source_id.clone()]);
+        }
+    }
+
+    #[test]
+    fn routing_nack_is_signed_and_directly_anchored_to_sender() {
+        let channel_id = Uuid::new_v4();
+        let source = one_event_batch(channel_id).events.remove(0).event;
+        let keys = Keys::generate();
+        let nack = build_routing_nack(
+            &keys,
+            channel_id,
+            &source,
+            RoutingNackCode::ExactChannelTagRequired,
+        )
+        .unwrap();
+
+        nack.verify().unwrap();
+        assert_eq!(nack.pubkey, keys.public_key());
+        assert_eq!(nack.kind, Kind::Custom(9));
+        assert!(crate::filter::has_exact_channel_tag(&nack, channel_id));
+        assert_eq!(
+            buzz_core::nip10::parse_thread_markers(&nack.tags)
+                .reply
+                .as_deref(),
+            Some(source.id.to_hex().as_str())
+        );
+        assert!(nack.tags.iter().any(|tag| {
+            let parts = tag.as_slice();
+            parts.first().map(String::as_str) == Some("p")
+                && parts.get(1).map(String::as_str) == Some(source.pubkey.to_hex().as_str())
+        }));
+        let content: serde_json::Value = serde_json::from_str(&nack.content).unwrap();
+        assert_eq!(content["type"], "routing_nack");
+        assert_eq!(content["status"], "refused");
+        assert!(contains_verified_event(
+            &serde_json::json!([&nack]),
+            nack.id
+        ));
+    }
+
+    #[test]
+    fn routing_nack_is_deterministic_for_every_rejection_branch() {
+        let channel_id = Uuid::new_v4();
+        let source = one_event_batch(channel_id).events.remove(0).event;
+        let keys = Keys::generate();
+
+        for (code, expected) in [
+            (
+                RoutingNackCode::ExactChannelTagRequired,
+                "exact_channel_tag_required",
+            ),
+            (
+                RoutingNackCode::RecipientTagRequired,
+                "recipient_tag_required",
+            ),
+            (
+                RoutingNackCode::InboundEventTooLarge,
+                "inbound_event_too_large",
+            ),
+            (RoutingNackCode::UnauthorizedRoute, "unauthorized_route"),
+            (
+                RoutingNackCode::WorkerStateUnavailable,
+                "worker_state_unavailable",
+            ),
+        ] {
+            let first = build_routing_nack(&keys, channel_id, &source, code).unwrap();
+            let second = build_routing_nack(&keys, channel_id, &source, code).unwrap();
+            assert_eq!(first.id, second.id, "{expected} must relay-deduplicate");
+            assert_eq!(first.created_at, source.created_at);
+            let content: serde_json::Value = serde_json::from_str(&first.content).unwrap();
+            assert_eq!(content["code"], expected);
+            assert!(contains_verified_event(
+                &serde_json::json!([&first]),
+                first.id
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_nack_verified_readback_avoids_duplicate_submit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel_id = Uuid::new_v4();
+        let source = one_event_batch(channel_id).events.remove(0).event;
+        let keys = Keys::generate();
+        let existing = build_routing_nack(
+            &keys,
+            channel_id,
+            &source,
+            RoutingNackCode::UnauthorizedRoute,
+        )
+        .unwrap();
+        let response_body = serde_json::json!([existing]).to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8_192];
+                let _ = socket.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(), response_body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys,
+            auth_tag_json: None,
+        };
+
+        assert!(
+            post_routing_nack(
+                &rest,
+                channel_id,
+                &source,
+                RoutingNackCode::UnauthorizedRoute,
+            )
+            .await
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no /events submit");
+        server.abort();
+    }
+
+    #[test]
+    fn turn_completed_is_discriminated_and_compact() {
+        let observer = observer::ObserverHandle::in_process();
+        let source_ids: Vec<String> = (0..20).map(|index| format!("source-{index}")).collect();
+        let guard = TurnCompletionGuard::new(
+            Some(observer.clone()),
+            Some(3),
+            Some(Uuid::new_v4()),
+            "turn-1".into(),
+            source_ids,
+        );
+        guard.set_session_id("session-1".into());
+        guard.set_publisher_invoked(true);
+        guard.set_reply_event_ids(vec!["reply-1".into()]);
+        guard.finish(&PromptOutcome::Incomplete {
+            missing_reply_event_ids: vec!["source-19".into()],
+            stop_reason: StopReason::EndTurn,
+        });
+        drop(guard);
+
+        let event = observer
+            .snapshot()
+            .into_iter()
+            .find(|event| event.kind == "turn_completed")
+            .expect("completion frame");
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+        assert_eq!(event.payload["outcome"], "incomplete");
+        assert_eq!(event.payload["stopReason"], "end_turn");
+        assert_eq!(event.payload["triggeringEventCount"], 20);
+        assert_eq!(
+            event.payload["triggeringEventIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(event.payload["triggeringEventIdsTruncated"], true);
+        assert_eq!(
+            event.payload["replyEventIds"],
+            serde_json::json!(["reply-1"])
+        );
+        assert_eq!(event.payload["publisherInvoked"], true);
+        assert!(
+            serde_json::to_vec(&event).unwrap().len() < 2_048,
+            "terminal receipt must stay far below the NIP-44 plaintext ceiling"
+        );
     }
 
     // ── classify_control_cancel_failure ─────────────────────────────────────
@@ -7272,6 +8937,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::ProjectContextIndeterminate(_) => "ProjectContextIndeterminate",
             PromptOutcome::Cancelled => "Cancelled",
+            PromptOutcome::Incomplete { .. } => "Incomplete",
             PromptOutcome::Ok(_) => "Ok",
         };
         assert_eq!(
@@ -7749,6 +9415,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             &["-c".to_string(), "sleep 10".to_string()],
             &[],
             false,
+            true,
         )
         .await
         .expect("failed to spawn test agent");
@@ -7776,8 +9443,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         // `send_prompt_result` without the read loop ever running `take()`.
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
         let source = PromptSource::Heartbeat;
+        let completion = TurnCompletionGuard::new(None, None, None, "test-turn-id".into(), vec![]);
         send_prompt_result(
             &result_tx,
+            &completion,
             "test-turn-id",
             agent,
             source,
@@ -7810,6 +9479,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             &["-c".to_string(), "sleep 10".to_string()],
             &[],
             false,
+            true,
         )
         .await
         .expect("failed to spawn test agent");
@@ -7837,8 +9507,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
 
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<PromptResult>();
         let source = PromptSource::Heartbeat;
+        let completion = TurnCompletionGuard::new(None, None, None, "test-turn-id".into(), vec![]);
         send_prompt_result(
             &result_tx,
+            &completion,
             "test-turn-id",
             agent,
             source,
@@ -8282,6 +9954,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
             dedup_mode: DedupMode::Drop,
+            replay_state: Arc::new(Mutex::new(crate::replay_state::ReplayState::in_memory())),
             system_prompt: None,
             session_title: None,
             team_instructions: None,
@@ -8310,6 +9983,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,
             harness_name: "goose".to_string(),
+            turn_receipts: false,
+            expected_gateway_session_key: None,
+            trusted_inbound_envelope: false,
             relay_url: "ws://127.0.0.1:3000".to_string(),
         }
     }
@@ -8832,6 +10508,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                     name: "ordinary-looking".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             )]),
             crate::relay::RestClient {
@@ -8925,7 +10605,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
   printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'
 done"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false, false)
             .await
             .expect("spawn wire-capture ACP");
         let agent = OwnedAgent {
@@ -8969,6 +10649,10 @@ done"#
                     name: "ordinary-looking".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             )]),
             RestClient {
@@ -9075,6 +10759,10 @@ done"#
                     name: "project-home".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             )]),
             crate::relay::RestClient {
@@ -9356,7 +11044,7 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, false)
             .await
             .expect("spawn effort ACP script")
     }
@@ -9527,7 +11215,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configO
 IFS= read -r _effort
 exit 0"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, false)
             .await
             .expect("spawn transport-exit ACP script");
         let mut agent = effort_agent(acp, Some("high"));
@@ -9616,7 +11304,7 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, false)
             .await
             .expect("spawn switch ACP script")
     }
@@ -9912,7 +11600,7 @@ while IFS= read -r line; do
   fi
 done"#
         );
-        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false, false)
             .await
             .expect("spawn switch ACP script")
     }

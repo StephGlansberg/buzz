@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{error, warn};
 
@@ -16,10 +16,32 @@ use tracing::{error, warn};
 pub enum FilterError {
     #[error("expression too long ({len} bytes, max {max})")]
     ExpressionTooLong { len: usize, max: usize },
-    #[error("evaluation timed out")]
-    Timeout,
+    #[error("evaluation timed out during {stage}")]
+    Timeout { stage: FilterTimeoutStage },
     #[error("evaluation error: {0}")]
     EvalError(String),
+}
+
+/// Stage at which a filter evaluation exhausted its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterTimeoutStage {
+    /// Waiting for capacity in the bounded filter evaluator.
+    Admission,
+    /// Waiting for the blocking executor to start the admitted evaluation.
+    Start,
+    /// Evaluating the expression after the blocking job started.
+    Execution,
+}
+
+impl std::fmt::Display for FilterTimeoutStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Admission => "admission",
+            Self::Start => "start",
+            Self::Execution => "execution",
+        };
+        formatter.write_str(value)
+    }
 }
 
 /// Variables extracted from a Nostr event for use in filter expressions.
@@ -80,6 +102,7 @@ impl ChannelScope {
 /// without requiring `&mut self` — rules are shared via `Arc<[SubscriptionRule]>`
 /// across the event-dispatch loop.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionRule {
     /// Human-readable rule name; used as fallback `prompt_tag`.
     pub name: String,
@@ -91,6 +114,18 @@ pub struct SubscriptionRule {
     /// If `true`, the event must contain a `p` tag referencing the agent pubkey.
     #[serde(default)]
     pub require_mention: bool,
+    /// If `true`, the event must carry exactly one canonical `h` tag whose
+    /// value is the channel selected by the relay subscription.
+    #[serde(default)]
+    pub require_exact_channel_tag: bool,
+    /// If `true`, a successful ACP turn is incomplete until the agent has
+    /// published a reply in the triggering event's origin thread.
+    #[serde(default)]
+    pub requires_reply: bool,
+    /// Admit membership-triggered channels only after their relay metadata
+    /// proves a positive TTL; `load_rules` enforces the fail-closed rule shape.
+    #[serde(default)]
+    pub admit_invited_ephemeral: bool,
     /// Optional evalexpr boolean expression for fine-grained filtering.
     #[serde(default)]
     pub filter: Option<String>,
@@ -120,6 +155,9 @@ impl Default for SubscriptionRule {
             channels: ChannelScope::All("all".into()),
             kinds: Vec::new(),
             require_mention: false,
+            require_exact_channel_tag: false,
+            requires_reply: false,
+            admit_invited_ephemeral: false,
             filter: None,
             prompt_tag: None,
             compiled_filter: None,
@@ -135,6 +173,9 @@ impl Clone for SubscriptionRule {
             channels: self.channels.clone(),
             kinds: self.kinds.clone(),
             require_mention: self.require_mention,
+            require_exact_channel_tag: self.require_exact_channel_tag,
+            requires_reply: self.requires_reply,
+            admit_invited_ephemeral: self.admit_invited_ephemeral,
             filter: self.filter.clone(),
             prompt_tag: self.prompt_tag.clone(),
             compiled_filter: self.compiled_filter.clone(),
@@ -153,6 +194,27 @@ pub struct MatchedRule {
     pub rule_index: usize,
     /// Prompt tag to use (rule's `prompt_tag` or its `name`).
     pub prompt_tag: String,
+    /// Whether this rule requires a durable origin-thread reply.
+    pub requires_reply: bool,
+}
+
+/// Why a channel-scoped rule rejected an otherwise eligible event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchRejection {
+    /// The rule requires one canonical `h` tag and the event did not carry it.
+    ExactChannelTagRequired,
+    /// The rule requires an explicit recipient `p` tag for this agent.
+    MentionRequired,
+    /// The signed event exceeds the trusted inbound projection limits.
+    InboundEventTooLarge,
+}
+
+/// Detailed matcher result used by the harness for structured rejection.
+#[derive(Debug, Clone)]
+pub enum MatchDecision {
+    Matched(MatchedRule),
+    Rejected(MatchRejection),
+    NoMatch,
 }
 
 /// Maximum expression length accepted by `evaluate_filter`.
@@ -161,8 +223,21 @@ pub struct MatchedRule {
 /// be cancelled after a timeout fires, so we cap length before dispatching.
 const MAX_EXPR_LEN: usize = 4096;
 
-/// Maximum wall-clock time allowed for a single evalexpr evaluation.
-const EVAL_TIMEOUT: Duration = Duration::from_millis(100);
+/// Maximum time a filter evaluation may wait to enter the bounded evaluator.
+const EVAL_ADMISSION_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Maximum wall-clock time allowed once a filter evaluation has started.
+///
+/// This tolerates ordinary host scheduling pauses while the expression-size cap
+/// and bounded blocking pool continue to contain expensive expressions.
+const EVAL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum time an admitted evaluation may wait for a blocking worker.
+///
+/// This is deliberately separate from [`EVAL_EXECUTION_TIMEOUT`]. Blocking-pool queue
+/// latency is executor pressure, not expression execution time, and charging
+/// it to the expression deadline caused trivial filters to fail spuriously.
+const EVAL_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum concurrent blocking filter evaluations.
 ///
@@ -171,6 +246,17 @@ const EVAL_TIMEOUT: Duration = Duration::from_millis(100);
 /// fires. This truly bounds the number of live blocking evals even under repeated
 /// slow expressions.
 const MAX_CONCURRENT_FILTER_EVALS: usize = 4;
+
+/// Trusted inbound tag limits shared with the AEON Gateway projection.
+///
+/// These bounds are counted in Unicode scalar values, matching JavaScript's
+/// `Array.from(value).length` in the Gateway normalizer. Rejecting before ACP
+/// prompt delivery keeps an otherwise valid signed event from entering a
+/// permanent Gateway-rejection/retry loop.
+const MAX_TRUSTED_INBOUND_TAGS: usize = 64;
+const MAX_TRUSTED_INBOUND_TAG_PARTS: usize = 16;
+const MAX_TRUSTED_INBOUND_TAG_PART_CHARS: usize = 512;
+const MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS: usize = 8_192;
 
 /// Semaphore that bounds concurrent `spawn_blocking` filter evaluations.
 ///
@@ -188,7 +274,7 @@ static FILTER_EVAL_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// - Acquires an owned permit from [`FILTER_EVAL_SEMAPHORE`] and moves it into
 ///   the blocking closure so it is held until the task finishes, not just until
 ///   the caller's timeout fires.
-/// - Runs evaluation on a blocking thread with a [`EVAL_TIMEOUT`] hard timeout.
+/// - Runs evaluation on a blocking thread with an [`EVAL_EXECUTION_TIMEOUT`] hard timeout.
 /// - When a pre-compiled `node` is provided (via `Arc`), uses
 ///   `node.eval_boolean_with_context()` instead of re-parsing the expression
 ///   string on every call.
@@ -209,41 +295,81 @@ pub async fn evaluate_filter(
     let eval_ctx = build_eval_context(ctx).map_err(FilterError::EvalError)?;
     let expr_owned = expr.to_owned();
 
+    run_filter_eval(move || {
+        // Use the pre-compiled AST when available; fall back to string parsing.
+        if let Some(node) = node {
+            node.eval_boolean_with_context(&eval_ctx)
+        } else {
+            evalexpr::eval_boolean_with_context(&expr_owned, &eval_ctx)
+        }
+        .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+async fn run_filter_eval<F>(evaluate: F) -> Result<bool, FilterError>
+where
+    F: FnOnce() -> Result<bool, String> + Send + 'static,
+{
     // Acquire an *owned* permit so it can be moved into the spawn_blocking closure.
     // The permit is held until the blocking task actually completes — not just until
     // the caller's timeout fires — so the semaphore truly bounds the number of live
     // blocking threads even when callers time out.
     //
-    // The acquire itself is bounded by EVAL_TIMEOUT: if all permits are held by
+    // The acquire itself is bounded by EVAL_ADMISSION_TIMEOUT: if all permits are held by
     // wedged blocking tasks, we time out instead of blocking the main event loop.
     let permit = tokio::time::timeout(
-        EVAL_TIMEOUT,
+        EVAL_ADMISSION_TIMEOUT,
         Arc::clone(&*FILTER_EVAL_SEMAPHORE).acquire_owned(),
     )
     .await
-    .map_err(|_| FilterError::Timeout)?
+    .map_err(|_| FilterError::Timeout {
+        stage: FilterTimeoutStage::Admission,
+    })?
     .map_err(|e| FilterError::EvalError(format!("semaphore closed: {e}")))?;
 
-    let result = tokio::time::timeout(
-        EVAL_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            // Hold the permit for the lifetime of this closure: released only
-            // when the blocking thread returns, not when the caller times out.
-            let _permit = permit;
-            // Use the pre-compiled AST when available; fall back to string parsing.
-            if let Some(node) = node {
-                node.eval_boolean_with_context(&eval_ctx)
-            } else {
-                evalexpr::eval_boolean_with_context(&expr_owned, &eval_ctx)
-            }
-        }),
-    )
-    .await
-    .map_err(|_| FilterError::Timeout)?
-    .map_err(|e| FilterError::EvalError(format!("eval task panicked: {e}")))?
-    .map_err(|e| FilterError::EvalError(e.to_string()))?;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut task = tokio::task::spawn_blocking(move || {
+        // Hold the permit for the lifetime of this closure: released only
+        // when the blocking thread returns, not when the caller times out.
+        let _permit = permit;
+        let started_at = Instant::now();
+        let _ = started_tx.send(());
+        let result = evaluate();
+        (result, started_at.elapsed())
+    });
 
-    Ok(result)
+    match tokio::time::timeout(EVAL_START_TIMEOUT, started_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return task
+                .await
+                .map_err(|error| FilterError::EvalError(format!("eval task panicked: {error}")))?
+                .0
+                .map_err(FilterError::EvalError);
+        }
+        Err(_) => {
+            task.abort();
+            return Err(FilterError::Timeout {
+                stage: FilterTimeoutStage::Start,
+            });
+        }
+    }
+
+    let (result, execution_time) = tokio::time::timeout(EVAL_EXECUTION_TIMEOUT, &mut task)
+        .await
+        .map_err(|_| FilterError::Timeout {
+            stage: FilterTimeoutStage::Execution,
+        })?
+        .map_err(|error| FilterError::EvalError(format!("eval task panicked: {error}")))?;
+
+    if execution_time > EVAL_EXECUTION_TIMEOUT {
+        return Err(FilterError::Timeout {
+            stage: FilterTimeoutStage::Execution,
+        });
+    }
+
+    result.map_err(FilterError::EvalError)
 }
 
 /// Build an `evalexpr::HashMapContext` from a `FilterContext`.
@@ -365,13 +491,30 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 5;
 /// After [`MAX_CONSECUTIVE_TIMEOUTS`] consecutive timeouts on a single rule,
 /// that rule is logged at ERROR and the call returns `None` immediately to
 /// avoid blocking the event loop indefinitely.
-pub async fn match_event(
+pub async fn match_event_decision(
     event: &nostr::Event,
     channel_id: uuid::Uuid,
     rules: &[SubscriptionRule],
     agent_pubkey_hex: &str,
-) -> Option<MatchedRule> {
+) -> MatchDecision {
+    match_event_decision_with_trusted_limits(event, channel_id, rules, agent_pubkey_hex, false)
+        .await
+}
+
+/// Match an event with optional AEON trusted-envelope projection bounds.
+///
+/// Ordinary Buzz ACP rules retain their historical, unbounded tag behavior.
+/// Only the explicitly configured trusted inbound envelope path opts into the
+/// cross-repository Gateway limits.
+pub async fn match_event_decision_with_trusted_limits(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+    enforce_trusted_inbound_limits: bool,
+) -> MatchDecision {
     let filter_ctx = FilterContext::from_event(event, channel_id);
+    let mut rejection = None;
 
     for (index, rule) in rules.iter().enumerate() {
         // 1. Channel scope check.
@@ -384,7 +527,15 @@ pub async fn match_event(
             continue;
         }
 
-        // 3. Mention check — look for a `p` tag whose first element equals
+        // 3. Exact channel binding. The relay extracts a UUID from the first
+        // parseable `h` tag, but a signed event may carry extra or conflicting
+        // `h` tags. Strict rules accept one canonical two-element tag only.
+        if rule.require_exact_channel_tag && !has_exact_channel_tag(event, channel_id) {
+            rejection.get_or_insert(MatchRejection::ExactChannelTagRequired);
+            continue;
+        }
+
+        // 4. Mention check — look for a `p` tag whose first element equals
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
         if rule.require_mention {
@@ -394,11 +545,21 @@ pub async fn match_event(
                     && s.get(1).map(|v| v.as_str()) == Some(agent_pubkey_hex)
             });
             if !mentioned {
+                rejection.get_or_insert(MatchRejection::MentionRequired);
                 continue;
             }
         }
 
-        // 4. Optional evalexpr filter expression.
+        // 5. Trusted envelope projection bounds. Apply only after the event is
+        // eligible for this rule's channel/kind/h/p constraints so unrelated
+        // traffic is not NACKed, but before evaluating filters or prompting.
+        // The limits are universal once a rule is eligible, so a later,
+        // looser rule must not bypass them.
+        if enforce_trusted_inbound_limits && !trusted_inbound_tags_within_limits(event) {
+            return MatchDecision::Rejected(MatchRejection::InboundEventTooLarge);
+        }
+
+        // 6. Optional evalexpr filter expression.
         if let Some(expr) = &rule.filter {
             // Skip rules that have timed out too many times — treat as disabled.
             let prior_timeouts = rule.consecutive_timeouts.load(Ordering::Relaxed);
@@ -411,7 +572,7 @@ pub async fn match_event(
                      failing closed (no match for any rule)"
                 );
                 // Fail-closed: disabled rule → no match for this event.
-                return None;
+                return MatchDecision::NoMatch;
             }
 
             match evaluate_filter(expr, &filter_ctx, rule.compiled_filter.clone()).await {
@@ -423,16 +584,17 @@ pub async fn match_event(
                     rule.consecutive_timeouts.store(0, Ordering::Relaxed);
                     continue;
                 }
-                Err(FilterError::Timeout) => {
+                Err(FilterError::Timeout { stage }) => {
                     let n = rule.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                     warn!(
                         rule = %rule.name,
                         rule_index = index,
                         consecutive_timeouts = n,
+                        timeout_stage = %stage,
                         "filter expression timed out; failing closed (no match for any rule)"
                     );
                     // Fail-closed: timeout → no match, not next rule.
-                    return None;
+                    return MatchDecision::NoMatch;
                 }
                 Err(e) => {
                     warn!(
@@ -442,7 +604,7 @@ pub async fn match_event(
                         "filter expression error; failing closed (no match for any rule)"
                     );
                     // Fail-closed: any error → no match, not next rule.
-                    return None;
+                    return MatchDecision::NoMatch;
                 }
             }
         }
@@ -450,13 +612,71 @@ pub async fn match_event(
         // All checks passed — this rule wins.
         let prompt_tag = rule.prompt_tag.clone().unwrap_or_else(|| rule.name.clone());
 
-        return Some(MatchedRule {
+        return MatchDecision::Matched(MatchedRule {
             rule_index: index,
             prompt_tag,
+            requires_reply: rule.requires_reply,
         });
     }
 
-    None
+    rejection.map_or(MatchDecision::NoMatch, MatchDecision::Rejected)
+}
+
+/// Match an event while preserving the historical `Option` API for callers
+/// that do not publish sender-visible routing diagnostics.
+pub async fn match_event(
+    event: &nostr::Event,
+    channel_id: uuid::Uuid,
+    rules: &[SubscriptionRule],
+    agent_pubkey_hex: &str,
+) -> Option<MatchedRule> {
+    match match_event_decision(event, channel_id, rules, agent_pubkey_hex).await {
+        MatchDecision::Matched(rule) => Some(rule),
+        MatchDecision::Rejected(_) | MatchDecision::NoMatch => None,
+    }
+}
+
+pub(crate) fn has_exact_channel_tag(event: &nostr::Event, channel_id: uuid::Uuid) -> bool {
+    let expected = channel_id.to_string();
+    let mut h_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("h"));
+    let Some(tag) = h_tags.next() else {
+        return false;
+    };
+    let values = tag.as_slice();
+    values.len() == 2 && values[1] == expected && h_tags.next().is_none()
+}
+
+fn trusted_inbound_tags_within_limits(event: &nostr::Event) -> bool {
+    if event.tags.len() > MAX_TRUSTED_INBOUND_TAGS {
+        return false;
+    }
+
+    let mut total_chars = 0usize;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() > MAX_TRUSTED_INBOUND_TAG_PARTS {
+            return false;
+        }
+        for part in parts {
+            // Stop after max+1 scalars so a single untrusted, very large part
+            // does not need a complete traversal before it can be rejected.
+            let chars = part
+                .chars()
+                .take(MAX_TRUSTED_INBOUND_TAG_PART_CHARS + 1)
+                .count();
+            if chars > MAX_TRUSTED_INBOUND_TAG_PART_CHARS {
+                return false;
+            }
+            total_chars += chars;
+            if total_chars > MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -484,6 +704,47 @@ mod tests {
             .unwrap()
     }
 
+    fn make_event_with_tags(kind: u32, tags: Vec<Tag>) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(kind as u16), "hello")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    fn trusted_tags_with_total_chars(
+        channel_id: Uuid,
+        agent_pubkey: &str,
+        total_chars: usize,
+    ) -> Vec<Tag> {
+        let mut raw_tags = vec![
+            vec!["h".to_string(), channel_id.to_string()],
+            vec!["p".to_string(), agent_pubkey.to_string()],
+        ];
+        while raw_tags.len() < MAX_TRUSTED_INBOUND_TAGS {
+            raw_tags.push(vec!["x".to_string()]);
+        }
+
+        let base_chars: usize = raw_tags
+            .iter()
+            .flatten()
+            .map(|part| part.chars().count())
+            .sum();
+        let mut remaining = total_chars.checked_sub(base_chars).unwrap();
+        for tag in raw_tags.iter_mut().skip(2) {
+            while remaining > 0 && tag.len() < MAX_TRUSTED_INBOUND_TAG_PARTS {
+                let chars = remaining.min(MAX_TRUSTED_INBOUND_TAG_PART_CHARS);
+                tag.push("a".repeat(chars));
+                remaining -= chars;
+            }
+        }
+        assert_eq!(remaining, 0, "test fixture exceeded tag capacity");
+
+        raw_tags
+            .into_iter()
+            .map(|parts| Tag::parse(parts).unwrap())
+            .collect()
+    }
+
     fn any_channel() -> Uuid {
         Uuid::new_v4()
     }
@@ -501,6 +762,9 @@ mod tests {
             channels,
             kinds,
             require_mention: mention,
+            require_exact_channel_tag: false,
+            requires_reply: false,
+            admit_invited_ephemeral: false,
             filter: filter.map(|s| s.into()),
             prompt_tag: prompt_tag.map(|s| s.into()),
             compiled_filter: None,
@@ -575,6 +839,87 @@ mod tests {
             .await
             .unwrap();
         assert!(result);
+    }
+
+    #[test]
+    fn test_blocking_queue_delay_does_not_consume_expression_deadline() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+
+            let release_thread = std::thread::spawn(move || {
+                std::thread::sleep(EVAL_EXECUTION_TIMEOUT + Duration::from_millis(150));
+                release_blocker_tx.send(()).unwrap();
+            });
+
+            let event = make_event(9, "production request");
+            let author = event.pubkey.to_hex();
+            let expression = format!(
+                r#"author == "{a}" || author == "{author}" || author == "{c}""#,
+                a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
+            let node = Arc::new(evalexpr::build_operator_tree(&expression).unwrap());
+            let channel_id = any_channel();
+            let mut rule = make_rule(
+                "private-office",
+                ChannelScope::List(vec![channel_id.to_string()]),
+                vec![9, 40002],
+                false,
+                Some(&expression),
+                None,
+            );
+            rule.compiled_filter = Some(node);
+
+            let matched = match_event(&event, channel_id, &[rule], "").await.unwrap();
+            assert_eq!(matched.prompt_tag, "private-office");
+
+            release_thread.join().unwrap();
+            blocker.await.unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn test_execution_delay_within_budget_succeeds() {
+        let result = run_filter_eval(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(true)
+        })
+        .await
+        .unwrap();
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_execution_deadline_remains_fail_closed() {
+        let error = run_filter_eval(|| {
+            std::thread::sleep(EVAL_EXECUTION_TIMEOUT + Duration::from_millis(150));
+            Ok(true)
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FilterError::Timeout {
+                stage: FilterTimeoutStage::Execution
+            }
+        ));
     }
 
     #[tokio::test]
@@ -664,6 +1009,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_channel_tag_requires_one_canonical_h_tag() {
+        let channel_id = any_channel();
+        let exact_h = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
+        let mut rule = make_rule(
+            "strict-channel",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        let accepted = make_event_with_tags(9, vec![exact_h.clone()]);
+        assert!(matches!(
+            match_event_decision(&accepted, channel_id, &[rule.clone()], "").await,
+            MatchDecision::Matched(_)
+        ));
+
+        let missing = make_event(9, "hello");
+        assert!(matches!(
+            match_event_decision(&missing, channel_id, &[rule.clone()], "").await,
+            MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired)
+        ));
+
+        let duplicate = make_event_with_tags(9, vec![exact_h.clone(), exact_h]);
+        assert!(matches!(
+            match_event_decision(&duplicate, channel_id, &[rule], "").await,
+            MatchDecision::Rejected(MatchRejection::ExactChannelTagRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_tag_limits_accept_every_exact_boundary() {
+        let channel_id = any_channel();
+        let agent_pubkey = Keys::generate().public_key().to_hex();
+        let tags = trusted_tags_with_total_chars(
+            channel_id,
+            &agent_pubkey,
+            MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS,
+        );
+        assert_eq!(tags.len(), MAX_TRUSTED_INBOUND_TAGS);
+        assert!(tags.iter().all(|tag| {
+            tag.as_slice().len() <= MAX_TRUSTED_INBOUND_TAG_PARTS
+                && tag
+                    .as_slice()
+                    .iter()
+                    .all(|part| part.chars().count() <= MAX_TRUSTED_INBOUND_TAG_PART_CHARS)
+        }));
+        assert!(tags.iter().any(|tag| {
+            tag.as_slice().len() == MAX_TRUSTED_INBOUND_TAG_PARTS
+                && tag
+                    .as_slice()
+                    .iter()
+                    .any(|part| part.chars().count() == MAX_TRUSTED_INBOUND_TAG_PART_CHARS)
+        }));
+
+        let event = make_event_with_tags(9, tags);
+        let mut rule = make_rule(
+            "trusted-boundary",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        assert!(matches!(
+            match_event_decision_with_trusted_limits(
+                &event,
+                channel_id,
+                &[rule],
+                &agent_pubkey,
+                true,
+            )
+            .await,
+            MatchDecision::Matched(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn trusted_inbound_tag_limits_reject_each_over_bound_shape() {
+        let channel_id = any_channel();
+        let agent_pubkey = Keys::generate().public_key().to_hex();
+        let channel = channel_id.to_string();
+        let h = || Tag::parse(["h", channel.as_str()]).unwrap();
+        let p = || Tag::parse(["p", agent_pubkey.as_str()]).unwrap();
+
+        let mut too_many_tags = vec![h(), p()];
+        while too_many_tags.len() <= MAX_TRUSTED_INBOUND_TAGS {
+            too_many_tags.push(Tag::parse(["x"]).unwrap());
+        }
+
+        let mut too_many_parts = vec!["x".to_string()];
+        too_many_parts
+            .extend((0..MAX_TRUSTED_INBOUND_TAG_PARTS).map(|index| format!("part-{index}")));
+        let too_many_parts = vec![h(), p(), Tag::parse(too_many_parts).unwrap()];
+
+        let too_many_part_chars = vec![
+            h(),
+            p(),
+            Tag::parse([
+                "x".to_string(),
+                "🐝".repeat(MAX_TRUSTED_INBOUND_TAG_PART_CHARS + 1),
+            ])
+            .unwrap(),
+        ];
+        let too_many_total = trusted_tags_with_total_chars(
+            channel_id,
+            &agent_pubkey,
+            MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS + 1,
+        );
+
+        let mut rule = make_rule(
+            "trusted-over-bound",
+            ChannelScope::List(vec![channel]),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        for tags in [
+            too_many_tags,
+            too_many_parts,
+            too_many_part_chars,
+            too_many_total,
+        ] {
+            let event = make_event_with_tags(9, tags);
+            assert!(matches!(
+                match_event_decision_with_trusted_limits(
+                    &event,
+                    channel_id,
+                    std::slice::from_ref(&rule),
+                    &agent_pubkey,
+                    true,
+                )
+                .await,
+                MatchDecision::Rejected(MatchRejection::InboundEventTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_rules_keep_accepting_oversized_signed_events() {
+        let channel_id = any_channel();
+        let agent_pubkey = Keys::generate().public_key().to_hex();
+        let event = make_event_with_tags(
+            9,
+            trusted_tags_with_total_chars(
+                channel_id,
+                &agent_pubkey,
+                MAX_TRUSTED_INBOUND_TAG_TOTAL_CHARS + 1,
+            ),
+        );
+        let mut rule = make_rule(
+            "ordinary-over-bound",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        assert!(matches!(
+            match_event_decision(&event, channel_id, &[rule], &agent_pubkey).await,
+            MatchDecision::Matched(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn match_carries_rule_level_reply_requirement() {
+        let event = make_event(9, "hello");
+        let channel_id = any_channel();
+        let mut rule = make_rule(
+            "reply-required",
+            ChannelScope::All("all".into()),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        rule.requires_reply = true;
+
+        let matched = match_event(&event, channel_id, &[rule], "").await.unwrap();
+        assert!(matched.requires_reply);
+    }
+
+    #[tokio::test]
+    async fn missing_recipient_is_rejected_only_when_no_later_rule_matches() {
+        let event = make_event(9, "hello");
+        let channel_id = any_channel();
+        let mention_rule = make_rule(
+            "mention",
+            ChannelScope::All("all".into()),
+            vec![9],
+            true,
+            None,
+            None,
+        );
+        assert!(matches!(
+            match_event_decision(
+                &event,
+                channel_id,
+                std::slice::from_ref(&mention_rule),
+                "agent",
+            )
+            .await,
+            MatchDecision::Rejected(MatchRejection::MentionRequired)
+        ));
+
+        let fallback = make_rule(
+            "fallback",
+            ChannelScope::All("all".into()),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        let matched =
+            match_event_decision(&event, channel_id, &[mention_rule, fallback], "agent").await;
+        assert!(matches!(
+            matched,
+            MatchDecision::Matched(MatchedRule { rule_index: 1, .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_match_event_no_match() {
         let event = make_event(1, "hello");
         let channel_id = any_channel();
@@ -679,6 +1255,44 @@ mod tests {
 
         let result = match_event(&event, channel_id, &rules, "").await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_channel_tag_requires_one_matching_h_tag() {
+        let channel_id = any_channel();
+        let other_channel = any_channel();
+        let keys = Keys::generate();
+        let exact_h = Tag::parse(["h", channel_id.to_string().as_str()]).expect("h tag");
+        let other_h = Tag::parse(["h", other_channel.to_string().as_str()]).expect("other h tag");
+        let exact = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([exact_h.clone()])
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let duplicate = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([exact_h, other_h.clone()])
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let wrong = EventBuilder::new(Kind::Custom(9), "hello")
+            .tags([other_h])
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let mut rule = make_rule(
+            "exact-room",
+            ChannelScope::List(vec![channel_id.to_string()]),
+            vec![9],
+            false,
+            None,
+            None,
+        );
+        rule.require_exact_channel_tag = true;
+
+        assert!(match_event(&exact, channel_id, &[rule.clone()], "")
+            .await
+            .is_some());
+        assert!(match_event(&duplicate, channel_id, &[rule.clone()], "")
+            .await
+            .is_none());
+        assert!(match_event(&wrong, channel_id, &[rule], "").await.is_none());
     }
 
     #[test]

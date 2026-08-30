@@ -3,6 +3,7 @@ mod client;
 mod commands;
 mod error;
 mod links;
+mod schema;
 mod validate;
 
 use clap::{Parser, Subcommand};
@@ -63,6 +64,7 @@ where
 #[derive(Parser)]
 #[command(
     name = "buzz",
+    version,
     about = "Buzz CLI — interact with a Buzz relay",
     long_about = "\
 Buzz CLI — interact with a Buzz relay
@@ -174,6 +176,9 @@ pub enum OutputFormat {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Emit the versioned machine-readable CLI contract
+    #[command(hide = true)]
+    Schema,
     /// Draft owner-reviewed agent creation and updates
     #[command(subcommand)]
     Agents(AgentsCmd),
@@ -2030,6 +2035,19 @@ fn normalize_auth_tag_input(input: &str) -> String {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
+    // Schema introspection is local-only and must never require or parse
+    // identity credentials.
+    if matches!(cli.command, Cmd::Schema) {
+        let value = schema::cli_schema();
+        println!(
+            "{}",
+            serde_json::to_string(&value).map_err(|error| CliError::Other(format!(
+                "failed to serialize CLI schema: {error}"
+            )))?
+        );
+        return Ok(());
+    }
+
     let relay_url = client::normalize_relay_url(&cli.relay);
 
     // Pack commands are local-only — no relay connection needed.
@@ -2078,6 +2096,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
 
     match cli.command {
+        Cmd::Schema => unreachable!("handled above"),
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
         Cmd::Messages(sub) => commands::messages::dispatch(sub, &client, &cli.format).await,
         Cmd::Channels(sub) => commands::channels::dispatch(sub, &client, &cli.format).await,
@@ -2245,6 +2264,7 @@ mod tests {
             "projects",
             "reactions",
             "repos",
+            "schema",
             "social",
             "upload",
             "users",

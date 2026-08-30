@@ -11,6 +11,7 @@ mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
+mod replay_state;
 mod setup_mode;
 mod usage;
 
@@ -45,9 +46,91 @@ use pool::{
 use pool_lifecycle::PoolLifecycle;
 use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
+use replay_state::ReplayState;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+const DEFAULT_BASE_PROMPT: &str = include_str!("base_prompt.md");
+const AEON_BUZZ_COLLABORATION_CONTRACT_REVISION: &str = "aeon-buzz-collaboration/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BasePromptStartupReadback {
+    agent_identity: String,
+    base_prompt_source: &'static str,
+    base_prompt_sha256: Option<String>,
+    collaboration_contract_revision: &'static str,
+    collaboration_contract_present: bool,
+    session_scope: &'static str,
+    fixed_session_key: Option<String>,
+    canonical_channel_source: &'static str,
+    trusted_inbound_envelope: bool,
+    turn_receipts: bool,
+    expected_gateway_session_key: Option<String>,
+}
+
+/// Describe only the prompt contract selected for startup, never its content.
+/// This readback is safe for logs and observer frames and lets operators prove
+/// which CLI seat received the shared collaboration contract.
+fn base_prompt_startup_readback(config: &Config) -> BasePromptStartupReadback {
+    base_prompt_startup_readback_for(
+        &config.agent_command,
+        config.no_base_prompt,
+        config.base_prompt_content.as_deref(),
+        config.trusted_inbound_envelope,
+        config.turn_receipts,
+        config.expected_gateway_session_key.as_deref(),
+    )
+}
+
+fn base_prompt_startup_readback_for(
+    agent_command: &str,
+    no_base_prompt: bool,
+    custom_base_prompt: Option<&str>,
+    trusted_inbound_envelope: bool,
+    turn_receipts: bool,
+    expected_gateway_session_key: Option<&str>,
+) -> BasePromptStartupReadback {
+    use sha2::{Digest, Sha256};
+
+    let (source, prompt) = if no_base_prompt {
+        ("disabled", None)
+    } else if let Some(content) = custom_base_prompt {
+        ("custom", Some(content))
+    } else {
+        ("compiled", Some(DEFAULT_BASE_PROMPT))
+    };
+    // Only the compiled prompt is owned by this binary. A custom prompt may
+    // repeat the revision marker without carrying the complete contract.
+    let collaboration_contract_present = source == "compiled";
+    let base_prompt_sha256 = prompt.map(|content| hex::encode(Sha256::digest(content.as_bytes())));
+    let fixed_session_key = expected_gateway_session_key.map(str::to_owned);
+    let session_scope = if fixed_session_key.is_some() {
+        "fixed-gateway"
+    } else {
+        "per-channel-acp"
+    };
+    let canonical_channel_source = if fixed_session_key.is_some() {
+        "gateway-session-contract"
+    } else {
+        "per-turn-observer-context"
+    };
+
+    BasePromptStartupReadback {
+        agent_identity: crate::config::normalize_agent_command_identity(agent_command),
+        base_prompt_source: source,
+        base_prompt_sha256,
+        collaboration_contract_revision: AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+        collaboration_contract_present,
+        session_scope,
+        fixed_session_key: fixed_session_key.clone(),
+        canonical_channel_source,
+        trusted_inbound_envelope,
+        turn_receipts,
+        expected_gateway_session_key: fixed_session_key,
+    }
+}
 
 /// Check if argv[1] matches a subcommand name, before any clap parsing.
 ///
@@ -69,11 +152,6 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Resolve the process working directory for ACP session metadata and prompts.
-///
-/// `std::env::current_dir()` returns an absolute path on every supported
-/// platform. Keep the explicit invariant check so a future source cannot
-/// silently introduce a relative path, and surface resolution failures instead
-/// of substituting a misleading Unix-specific fallback.
 fn current_working_directory() -> Result<String> {
     let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
     ensure!(
@@ -82,6 +160,20 @@ fn current_working_directory() -> Result<String> {
         cwd.display()
     );
     Ok(cwd.to_string_lossy().into_owned())
+}
+
+/// Cold OpenClaw bridges can spend over a minute loading their Gateway plugin
+/// surface after host restart. Keep the supervisor attached through that boot.
+const AGENT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+
+#[cfg(test)]
+mod cold_start_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn frontier_supervisor_allows_three_minutes_for_cold_initialization() {
+        assert_eq!(AGENT_INITIALIZE_TIMEOUT, Duration::from_secs(180));
+    }
 }
 
 /// Publish a kind:20001 presence update event via the WebSocket connection.
@@ -235,9 +327,9 @@ async fn is_owner_or_sibling(
 
 /// Inbound author gate decision: does this author's event fire a turn?
 ///
-/// Coarse security policy applied before subscription rules. Both `OwnerOnly`
-/// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
-/// additionally accepts the explicit external pubkey list.
+/// Coarse security policy applied before subscription rules. `OwnerOnly` and
+/// `Allowlist` accept same-owner siblings. `StrictAllowlist` deliberately
+/// excludes siblings so deployments can name every inbound principal.
 ///
 /// # DM hardening (`is_dm`)
 ///
@@ -246,9 +338,10 @@ async fn is_owner_or_sibling(
 /// agent-initiated DMs (the agent can be asked to DM a third party), that
 /// turns `anyone`/`allowlist` modes into transitive access grants: whoever
 /// lands in a DM with the agent can prompt it. To close that hole, when
-/// `is_dm` is true only the owner and cryptographically verified same-owner
-/// siblings may fire a turn — the explicit allowlist and `anyone` mode do
-/// NOT apply inside DMs. `Nobody` still drops everything. Callers must
+/// `is_dm` is true, ordinary modes admit only the owner and cryptographically
+/// verified same-owner siblings. `StrictAllowlist` admits only the owner.
+/// Explicit allowlists and `anyone` do not apply inside DMs. `Nobody` still
+/// drops everything. Callers must
 /// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
 async fn author_allowed(
     respond_to: &RespondTo,
@@ -261,6 +354,7 @@ async fn author_allowed(
     if is_dm {
         return match respond_to {
             RespondTo::Nobody => false,
+            RespondTo::StrictAllowlist => owner_cache.get() == Some(author),
             _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
         };
     }
@@ -271,6 +365,9 @@ async fn author_allowed(
         RespondTo::Allowlist => {
             allowlist.contains(author)
                 || is_owner_or_sibling(author, owner_cache, rest_client).await
+        }
+        RespondTo::StrictAllowlist => {
+            allowlist.contains(author) || owner_cache.get() == Some(author)
         }
     }
 }
@@ -379,6 +476,209 @@ async fn check_sibling_via_profile(
     false
 }
 
+#[derive(Clone, Copy)]
+struct EphemeralLease {
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ttl_seconds: u64,
+    metadata_created_at: u64,
+    last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl EphemeralLease {
+    fn pending(ttl_seconds: u64, metadata_created_at: u64) -> Self {
+        Self {
+            deadline: None,
+            ttl_seconds,
+            metadata_created_at,
+            last_activity_at: None,
+        }
+    }
+
+    fn activate(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: u64,
+        metadata_created_at: u64,
+    ) -> bool {
+        let Some(deadline) = refreshed_ephemeral_deadline(now, ttl_seconds) else {
+            return false;
+        };
+        self.deadline = Some(deadline);
+        self.ttl_seconds = ttl_seconds;
+        self.metadata_created_at = metadata_created_at;
+        self.last_activity_at = Some(now);
+        true
+    }
+
+    fn reconcile_metadata(&mut self, ttl_seconds: u64, metadata_created_at: u64) -> bool {
+        if metadata_created_at < self.metadata_created_at {
+            return true;
+        }
+        if self.deadline.is_some()
+            && (ttl_seconds != self.ttl_seconds || metadata_created_at > self.metadata_created_at)
+        {
+            let Some(metadata_time) = i64::try_from(metadata_created_at)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            else {
+                return false;
+            };
+            let base = self
+                .last_activity_at
+                .map_or(metadata_time, |activity| activity.max(metadata_time));
+            let Some(deadline) = refreshed_ephemeral_deadline(base, ttl_seconds) else {
+                return false;
+            };
+            self.deadline = Some(deadline);
+        }
+        self.ttl_seconds = ttl_seconds;
+        self.metadata_created_at = metadata_created_at;
+        true
+    }
+
+    fn authorize_event(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+        event_created_at: u64,
+        ttl_seconds: u64,
+        metadata_created_at: u64,
+        is_subscription_catch_up: bool,
+    ) -> bool {
+        if !self.reconcile_metadata(ttl_seconds, metadata_created_at) {
+            return false;
+        }
+        if is_subscription_catch_up {
+            let Some(activity_at) = i64::try_from(event_created_at)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .filter(|activity_at| *activity_at <= now)
+            else {
+                return false;
+            };
+            let Some(metadata_at) = i64::try_from(self.metadata_created_at)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .filter(|metadata_at| *metadata_at <= now)
+            else {
+                return false;
+            };
+            let activity_at = self
+                .last_activity_at
+                .unwrap_or(activity_at)
+                .max(activity_at)
+                .max(metadata_at);
+            // Before EOSE, exact replay provenance is unknowable. Use the signed
+            // event time as activity so catch-up can recover current work but can
+            // never extend a lease as though the event arrived at `now`.
+            self.activate(activity_at, self.ttl_seconds, self.metadata_created_at)
+                && self.deadline.is_some_and(|deadline| deadline > now)
+        } else {
+            self.activate(now, self.ttl_seconds, self.metadata_created_at)
+        }
+    }
+}
+
+fn eligible_ephemeral_contract(
+    current: &Result<Option<relay::ChannelInfo>, relay::RelayError>,
+) -> Result<Option<(u64, u64)>, &relay::RelayError> {
+    match current {
+        Ok(Some(info)) => Ok(info.ephemeral_ttl_seconds().zip(info.metadata_created_at)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn refreshed_ephemeral_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_seconds: u64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ttl_seconds = i64::try_from(ttl_seconds).ok()?;
+    now.checked_add_signed(chrono::Duration::try_seconds(ttl_seconds)?)
+}
+
+#[cfg(test)]
+mod ephemeral_eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn transient_metadata_failure_stays_distinct_from_confirmed_ineligibility() {
+        let unavailable = Err(relay::RelayError::Timeout);
+        assert!(matches!(
+            eligible_ephemeral_contract(&unavailable),
+            Err(relay::RelayError::Timeout)
+        ));
+
+        let ineligible = Ok(None);
+        assert!(matches!(eligible_ephemeral_contract(&ineligible), Ok(None)));
+    }
+
+    #[test]
+    fn activity_refresh_uses_ttl_duration_after_metadata_deadline_ages_out() {
+        let now = chrono::Utc::now();
+        let info = relay::ChannelInfo {
+            name: "huddle".into(),
+            channel_type: "private".into(),
+            description: None,
+            ttl_seconds: Some(3600),
+            has_ttl_deadline: true,
+            metadata_created_at: Some(1),
+            metadata_event_id: Some("a".repeat(64)),
+        };
+        assert_eq!(info.ephemeral_ttl_seconds(), Some(3600));
+        assert!(refreshed_ephemeral_deadline(now, 3600).is_some_and(|value| value > now));
+    }
+
+    #[test]
+    fn newer_metadata_reconciles_a_shortened_ttl_against_latest_activity_or_update() {
+        let activity = chrono::DateTime::from_timestamp(200, 0).expect("activity time");
+        let mut lease = EphemeralLease::pending(3600, 100);
+        assert!(lease.activate(activity, 3600, 100));
+        assert!(lease.reconcile_metadata(60, 300));
+        assert_eq!(lease.deadline, chrono::DateTime::from_timestamp(360, 0));
+        assert_eq!(lease.ttl_seconds, 60);
+        assert_eq!(lease.metadata_created_at, 300);
+    }
+
+    #[test]
+    fn catch_up_uses_signed_event_time_instead_of_receipt_time() {
+        let now = chrono::DateTime::from_timestamp(500, 0).expect("current time");
+        let mut pending = EphemeralLease::pending(60, 100);
+        assert!(pending.authorize_event(now, 450, 60, 100, true));
+        assert_eq!(pending.deadline, chrono::DateTime::from_timestamp(510, 0));
+        assert!(pending.authorize_event(now, 490, 60, 100, true));
+        assert_eq!(pending.deadline, chrono::DateTime::from_timestamp(550, 0));
+        assert!(pending.authorize_event(now, 450, 60, 100, true));
+        assert_eq!(pending.deadline, chrono::DateTime::from_timestamp(550, 0));
+
+        let mut stale = EphemeralLease::pending(60, 100);
+        assert!(!stale.authorize_event(now, 400, 60, 100, true));
+        assert_eq!(stale.deadline, chrono::DateTime::from_timestamp(460, 0));
+
+        let mut future = EphemeralLease::pending(60, 100);
+        assert!(!future.authorize_event(now, 501, 60, 100, true));
+        assert_eq!(future.deadline, None);
+    }
+
+    #[test]
+    fn fresh_event_activates_a_pending_ephemeral_lease() {
+        let now = chrono::DateTime::from_timestamp(500, 0).expect("current time");
+        let mut lease = EphemeralLease::pending(60, 100);
+        assert!(lease.authorize_event(now, 500, 60, 100, false));
+        assert_eq!(lease.deadline, chrono::DateTime::from_timestamp(560, 0));
+    }
+
+    #[test]
+    fn stale_metadata_cannot_restore_an_older_longer_ttl() {
+        let now = chrono::DateTime::from_timestamp(500, 0).expect("current time");
+        let mut lease = EphemeralLease::pending(60, 300);
+
+        assert!(lease.authorize_event(now, 500, 3600, 100, false));
+        assert_eq!(lease.deadline, chrono::DateTime::from_timestamp(560, 0));
+        assert_eq!(lease.ttl_seconds, 60);
+        assert_eq!(lease.metadata_created_at, 300);
+    }
+}
+
 /// Observer frames are published at a global rate of AT MOST ONE relay frame
 /// per tick — not one per channel, and not one per drain. Everything that
 /// accumulates between ticks waits in [`ObserverPublishQueue`] as events and
@@ -439,6 +739,9 @@ const OBSERVER_BATCH_KIND: &str = "batch";
 #[derive(Default)]
 struct ObserverPublishQueue {
     coalescer: ObserverChunkCoalescer,
+    /// Process-local tool-call id → display name join used only to compact
+    /// later `tool_call_update` frames that omit the name.
+    tool_names: HashMap<String, String>,
     /// `(serialized_len, source_events, event)`, oldest first. Length is
     /// captured at enqueue (post-fit) so byte accounting never re-serializes
     /// on eviction; `source_events` is how many GENERATED observer events the
@@ -455,7 +758,8 @@ struct ObserverPublishQueue {
 }
 
 impl ObserverPublishQueue {
-    fn ingest(&mut self, event: observer::ObserverEvent) {
+    fn ingest(&mut self, mut event: observer::ObserverEvent) {
+        compact_observer_tool_frame(&mut event, &mut self.tool_names);
         // ObserverChunkCoalescer::ingest returns immediately-publishable events
         // (force-flushed pending chunks + non-chunk passthrough, or a pending
         // set displaced by the 60KB pre-flush); they join the queue in the
@@ -584,6 +888,83 @@ impl ObserverPublishQueue {
         self.events = kept;
         Some(seal_batch(picked))
     }
+}
+
+/// Project raw ACP tool frames to the only relay-observer facts consumers
+/// need. Arguments and results remain in the local desktop archive, never in
+/// the encrypted kind:24200 telemetry payload.
+fn compact_observer_tool_frame(
+    event: &mut observer::ObserverEvent,
+    tool_names: &mut HashMap<String, String>,
+) {
+    if event.kind != "acp_read" {
+        return;
+    }
+    let Some(update) = event.payload.pointer("/params/update") else {
+        return;
+    };
+    let Some(update_type) = update.get("sessionUpdate").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if !matches!(update_type, "tool_call" | "tool_call_update") {
+        return;
+    }
+    let tool_call_id = update
+        .get("toolCallId")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let direct_tool_name = [
+        update.get("title"),
+        update.get("name"),
+        update.get("toolName"),
+        update.pointer("/_meta/toolName"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(serde_json::Value::as_str)
+    .map(ToOwned::to_owned);
+    if update_type == "tool_call" {
+        if let (Some(tool_call_id), Some(tool_name)) = (&tool_call_id, &direct_tool_name) {
+            if tool_names.len() >= 1_024 && !tool_names.contains_key(tool_call_id) {
+                tool_names.clear();
+            }
+            tool_names.insert(tool_call_id.clone(), tool_name.clone());
+        }
+    }
+    let tool_name = direct_tool_name
+        .or_else(|| {
+            tool_call_id
+                .as_ref()
+                .and_then(|id| tool_names.get(id).cloned())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = update
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if update_type == "tool_call" {
+                "started".to_string()
+            } else {
+                "unknown".to_string()
+            }
+        });
+    if update_type == "tool_call_update"
+        && matches!(status.as_str(), "completed" | "failed" | "cancelled")
+    {
+        if let Some(tool_call_id) = &tool_call_id {
+            tool_names.remove(tool_call_id);
+        }
+    }
+    event.payload = serde_json::json!({
+        "params": {
+            "update": {
+                "sessionUpdate": update_type,
+                "toolName": tool_name,
+                "status": status,
+            }
+        }
+    });
 }
 
 /// A single event ships unwrapped; two or more get the batch envelope.
@@ -1959,6 +2340,26 @@ async fn tokio_main() -> Result<()> {
     }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
+    let base_prompt_readback = base_prompt_startup_readback(&config);
+    tracing::info!(
+        target: "buzz_acp::startup",
+        event = "startup_readback",
+        agent_identity = %base_prompt_readback.agent_identity,
+        base_prompt_source = base_prompt_readback.base_prompt_source,
+        base_prompt_sha256 = base_prompt_readback.base_prompt_sha256.as_deref().unwrap_or("none"),
+        collaboration_contract_revision = base_prompt_readback.collaboration_contract_revision,
+        collaboration_contract_present = base_prompt_readback.collaboration_contract_present,
+        session_scope = base_prompt_readback.session_scope,
+        fixed_session_key = base_prompt_readback.fixed_session_key.as_deref().unwrap_or("none"),
+        canonical_channel_source = base_prompt_readback.canonical_channel_source,
+        trusted_inbound_envelope = base_prompt_readback.trusted_inbound_envelope,
+        turn_receipts = base_prompt_readback.turn_receipts,
+        expected_gateway_session_key = base_prompt_readback
+            .expected_gateway_session_key
+            .as_deref()
+            .unwrap_or("none"),
+        "buzz_acp_startup_readback"
+    );
 
     let observer = config
         .relay_observer
@@ -1974,6 +2375,7 @@ async fn tokio_main() -> Result<()> {
                 "agentArgs": config.agent_args,
                 "parallelism": config.agents,
                 "relayObserver": config.relay_observer,
+                "startupReadback": base_prompt_readback,
             }),
         );
     }
@@ -1997,6 +2399,15 @@ async fn tokio_main() -> Result<()> {
         .as_secs();
 
     let pubkey_hex = config.keys.public_key().to_hex();
+    let replay_state_path = ReplayState::path_for(&config.config_path, &pubkey_hex);
+    let replay_state = Arc::new(std::sync::Mutex::new(
+        ReplayState::load(replay_state_path.clone()).with_context(|| {
+            format!(
+                "failed to load ACP replay state {}",
+                replay_state_path.display()
+            )
+        })?,
+    ));
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
@@ -2044,11 +2455,12 @@ async fn tokio_main() -> Result<()> {
                      dropped. Set BUZZ_AUTH_TAG or --agent-owner, or use --respond-to=anyone."
                 );
             }
-            RespondTo::Allowlist => {
+            RespondTo::Allowlist | RespondTo::StrictAllowlist => {
                 tracing::warn!(
-                    "respond-to=allowlist but no owner is set — allowlisted pubkeys \
+                    "respond-to={} but no owner is set — allowlisted pubkeys \
                      will still be accepted, but owner-based matching is unavailable \
-                     until owner is resolved."
+                     until owner is resolved.",
+                    config.respond_to
                 );
             }
             _ => {} // anyone/nobody don't depend on owner
@@ -2100,7 +2512,7 @@ async fn tokio_main() -> Result<()> {
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
-    let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
+    let mut rules: Vec<SubscriptionRule> = match config.subscribe_mode {
         SubscribeMode::Mentions => {
             vec![SubscriptionRule {
                 name: "mentions".into(),
@@ -2113,6 +2525,9 @@ async fn tokio_main() -> Result<()> {
                     ]
                 }),
                 require_mention: !config.no_mention_filter,
+                require_exact_channel_tag: false,
+                requires_reply: false,
+                admit_invited_ephemeral: false,
                 filter: None,
                 compiled_filter: None,
                 consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2125,6 +2540,9 @@ async fn tokio_main() -> Result<()> {
                 channels: filter::ChannelScope::All("all".into()),
                 kinds: config.kinds_override.clone().unwrap_or_default(),
                 require_mention: false,
+                require_exact_channel_tag: false,
+                requires_reply: false,
+                admit_invited_ephemeral: false,
                 filter: None,
                 compiled_filter: None,
                 consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2137,13 +2555,43 @@ async fn tokio_main() -> Result<()> {
         }
     };
 
+    // `None` is subscribed-but-suspended. A live durable event is the
+    // authoritative activity signal that promotes it to `Some(deadline)`;
+    // kind-39000's original absolute deadline is not reused after startup.
+    let mut admitted_ephemeral_deadlines: HashMap<Uuid, EphemeralLease> = HashMap::new();
+    for (channel_id, info) in &channel_info_map {
+        if let Some((ttl_seconds, metadata_created_at)) = info
+            .ephemeral_ttl_seconds()
+            .zip(info.metadata_created_at)
+            .filter(|_| config::admit_invited_ephemeral_channel(&mut rules, *channel_id))
+        {
+            admitted_ephemeral_deadlines.insert(
+                *channel_id,
+                EphemeralLease::pending(ttl_seconds, metadata_created_at),
+            );
+            tracing::debug!(
+                %channel_id,
+                metadata_created_at = ?info.metadata_created_at,
+                metadata_event_id = ?info.metadata_event_id,
+                "admitted canonical private TTL channel"
+            );
+        }
+    }
+
     let channel_filters = config::resolve_channel_filters(&config, &channel_ids, &rules);
     if channel_filters.is_empty() {
         tracing::warn!("no channel subscriptions resolved — agent will sit idle");
     }
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
     for (channel_id, filter) in &channel_filters {
-        if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
+        let replay_since = replay_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replay_since(*channel_id);
+        if let Err(e) = relay
+            .subscribe_channel_from(*channel_id, filter.clone(), replay_since)
+            .await
+        {
             tracing::warn!("failed to subscribe to channel {channel_id}: {e}");
         } else {
             subscribed_channel_ids.insert(*channel_id);
@@ -2190,8 +2638,12 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    let session_cwd = config
+        .session_cwd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("session cwd must be valid UTF-8 for the ACP protocol"))?
+        .to_owned();
     let base_prompt_content = config.base_prompt_content.take();
-    let cwd = current_working_directory()?;
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2199,6 +2651,7 @@ async fn tokio_main() -> Result<()> {
         max_turn_duration: Duration::from_secs(config.max_turn_duration_secs),
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
+        replay_state: replay_state.clone(),
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
@@ -2207,10 +2660,10 @@ async fn tokio_main() -> Result<()> {
         } else if let Some(content) = base_prompt_content {
             Some(Box::leak(content.into_boxed_str()))
         } else {
-            Some(include_str!("base_prompt.md"))
+            Some(DEFAULT_BASE_PROMPT)
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd,
+        cwd: session_cwd,
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
@@ -2222,6 +2675,9 @@ async fn tokio_main() -> Result<()> {
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
+        turn_receipts: config.turn_receipts,
+        expected_gateway_session_key: config.expected_gateway_session_key.clone(),
+        trusted_inbound_envelope: config.trusted_inbound_envelope,
         relay_url: config.relay_url.clone(),
     });
 
@@ -2262,6 +2718,11 @@ async fn tokio_main() -> Result<()> {
     } else {
         None
     };
+    let mut ephemeral_revalidation = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
+    ephemeral_revalidation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -2458,12 +2919,22 @@ async fn tokio_main() -> Result<()> {
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
+                let env = config.agent_spawn_env();
                 let has_codex = config.has_generated_codex_config;
+                let publisher_credentials = config.agent_publisher_credentials;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        publisher_credentials,
+                        idx,
+                        observer,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -2691,32 +3162,93 @@ async fn tokio_main() -> Result<()> {
 
                                     if subscribed_channel_ids.contains(&ch) {
                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
-                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
-                                            tracing::warn!("failed to subscribe to new channel {ch}: {e}");
-                                        } else {
-                                            subscribed_channel_ids.insert(ch);
-                                        }
                                     } else {
-                                        tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
+                                        let mut filter = config::resolve_dynamic_channel_filter(
+                                            &config, ch, &rules,
+                                        );
+                                        if filter.is_none() {
+                                            match relay.fetch_channel_info(ch).await {
+                                                Ok(Some(info)) => {
+                                                    if let Some((ttl_seconds, metadata_created_at)) = info
+                                                        .ephemeral_ttl_seconds()
+                                                        .zip(info.metadata_created_at)
+                                                        .filter(|_| config::admit_invited_ephemeral_channel(&mut rules, ch))
+                                                    {
+                                                        admitted_ephemeral_deadlines.insert(
+                                                            ch,
+                                                            EphemeralLease::pending(ttl_seconds, metadata_created_at),
+                                                        );
+                                                        filter = config::resolve_dynamic_channel_filter(
+                                                            &config, ch, &rules,
+                                                        );
+                                                    }
+                                                }
+                                                Ok(_) => {}
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        channel_id = %ch,
+                                                        %error,
+                                                        "membership metadata lookup failed — deferring admission"
+                                                    );
+                                                    let event_id = buzz_event.event.id.to_hex();
+                                                    seen_membership_current.remove(&event_id);
+                                                    seen_membership_previous.remove(&event_id);
+                                                    if membership_newest_ts.get(&ch) == Some(&ts) {
+                                                        membership_newest_ts.remove(&ch);
+                                                    }
+                                                    relay.defer_event(
+                                                        buzz_event,
+                                                        Duration::from_secs(1),
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if let Some(filter) = filter {
+                                            tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
+                                            let replay_since = replay_state
+                                                .lock()
+                                                .unwrap_or_else(|error| error.into_inner())
+                                                .replay_since(ch)
+                                                .map_or(ts, |persisted| persisted.min(ts));
+                                            if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(replay_since)).await {
+                                                tracing::warn!("failed to subscribe to new channel {ch}: {e}");
+                                            } else {
+                                                subscribed_channel_ids.insert(ch);
+                                            }
+                                        } else {
+                                            tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
+                                        }
                                     }
                                 } else {
+                                    config::remove_invited_ephemeral_channel(&mut rules, ch);
+                                    admitted_ephemeral_deadlines.remove(&ch);
+                                    relay.drop_deferred_events(ch);
                                     subscribed_channel_ids.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
-                                    if let Err(e) = relay.unsubscribe_channel(ch).await {
-                                        tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
-                                    }
-                                    // Drain queued events and invalidate sessions for the
-                                    // removed channel. Events already in-flight will
-                                    // complete normally (the relay may reject actions if
-                                    // the agent lost access).
+                                    // Membership is an authorization boundary: cancel any
+                                    // in-flight turn before awaiting relay command capacity.
+                                    let _ = signal_in_flight_task(
+                                        &mut pool,
+                                        ch,
+                                        ControlSignal::Cancel,
+                                    );
                                     let drained_ids = queue.drain_channel(ch);
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
                                         0
                                     };
+                                    if let Err(e) = relay.unsubscribe_channel(ch).await {
+                                        tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
+                                    }
+                                    if let Err(error) = replay_state
+                                        .lock()
+                                        .unwrap_or_else(|poison| poison.into_inner())
+                                        .remove_channel(ch)
+                                    {
+                                        tracing::error!(channel_id = %ch, "failed to clear replay state: {error}");
+                                    }
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
@@ -2752,6 +3284,106 @@ async fn tokio_main() -> Result<()> {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
                             }
+                            let event_id_hex = buzz_event.event.id.to_hex();
+                            if replay_state
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .is_handled(buzz_event.channel_id, &event_id_hex)
+                            {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    event_id = %event_id_hex,
+                                    "skipping replay of terminal request"
+                                );
+                                continue;
+                            }
+
+                            // Dynamic-room authorization is revalidated before every
+                            // behavior, including owner control commands. The periodic
+                            // timer is cleanup, never an authorization grace window.
+                            if let Some(previous_lease) = admitted_ephemeral_deadlines
+                                .remove(&buzz_event.channel_id)
+                            {
+                                let now = chrono::Utc::now();
+                                let current = relay.fetch_channel_info(buzz_event.channel_id).await;
+                                match eligible_ephemeral_contract(&current) {
+                                    Ok(Some((ttl_seconds, metadata_created_at))) => {
+                                        let mut current_lease = previous_lease;
+                                        if !current_lease.authorize_event(
+                                            now,
+                                            buzz_event.event.created_at.as_secs(),
+                                            ttl_seconds,
+                                            metadata_created_at,
+                                            buzz_event.is_subscription_catch_up,
+                                        ) {
+                                            admitted_ephemeral_deadlines.insert(
+                                                buzz_event.channel_id,
+                                                previous_lease,
+                                            );
+                                            tracing::warn!(channel_id = %buzz_event.channel_id, is_subscription_catch_up = buzz_event.is_subscription_catch_up, "ephemeral event cannot establish current authorization — denying event");
+                                            continue;
+                                        }
+                                        // The relay refreshes its database deadline when it
+                                        // durably stores this event. Mirror that activity-based
+                                        // lease locally instead of trusting the older metadata
+                                        // event's original absolute deadline.
+                                        admitted_ephemeral_deadlines
+                                            .insert(buzz_event.channel_id, current_lease);
+                                        removed_channels.remove(&buzz_event.channel_id);
+                                    }
+                                    Err(error) => {
+                                        // Deny this event but retain the admission record so
+                                        // periodic revalidation can recover after a transient
+                                        // metadata outage without membership churn or restart.
+                                        admitted_ephemeral_deadlines
+                                            .insert(buzz_event.channel_id, previous_lease);
+                                        tracing::warn!(
+                                            channel_id = %buzz_event.channel_id,
+                                            %error,
+                                            "ephemeral metadata dispatch check failed — deferring event pending retry"
+                                        );
+                                        relay.defer_event(buzz_event, Duration::from_secs(1));
+                                        continue;
+                                    }
+                                    Ok(None) => {
+                                        config::remove_invited_ephemeral_channel(
+                                            &mut rules,
+                                            buzz_event.channel_id,
+                                        );
+                                        relay.drop_deferred_events(buzz_event.channel_id);
+                                        subscribed_channel_ids.remove(&buzz_event.channel_id);
+                                        let _ = signal_in_flight_task(
+                                            &mut pool,
+                                            buzz_event.channel_id,
+                                            ControlSignal::Cancel,
+                                        );
+                                        if let Err(error) = relay
+                                            .unsubscribe_channel(buzz_event.channel_id)
+                                            .await
+                                        {
+                                            tracing::warn!(channel_id = %buzz_event.channel_id, %error, "failed to unsubscribe revoked ephemeral channel");
+                                        }
+                                        let drained_ids = queue.drain_channel(buzz_event.channel_id);
+                                        if pool_ready {
+                                            pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                        }
+                                        removed_channels.insert(buzz_event.channel_id);
+                                        typing_channels.remove(&buzz_event.channel_id);
+                                        if !drained_ids.is_empty() {
+                                            let rest = ctx.rest_client.clone();
+                                            tokio::spawn(async move {
+                                                pool::clear_reactions(
+                                                    rest,
+                                                    buzz_event.channel_id,
+                                                    drained_ids,
+                                                )
+                                                .await;
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
 
                             // Check: kind:9, content "!shutdown", from owner, mentions THIS agent.
                             let is_shutdown = is_owner_control_command(
@@ -2764,6 +3396,12 @@ async fn tokio_main() -> Result<()> {
                                 let owner = owner_cache.get();
                                 if let Some(owner) = owner {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        terminalize_source_best_effort(
+                                            &replay_state,
+                                            buzz_event.channel_id,
+                                            &event_id_hex,
+                                            "shutdown control",
+                                        );
                                         tracing::info!(
                                             channel_id = %buzz_event.channel_id,
                                             sender = %buzz_event.event.pubkey.to_hex(),
@@ -2794,6 +3432,12 @@ async fn tokio_main() -> Result<()> {
                             if is_cancel {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        terminalize_source_best_effort(
+                                            &replay_state,
+                                            buzz_event.channel_id,
+                                            &event_id_hex,
+                                            "cancel control",
+                                        );
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2832,6 +3476,12 @@ async fn tokio_main() -> Result<()> {
                             if is_rotate {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        terminalize_source_best_effort(
+                                            &replay_state,
+                                            buzz_event.channel_id,
+                                            &event_id_hex,
+                                            "rotate control",
+                                        );
                                         let fired = signal_in_flight_task(
                                             &mut pool,
                                             buzz_event.channel_id,
@@ -2891,14 +3541,64 @@ async fn tokio_main() -> Result<()> {
                                         is_dm,
                                         "inbound author gate — dropping event"
                                     );
+                                    spawn_routing_nack(
+                                        &replay_state,
+                                        &ctx.rest_client,
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        pool::RoutingNackCode::UnauthorizedRoute,
+                                    );
                                     continue;
                                 }
                             }
 
-                            let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
-                                None => {
+                            let matched = filter::match_event_decision_with_trusted_limits(
+                                &buzz_event.event,
+                                buzz_event.channel_id,
+                                &rules,
+                                &pubkey_hex,
+                                config.trusted_inbound_envelope,
+                            )
+                            .await;
+                            let (prompt_tag, requires_reply) = match matched {
+                                filter::MatchDecision::Matched(m) => {
+                                    if m.requires_reply {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            rule_index = m.rule_index,
+                                            "matched reply-required subscription rule"
+                                        );
+                                    }
+                                    (m.prompt_tag, m.requires_reply)
+                                }
+                                filter::MatchDecision::Rejected(reason) => {
+                                    let code = match reason {
+                                        filter::MatchRejection::ExactChannelTagRequired => {
+                                            pool::RoutingNackCode::ExactChannelTagRequired
+                                        }
+                                        filter::MatchRejection::MentionRequired => {
+                                            pool::RoutingNackCode::RecipientTagRequired
+                                        }
+                                        filter::MatchRejection::InboundEventTooLarge => {
+                                            pool::RoutingNackCode::InboundEventTooLarge
+                                        }
+                                    };
+                                    spawn_routing_nack(
+                                        &replay_state,
+                                        &ctx.rest_client,
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        code,
+                                    );
+                                    continue;
+                                }
+                                filter::MatchDecision::NoMatch => {
+                                    terminalize_source_best_effort(
+                                        &replay_state,
+                                        buzz_event.channel_id,
+                                        &event_id_hex,
+                                        "unmatched event",
+                                    );
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
                                 }
@@ -2906,7 +3606,45 @@ async fn tokio_main() -> Result<()> {
                             // Capture author pubkey before queue.push() moves
                             // buzz_event.event (needed for mode gate below).
                             let author_hex = buzz_event.event.pubkey.to_hex();
-                            let event_id_hex = buzz_event.event.id.to_hex();
+                            let should_dispatch = {
+                                let mut replay_state = ctx
+                                    .replay_state
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                replay_state.record_open(
+                                    buzz_event.channel_id,
+                                    event_id_hex.clone(),
+                                    buzz_event.event.created_at.as_secs(),
+                                    nostr::Timestamp::now().as_secs(),
+                                    requires_reply,
+                                )
+                            };
+                            match should_dispatch {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::debug!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %event_id_hex,
+                                        "skipping replay of already handled request"
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %event_id_hex,
+                                        "failed to persist accepted request: {error}"
+                                    );
+                                    spawn_routing_nack(
+                                        &replay_state,
+                                        &ctx.rest_client,
+                                        buzz_event.channel_id,
+                                        &buzz_event.event,
+                                        pool::RoutingNackCode::WorkerStateUnavailable,
+                                    );
+                                    continue;
+                                }
+                            }
                             // Clone for the non-cancelling steer fork, which
                             // needs the event to render the steer body. The
                             // clone is unconditional because we don't know
@@ -2925,12 +3663,34 @@ async fn tokio_main() -> Result<()> {
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
                             });
+                            if !accepted {
+                                // `DedupMode::Drop` is an explicit terminal
+                                // disposition, not open work to resurrect after
+                                // a restart. Retire the pre-queue durable claim.
+                                if let Err(error) = replay_state
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .close(
+                                        buzz_event.channel_id,
+                                        std::slice::from_ref(&event_id_hex),
+                                    )
+                                {
+                                    tracing::error!(
+                                        channel_id = %buzz_event.channel_id,
+                                        event_id = %event_id_hex,
+                                        "failed to persist dropped request disposition: {error}"
+                                    );
+                                }
+                            }
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
-                            if accepted {
+                            if should_add_queued_seen_reaction(
+                                accepted,
+                                config.trusted_inbound_envelope,
+                            ) {
                                 let rc = ctx.rest_client.clone();
                                 let eid = event_id_hex.clone();
                                 let channel_id = buzz_event.channel_id;
@@ -2964,7 +3724,14 @@ async fn tokio_main() -> Result<()> {
                                     // to the universal cancel+merge `Steer`
                                     // signal so the event still reaches the
                                     // agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
+                                    // Contracted events must become normal
+                                    // one-source batches. Native steer has no
+                                    // independent envelope/reply/terminal boundary.
+                                    let native_attempted = native_steer_is_eligible(
+                                        requires_reply,
+                                        config.trusted_inbound_envelope,
+                                        &signal,
+                                    )
                                         && try_native_steer(
                                             &mut pool,
                                             &mut queue,
@@ -3138,6 +3905,98 @@ async fn tokio_main() -> Result<()> {
                     }
                     None
                 }
+                _ = ephemeral_revalidation.tick() => {
+                    let _ = result_rx;
+                    let now = chrono::Utc::now();
+                    let channel_leases = admitted_ephemeral_deadlines
+                        .iter()
+                        .map(|(channel_id, lease)| (*channel_id, *lease))
+                        .collect::<Vec<_>>();
+                    // Run the one-second, one-attempt lookups concurrently so
+                    // periodic authorization work has a constant wall-clock
+                    // bound instead of N huddles serializing the dispatch loop.
+                    let relay_ref = &relay;
+                    let metadata_checks = futures_util::future::join_all(
+                        channel_leases.into_iter().map(|(channel_id, lease)| async move {
+                            (
+                                channel_id,
+                                lease,
+                                relay_ref.fetch_channel_info(channel_id).await,
+                            )
+                        }),
+                    )
+                    .await;
+                    let mut cleanup = Vec::new();
+                    for (channel_id, mut lease, current) in metadata_checks {
+                        match eligible_ephemeral_contract(&current) {
+                            Ok(Some((ttl_seconds, metadata_created_at))) => {
+                                if !lease.reconcile_metadata(ttl_seconds, metadata_created_at)
+                                    || lease.deadline.is_some_and(|value| value <= now)
+                                {
+                                    cleanup.push((channel_id, false));
+                                } else {
+                                    admitted_ephemeral_deadlines.insert(channel_id, lease);
+                                }
+                            }
+                            Ok(None) => cleanup.push((channel_id, true)),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %channel_id,
+                                    %error,
+                                    "ephemeral metadata revalidation failed — retaining denied channel for retry"
+                                );
+                            }
+                        }
+                    }
+                    for (channel_id, permanently_ineligible) in cleanup {
+                        if permanently_ineligible {
+                            admitted_ephemeral_deadlines.remove(&channel_id);
+                            config::remove_invited_ephemeral_channel(&mut rules, channel_id);
+                            relay.drop_deferred_events(channel_id);
+                            subscribed_channel_ids.remove(&channel_id);
+                        } else {
+                            // Drop all execution authority at lease expiry but keep
+                            // the subscription as a recovery sensor. A later durable
+                            // event proves the relay renewed its database lease and
+                            // promotes this channel from suspended to active again.
+                            if let Some(lease) = admitted_ephemeral_deadlines.get_mut(&channel_id) {
+                                lease.deadline = None;
+                                lease.last_activity_at = None;
+                            }
+                        }
+                        let _ = signal_in_flight_task(
+                            &mut pool,
+                            channel_id,
+                            ControlSignal::Cancel,
+                        );
+                        let drained_ids = queue.drain_channel(channel_id);
+                        let invalidated = if pool_ready {
+                            pool.invalidate_channel_sessions(channel_id)
+                        } else {
+                            0
+                        };
+                        if permanently_ineligible {
+                            if let Err(error) = relay.unsubscribe_channel(channel_id).await {
+                                tracing::warn!(%channel_id, %error, "failed to unsubscribe revoked ephemeral channel");
+                            }
+                        }
+                        removed_channels.insert(channel_id);
+                        typing_channels.remove(&channel_id);
+                        if !drained_ids.is_empty() {
+                            let rest = ctx.rest_client.clone();
+                            tokio::spawn(async move {
+                                pool::clear_reactions(rest, channel_id, drained_ids).await;
+                            });
+                        }
+                        tracing::info!(
+                            %channel_id,
+                            invalidated,
+                            permanently_ineligible,
+                            "ephemeral channel authorization cleaned up"
+                        );
+                    }
+                    None
+                }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("shutting down");
                     break;
@@ -3151,7 +4010,7 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                if handle_prompt_result_with_replay(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3163,6 +4022,7 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
+                    &replay_state,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -3178,6 +4038,7 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    &replay_state,
                 ) == LoopAction::Exit
                 {
                     break;
@@ -3190,7 +4051,7 @@ async fn tokio_main() -> Result<()> {
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                recover_panicked_agent_with_replay(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -3202,6 +4063,7 @@ async fn tokio_main() -> Result<()> {
                     &respawn_tx,
                     &mut respawn_tasks,
                     observer.clone(),
+                    &replay_state,
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
@@ -3293,7 +4155,7 @@ async fn tokio_main() -> Result<()> {
                 //     pending_steer on every return path. If it does,
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
-                let (release_withheld, drop_withheld, signal_fallback) = match &ack {
+                let (mut release_withheld, mut drop_withheld, signal_fallback) = match &ack {
                     Ok(pool::SteerAck::Success { .. }) => (false, true, false),
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
@@ -3339,6 +4201,21 @@ async fn tokio_main() -> Result<()> {
                             event_id = %event_id,
                             "successful steer lost its in-flight delivery ledger"
                         );
+                    }
+                    if let Err(error) = replay_state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .close(channel_id, std::slice::from_ref(&event_id))
+                    {
+                        tracing::error!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            "failed to persist successful steer: {error}"
+                        );
+                        // Preserve the event for normal dispatch. Duplicate
+                        // delivery is safer than forgetting an unclosed request.
+                        release_withheld = true;
+                        drop_withheld = false;
                     }
                 }
                 if drop_withheld {
@@ -3537,6 +4414,26 @@ async fn tokio_main() -> Result<()> {
     Ok(())
 }
 
+fn should_add_queued_seen_reaction(accepted: bool, trusted_inbound_envelope: bool) -> bool {
+    accepted && !trusted_inbound_envelope
+}
+
+#[test]
+fn queued_seen_reaction_is_deferred_for_trusted_admission() {
+    for (accepted, trusted, expected) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        assert_eq!(
+            should_add_queued_seen_reaction(accepted, trusted),
+            expected,
+            "accepted={accepted}, trusted={trusted}"
+        );
+    }
+}
+
 #[derive(PartialEq)]
 enum LoopAction {
     Continue,
@@ -3587,6 +4484,16 @@ fn mode_gate_signal(
             _ => None,
         },
     }
+}
+
+/// Native steer is only an optimization for uncontracted events. Trusted
+/// inbound metadata and origin-reply proof both require a distinct ACP turn.
+fn native_steer_is_eligible(
+    requires_reply: bool,
+    trusted_inbound_envelope: bool,
+    signal: &ControlSignal,
+) -> bool {
+    !requires_reply && !trusted_inbound_envelope && matches!(signal, ControlSignal::Steer)
 }
 
 /// Send a control signal to the in-flight task for `channel_id`.
@@ -3735,7 +4642,16 @@ fn dispatch_pending(
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     loop {
-        let batch = match queue.flush_next() {
+        let replay_state = ctx
+            .replay_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let batch = queue.flush_next_with_single_event_contract(|channel_id, event| {
+            ctx.trusted_inbound_envelope
+                || replay_state.requires_reply(channel_id, &event.id.to_hex())
+        });
+        drop(replay_state);
+        let batch = match batch {
             Some(b) => b,
             None => break,
         };
@@ -3758,10 +4674,10 @@ fn dispatch_pending(
         };
         tracing::debug!(agent = agent.index, channel = %channel_id, affinity_hit, "agent_claimed");
 
-        let recoverable_batch = match ctx.dedup_mode {
-            DedupMode::Queue => Some(batch.clone()),
-            DedupMode::Drop => None,
-        };
+        // Keep a metadata copy even in Drop mode so a panic can durably mark
+        // the accepted source ids terminal instead of resurrecting them after
+        // restart. Queue mode still uses the same copy for bounded requeue.
+        let recoverable_batch = Some(batch.clone());
 
         let result_tx = pool.result_tx();
         let ctx_clone = Arc::clone(ctx);
@@ -3874,8 +4790,166 @@ fn spawn_failure_notice(
     }
 }
 
+fn spawn_routing_nack(
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
+    rest_client: &relay::RestClient,
+    channel_id: Uuid,
+    source: &nostr::Event,
+    code: pool::RoutingNackCode,
+) {
+    // Terminalize synchronously before the best-effort network publication.
+    // A rejected source must never enter the agent or resurrect after a crash,
+    // even when the relay is unavailable or its timestamp freshness policy
+    // refuses a deterministic NACK for an old catch-up event.
+    terminalize_source_best_effort(
+        replay_state,
+        channel_id,
+        &source.id.to_hex(),
+        "routing rejection",
+    );
+    let rest = rest_client.clone();
+    let source = source.clone();
+    tokio::spawn(async move {
+        pool::post_routing_nack(&rest, channel_id, &source, code).await;
+    });
+}
+
+fn terminalize_source_best_effort(
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
+    channel_id: Uuid,
+    event_id: &str,
+    disposition: &'static str,
+) -> bool {
+    match replay_state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .terminalize(channel_id, &[event_id.to_string()])
+    {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::error!(
+                channel_id = %channel_id,
+                event_id,
+                disposition,
+                "failed to persist terminal request disposition: {error}"
+            );
+            false
+        }
+    }
+}
+
+fn terminalize_replay_batch(
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
+    batch: &FlushBatch,
+    disposition: &'static str,
+) {
+    let event_ids: Vec<String> = batch
+        .events
+        .iter()
+        .chain(batch.cancelled_events.iter())
+        .map(|event| event.event.id.to_hex())
+        .collect();
+    if event_ids.is_empty() {
+        return;
+    }
+    if let Err(error) = replay_state
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .terminalize(batch.channel_id, &event_ids)
+    {
+        tracing::error!(
+            channel_id = %batch.channel_id,
+            events = event_ids.len(),
+            disposition,
+            "failed to persist terminal batch disposition: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_nack_terminal_tests {
+    use super::*;
+    use nostr::{EventBuilder, Kind, Tag};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn oversized_nack_publish_failure_stays_terminal_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "buzz-acp-over-bound-nack-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("replay.json");
+        let channel_id = Uuid::new_v4();
+        let channel = channel_id.to_string();
+        let source = EventBuilder::new(Kind::Custom(9), "oversized source")
+            .tags([Tag::parse(["h", channel.as_str()]).unwrap()])
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let event_id = source.id.to_hex();
+
+        // The local server proves both deterministic-NACK readback and submit
+        // fail. Durability must not depend on either network operation.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8_192];
+                let _ = socket.read(&mut request).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: nostr::Keys::generate(),
+            auth_tag_json: None,
+        };
+        let replay_state = Arc::new(std::sync::Mutex::new(
+            ReplayState::load(state_path.clone()).unwrap(),
+        ));
+
+        spawn_routing_nack(
+            &replay_state,
+            &rest,
+            channel_id,
+            &source,
+            pool::RoutingNackCode::InboundEventTooLarge,
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(replay_state
+            .lock()
+            .unwrap()
+            .is_handled(channel_id, &event_id));
+        drop(replay_state);
+
+        let mut restarted = ReplayState::load(state_path).unwrap();
+        assert!(restarted.is_handled(channel_id, &event_id));
+        assert!(!restarted
+            .record_open(
+                channel_id,
+                event_id,
+                source.created_at.as_secs(),
+                source.created_at.as_secs(),
+                true,
+            )
+            .unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn handle_prompt_result(
+fn handle_prompt_result_with_replay(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -3887,6 +4961,7 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
@@ -3930,9 +5005,11 @@ fn handle_prompt_result(
     // every retry starts at attempt 1 — defeating exponential backoff and
     // dead-letter protection.
     if let Some(batch) = result.batch.take() {
+        if matches!(config.dedup_mode, DedupMode::Drop) {
+            terminalize_replay_batch(replay_state, &batch, "dedup drop");
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
-        if !removed_channels.contains(&batch.channel_id) {
+        } else if !removed_channels.contains(&batch.channel_id) {
             if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
@@ -3970,6 +5047,7 @@ fn handle_prompt_result(
                     config.max_turn_duration_secs
                 );
                 spawn_failure_notice(rest_client, &batch, content);
+                terminalize_replay_batch(replay_state, &batch, "hard-timeout dead letter");
                 hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
             } else if matches!(
                 result.outcome,
@@ -3988,6 +5066,7 @@ fn handle_prompt_result(
                         config.max_turn_duration_secs
                     );
                     spawn_failure_notice(rest_client, &dead, content);
+                    terminalize_replay_batch(replay_state, &dead, "retry-budget dead letter");
                     hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
@@ -4007,6 +5086,7 @@ fn handle_prompt_result(
                     and then re-send."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
+                terminalize_replay_batch(replay_state, &batch, "authentication dead letter");
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -4014,6 +5094,9 @@ fn handle_prompt_result(
                         "the turn exceeded the maximum duration".to_string()
                     }
                     PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                    PromptOutcome::Incomplete { .. } => {
+                        "the required origin reply was not published".to_string()
+                    }
                     PromptOutcome::Error(e) => format!("{e}"),
                     PromptOutcome::ProjectContextIndeterminate(reason) => reason.clone(),
                     _ => "repeated failures".to_string(),
@@ -4022,6 +5105,7 @@ fn handle_prompt_result(
                     "⚠️ I couldn't process the last request after multiple retries ({reason}). Please re-send if it's still needed."
                 );
                 spawn_failure_notice(rest_client, &dead, content);
+                terminalize_replay_batch(replay_state, &dead, "retry-budget dead letter");
             }
         } else {
             tracing::debug!(
@@ -4030,6 +5114,7 @@ fn handle_prompt_result(
                 "dropping failed batch for removed channel"
             );
             hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
+            terminalize_replay_batch(replay_state, &batch, "removed-channel drop");
         }
     }
 
@@ -4047,6 +5132,7 @@ fn handle_prompt_result(
 
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
+        PromptOutcome::Incomplete { .. } => "incomplete",
         PromptOutcome::Error(_) => "error",
         PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
@@ -4101,6 +5187,19 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
+            pool.return_agent(result.agent);
+        }
+        PromptOutcome::Incomplete {
+            missing_reply_event_ids,
+            ..
+        } => {
+            tracing::warn!(
+                agent = agent_index,
+                outcome = outcome_label,
+                missing = ?missing_reply_event_ids,
+                "agent_returned — required origin reply missing"
+            );
+            emit_turn_error("required origin reply was not published", None);
             pool.return_agent(result.agent);
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
@@ -4275,8 +5374,40 @@ fn handle_prompt_result(
     LoopAction::Continue
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn recover_panicked_agent(
+fn handle_prompt_result(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    result: PromptResult,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+) -> LoopAction {
+    let replay_state = Arc::new(std::sync::Mutex::new(ReplayState::in_memory()));
+    handle_prompt_result_with_replay(
+        pool,
+        queue,
+        config,
+        result,
+        heartbeat_in_flight,
+        removed_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        rest_client,
+        &replay_state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_panicked_agent_with_replay(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -4288,6 +5419,7 @@ fn recover_panicked_agent(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
 ) {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
@@ -4299,15 +5431,19 @@ fn recover_panicked_agent(
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
-            if !removed_channels.contains(&ch) {
+            if matches!(config.dedup_mode, DedupMode::Queue) && !removed_channels.contains(&ch) {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
-                tracing::warn!("requeued batch for panicked agent {i}");
+                if let Some(dead) = queue.requeue(batch) {
+                    terminalize_replay_batch(replay_state, &dead, "panic retry-budget dead letter");
+                } else {
+                    tracing::warn!("requeued batch for panicked agent {i}");
+                }
             } else {
+                terminalize_replay_batch(replay_state, &batch, "panic terminal drop");
                 tracing::debug!(
                     channel_id = %ch,
-                    "dropping panicked batch for removed channel"
+                    "terminally dropping panicked batch"
                 );
             }
         }
@@ -4362,16 +5498,58 @@ fn recover_panicked_agent(
     slot.respawn_in_flight = true;
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = config.agent_spawn_env();
     let has_codex = config.has_generated_codex_config;
+    let publisher_credentials = config.agent_publisher_credentials;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            publisher_credentials,
+            i,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn recover_panicked_agent(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    join_error: tokio::task::JoinError,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) {
+    let replay_state = Arc::new(std::sync::Mutex::new(ReplayState::in_memory()));
+    recover_panicked_agent_with_replay(
+        pool,
+        queue,
+        config,
+        join_error,
+        heartbeat_in_flight,
+        removed_channels,
+        typing_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        observer,
+        &replay_state,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4386,11 +5564,12 @@ fn drain_ready_join_results(
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
+    replay_state: &Arc<std::sync::Mutex<ReplayState>>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            recover_panicked_agent_with_replay(
                 pool,
                 queue,
                 config,
@@ -4402,6 +5581,7 @@ fn drain_ready_join_results(
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
+                replay_state,
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                 return LoopAction::Exit;
@@ -4465,9 +5645,14 @@ fn dispatch_heartbeat(
 
 #[cfg(test)]
 mod agent_draft_prompt_tests {
+    use super::{
+        base_prompt_startup_readback_for, AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+        DEFAULT_BASE_PROMPT,
+    };
+
     #[test]
     fn shared_base_prompt_teaches_portable_agent_drafts() {
-        let prompt = include_str!("base_prompt.md");
+        let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains("buzz agents draft-create"));
         assert!(prompt.contains("ask for at most two things"));
         assert!(prompt.contains("what it should do day-to-day"));
@@ -4485,7 +5670,7 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
-        let prompt = include_str!("base_prompt.md");
+        let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains("pass real newline bytes through stdin"));
         assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
         assert!(prompt.contains("buzz messages send ... --content -"));
@@ -4514,10 +5699,11 @@ mod agent_draft_prompt_tests {
 
     #[test]
     fn shared_base_prompt_teaches_single_command_mentions_and_preflight() {
-        let prompt = include_str!("base_prompt.md");
-        assert!(prompt.contains("use the person's **exact display name as shown in Buzz**"));
-        assert!(prompt.contains("Do not expand a short display name, infer a surname"));
-        assert!(prompt.contains("Preserve it exactly; do not infer, expand, or look up a surname"));
+        let prompt = DEFAULT_BASE_PROMPT;
+        assert!(prompt.contains("another permitted recipient"));
+        assert!(prompt.contains("exact `@Display Name` mention is mandatory"));
+        assert!(prompt.contains("one actionable recipient per assignment"));
+        assert!(prompt.contains("Publication proves addressing, not intake"));
         assert!(prompt.contains("--mention <hex-or-npub>"));
         assert!(prompt.contains("every presentation-only name that should notify"));
         assert!(
@@ -4532,12 +5718,29 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_disposes_actionable_mentions_without_acknowledgement_loops() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        for disposition in [
+            "`accepted`",
+            "`completed`",
+            "`blocked`",
+            "`no_action_required`",
+        ] {
+            assert!(
+                prompt.contains(disposition),
+                "missing disposition: {disposition}"
+            );
+        }
+        assert!(prompt.contains("never use it as a bare acknowledgement"));
+        assert!(prompt.contains("never answer an acknowledgement with another acknowledgement"));
+    }
+
+    #[test]
     fn shared_base_prompt_requires_disposition_for_actionable_direct_mentions() {
-        let prompt = include_str!("base_prompt.md");
+        let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains(
             "A direct signed mention with an assignment or operational directive requires one compact disposition reply"
         ));
-        assert!(prompt.contains("`accepted`, `completed`, `blocked`, or `no_action_required`"));
         assert!(prompt.contains("This is operational status, not a bare acknowledgement"));
         assert!(prompt
             .contains("Mention the sender back only for `completed` or `blocked` delegated work"));
@@ -4547,7 +5750,117 @@ mod agent_draft_prompt_tests {
         assert!(
             prompt.contains("If the sender explicitly says no reply is required, remain silent")
         );
-        assert!(prompt.contains("Never publish a bare acknowledgement"));
+    }
+
+    #[test]
+    fn shared_base_prompt_yields_publication_to_runtime_capability() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        assert!(prompt.contains("runtime withholds `BUZZ_PRIVATE_KEY`"));
+        assert!(prompt.contains("caller-bound trusted reply tool"));
+        assert!(prompt.contains("supersedes the generic `buzz messages send` guidance"));
+        assert!(prompt
+            .contains("Never discover, request, reconstruct, or expose raw signer credentials"));
+    }
+
+    #[test]
+    fn shared_base_prompt_carries_aeon_collaboration_contract() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        for required in [
+            AEON_BUZZ_COLLABORATION_CONTRACT_REVISION,
+            "verified event metadata",
+            "canonical job path",
+            "what changed, why it matters, who needs it, and what should happen next",
+            "accepted Buzz event ID is terminal publication proof",
+            "they do not grant credentials or effect authority",
+        ] {
+            assert!(
+                prompt.contains(required),
+                "missing collaboration rule: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_readback_proves_contract_for_every_frontier_cli_identity() {
+        for (command, expected_identity) in [
+            ("/opt/aeon/bin/codex-acp", "codex-acp"),
+            ("claude-agent-acp", "claude-agent-acp"),
+            ("/Users/architect/.local/bin/cursor-agent", "cursor-agent"),
+            ("/Users/architect/.grok/bin/grok", "grok"),
+        ] {
+            let readback =
+                base_prompt_startup_readback_for(command, false, None, false, false, None);
+            assert_eq!(readback.agent_identity, expected_identity);
+            assert_eq!(readback.base_prompt_source, "compiled");
+            assert_eq!(
+                readback.collaboration_contract_revision,
+                AEON_BUZZ_COLLABORATION_CONTRACT_REVISION
+            );
+            assert!(readback.collaboration_contract_present);
+            assert_eq!(readback.session_scope, "per-channel-acp");
+            assert_eq!(readback.fixed_session_key, None);
+            assert_eq!(
+                readback.canonical_channel_source,
+                "per-turn-observer-context"
+            );
+            assert!(!readback.trusted_inbound_envelope);
+            assert!(!readback.turn_receipts);
+            assert_eq!(readback.expected_gateway_session_key, None);
+            assert_eq!(
+                readback.base_prompt_sha256.as_deref().map(str::len),
+                Some(64)
+            );
+        }
+    }
+
+    #[test]
+    fn startup_readback_does_not_claim_contract_for_custom_or_disabled_prompt() {
+        let custom = base_prompt_startup_readback_for(
+            "codex-acp",
+            false,
+            Some(AEON_BUZZ_COLLABORATION_CONTRACT_REVISION),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(custom.base_prompt_source, "custom");
+        assert!(!custom.collaboration_contract_present);
+        assert_eq!(custom.base_prompt_sha256.as_deref().map(str::len), Some(64));
+
+        let disabled =
+            base_prompt_startup_readback_for("codex-acp", true, None, false, false, None);
+        assert_eq!(disabled.base_prompt_source, "disabled");
+        assert!(!disabled.collaboration_contract_present);
+        assert_eq!(disabled.base_prompt_sha256, None);
+    }
+
+    #[test]
+    fn startup_readback_proves_the_fixed_gateway_contract_when_enabled() {
+        let readback = base_prompt_startup_readback_for(
+            "openclaw",
+            false,
+            None,
+            true,
+            true,
+            Some("agent:fontis-buzz:buzz-private"),
+        );
+        assert_eq!(readback.session_scope, "fixed-gateway");
+        assert_eq!(readback.base_prompt_source, "compiled");
+        assert!(readback.collaboration_contract_present);
+        assert_eq!(
+            readback.fixed_session_key.as_deref(),
+            Some("agent:fontis-buzz:buzz-private")
+        );
+        assert_eq!(
+            readback.canonical_channel_source,
+            "gateway-session-contract"
+        );
+        assert!(readback.trusted_inbound_envelope);
+        assert!(readback.turn_receipts);
+        assert_eq!(
+            readback.expected_gateway_session_key,
+            readback.fixed_session_key
+        );
     }
 }
 
@@ -4608,8 +5921,9 @@ fn spawn_respawn_task(
     // Spawn the actual work (shutdown + sleep + spawn + init) off the main loop.
     let cmd = config.agent_command.clone();
     let args = config.agent_args.clone();
-    let env = config.persona_env_vars.clone();
+    let env = config.agent_spawn_env();
     let has_codex = config.has_generated_codex_config;
+    let publisher_credentials = config.agent_publisher_credentials;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -4621,7 +5935,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            publisher_credentials,
+            index,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -4665,6 +5988,7 @@ struct PoolStartup {
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
+    forward_publisher_credentials: bool,
     model: Option<String>,
     effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
@@ -4676,8 +6000,9 @@ impl PoolStartup {
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
-            extra_env: config.persona_env_vars.clone(),
+            extra_env: config.agent_spawn_env(),
             has_generated_codex_config: config.has_generated_codex_config,
+            forward_publisher_credentials: config.agent_publisher_credentials,
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
@@ -4690,7 +6015,7 @@ async fn initialize_agent_pool(
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
     // One agent failing to start must not kill the whole pool.
-    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
+    // Attempt each spawn under the bounded cold-start timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
         let spawn_result = AcpClient::spawn(
@@ -4698,12 +6023,13 @@ async fn initialize_agent_pool(
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
+            startup.forward_publisher_credentials,
         )
         .await;
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
-                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize = acp.initialize_with_timeout(AGENT_INITIALIZE_TIMEOUT);
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
                         biased;
@@ -4717,7 +6043,7 @@ async fn initialize_agent_pool(
                     None => initialize.await,
                 };
                 match initialize_result {
-                    Ok(Ok(init_result)) => {
+                    Ok(init_result) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
                         let protocol_version =
                             init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
@@ -4755,13 +6081,8 @@ async fn initialize_agent_pool(
                             protocol_version,
                         }));
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
-                        acp.shutdown().await;
-                        agent_slots.push(None);
-                    }
-                    Err(_) => {
-                        tracing::error!(agent = i, "agent timed out during init (60s)");
                         acp.shutdown().await;
                         agent_slots.push(None);
                     }
@@ -4801,15 +6122,22 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    forward_publisher_credentials: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    let mut acp = AcpClient::spawn(
+        command,
+        args,
+        extra_env,
+        has_generated_codex_config,
+        forward_publisher_credentials,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
-    match acp.initialize().await {
+    match acp.initialize_with_timeout(AGENT_INITIALIZE_TIMEOUT).await {
         Ok(init_result) => {
             tracing::info!("agent initialized: {init_result}");
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
@@ -4835,7 +6163,7 @@ async fn spawn_and_init(
 
 async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
     let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
-    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
+    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false, false).await
 }
 
 fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -4962,7 +6290,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
     let mut client =
-        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
+        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false, false).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("error: failed to spawn agent: {e}");
@@ -5270,6 +6598,30 @@ mod owner_control_command_tests {
         );
     }
 
+    #[test]
+    fn native_steer_never_bypasses_a_contracted_turn() {
+        assert!(native_steer_is_eligible(
+            false,
+            false,
+            &ControlSignal::Steer
+        ));
+        assert!(!native_steer_is_eligible(
+            true,
+            false,
+            &ControlSignal::Steer
+        ));
+        assert!(!native_steer_is_eligible(
+            false,
+            true,
+            &ControlSignal::Steer
+        ));
+        assert!(!native_steer_is_eligible(
+            false,
+            false,
+            &ControlSignal::Interrupt
+        ));
+    }
+
     #[tokio::test]
     async fn signal_in_flight_task_sends_rotate_once() {
         let mut pool = AgentPool::from_slots(vec![]);
@@ -5488,6 +6840,27 @@ mod author_gate_tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_strict_allowlist_accepts_owner_and_explicit_pubkey_but_rejects_sibling() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([EXTERNAL.to_string()]);
+        for (who, expected) in [(OWNER, true), (EXTERNAL, true), (SIBLING, false)] {
+            assert_eq!(
+                author_allowed(
+                    &RespondTo::StrictAllowlist,
+                    &allowlist,
+                    who,
+                    false,
+                    &cache,
+                    &dummy_rest_client()
+                )
+                .await,
+                expected,
+                "strict allowlist result for {who}"
+            );
+        }
+    }
+
     // The default `respond-to` is OwnerOnly. Under steering, "an ineligible
     // author must NOT steer" is enforced *here* — author_allowed drops the
     // event before it reaches the mode gate — not in the gate itself. These
@@ -5533,7 +6906,7 @@ mod author_gate_tests {
     // In a DM, clients auto-p-tag every participant, and an agent can be
     // asked to open a DM with a third party. The gate must therefore ignore
     // the allowlist and `anyone` mode inside DMs: only owner + verified
-    // siblings fire turns.
+    // siblings fire turns. Strict allowlists narrow that further to owner-only.
 
     #[tokio::test]
     async fn test_dm_rejects_allowlisted_external_pubkey() {
@@ -5567,6 +6940,34 @@ mod author_gate_tests {
             )
             .await,
             "respond_to=anyone must still drop non-owner authors inside a DM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dm_strict_allowlist_accepts_owner_but_rejects_sibling() {
+        let cache = cache_with_sibling();
+        let allowlist = HashSet::from([SIBLING.to_string()]);
+        assert!(
+            author_allowed(
+                &RespondTo::StrictAllowlist,
+                &allowlist,
+                OWNER,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await
+        );
+        assert!(
+            !author_allowed(
+                &RespondTo::StrictAllowlist,
+                &allowlist,
+                SIBLING,
+                true,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await
         );
     }
 
@@ -5629,6 +7030,10 @@ mod author_gate_tests {
                     name: "dm".into(),
                     channel_type: "dm".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             ),
             (
@@ -5637,6 +7042,10 @@ mod author_gate_tests {
                     name: "stream".into(),
                     channel_type: "stream".into(),
                     description: None,
+                    ttl_seconds: None,
+                    has_ttl_deadline: false,
+                    metadata_created_at: None,
+                    metadata_event_id: None,
                 },
             ),
         ]);
@@ -5654,6 +7063,10 @@ mod author_gate_tests {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
                 description: None,
+                ttl_seconds: None,
+                has_ttl_deadline: false,
+                metadata_created_at: None,
+                metadata_event_id: None,
             },
         )]);
         assert!(
@@ -5877,6 +7290,71 @@ mod observer_publish_queue_tests {
             Some(inner) => inner.iter().map(|e| e["seq"].as_u64().unwrap()).collect(),
             None => vec![frame.seq],
         }
+    }
+
+    #[test]
+    fn relay_observer_tool_frames_drop_arguments_and_results() {
+        let mut tool = event(1, "acp_read", Some("channel-1"));
+        tool.payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "title": "buzz_mechanon_reply",
+                    "status": "completed",
+                    "rawInput": {"credential": "must-not-leave-process"},
+                    "content": [{"text": "sensitive tool result"}],
+                }
+            }
+        });
+
+        let mut queue = queue_of(vec![tool]);
+        let projected = queue.next_frame().unwrap();
+        assert_eq!(
+            projected.payload,
+            serde_json::json!({
+                "params": {
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolName": "buzz_mechanon_reply",
+                        "status": "completed",
+                    }
+                }
+            })
+        );
+        let serialized = serde_json::to_string(&projected).unwrap();
+        assert!(!serialized.contains("must-not-leave-process"));
+        assert!(!serialized.contains("sensitive tool result"));
+    }
+
+    #[test]
+    fn relay_observer_tool_update_recovers_name_without_forwarding_call_id() {
+        let mut started = event(1, "acp_read", Some("channel-1"));
+        started.payload = serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "secret-correlation-id",
+                "title": "buzz_mechanon_reply",
+                "rawInput": {"body": "private"},
+            }}
+        });
+        let mut completed = event(2, "acp_read", Some("channel-1"));
+        completed.payload = serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "secret-correlation-id",
+                "status": "completed",
+                "content": [{"text": "private result"}],
+            }}
+        });
+
+        let mut queue = queue_of(vec![started, completed]);
+        let serialized = serde_json::to_string(&queue.next_frame().unwrap()).unwrap();
+        assert_eq!(serialized.matches("buzz_mechanon_reply").count(), 2);
+        assert!(!serialized.contains("secret-correlation-id"));
+        assert!(!serialized.contains("private result"));
+        assert!(!serialized.contains("private"));
     }
 
     /// Retained bytes computed by WALKING the entries, independently of the
@@ -6813,7 +8291,9 @@ mod build_mcp_servers_tests {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
+            session_cwd: std::path::PathBuf::from("."),
             agent_command: "goose".into(),
+            agent_publisher_credentials: false,
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -6848,6 +8328,9 @@ mod build_mcp_servers_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            turn_receipts: false,
+            expected_gateway_session_key: None,
+            trusted_inbound_envelope: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
@@ -7034,10 +8517,12 @@ mod error_outcome_emission_tests {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
+            session_cwd: std::path::PathBuf::from("."),
             // `true` exits cleanly, so the async respawn fails fast and
             // harmlessly off the JoinSet — irrelevant to the synchronous
             // feed emission under test.
             agent_command: "true".into(),
+            agent_publisher_credentials: false,
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -7072,6 +8557,9 @@ mod error_outcome_emission_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            turn_receipts: false,
+            expected_gateway_session_key: None,
+            trusted_inbound_envelope: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
@@ -7103,7 +8591,7 @@ mod error_outcome_emission_tests {
     async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
-            acp: AcpClient::spawn("cat", &[], &[], false)
+            acp: AcpClient::spawn("cat", &[], &[], false, false)
                 .await
                 .expect("spawn cat as inert agent"),
             state: Default::default(),
@@ -7952,12 +9440,26 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
+        let replay_state = Arc::new(std::sync::Mutex::new(ReplayState::in_memory()));
+        let source_event = EventBuilder::new(Kind::Custom(9), "final-attempt")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let source_event_id = source_event.id.to_hex();
+        replay_state
+            .lock()
+            .unwrap()
+            .record_open(
+                channel_id,
+                source_event_id.clone(),
+                source_event.created_at.as_secs(),
+                source_event.created_at.as_secs(),
+                false,
+            )
+            .unwrap();
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
-                event: EventBuilder::new(Kind::Custom(9), "final-attempt")
-                    .sign_with_keys(&Keys::generate())
-                    .unwrap(),
+                event: source_event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
             }],
@@ -7973,7 +9475,7 @@ mod error_outcome_emission_tests {
             }),
             batch: Some(batch),
         };
-        handle_prompt_result(
+        handle_prompt_result_with_replay(
             &mut pool,
             &mut queue,
             &config,
@@ -7985,6 +9487,7 @@ mod error_outcome_emission_tests {
             &mut respawn_tasks,
             Some(observer.clone()),
             None,
+            &replay_state,
         );
 
         let events = observer.snapshot();
@@ -8003,6 +9506,13 @@ mod error_outcome_emission_tests {
             queue.queued_event_count(&channel_id),
             0,
             "batch with an exhausted retry budget must be dead-lettered, not requeued"
+        );
+        assert!(
+            replay_state
+                .lock()
+                .unwrap()
+                .is_handled(channel_id, &source_event_id),
+            "dead-lettered accepted work must not resurrect after restart"
         );
     }
 

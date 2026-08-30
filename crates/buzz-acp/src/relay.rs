@@ -136,8 +136,51 @@ use crate::config::ChannelFilter;
 pub struct ChannelInfo {
     pub name: String,
     pub channel_type: String,
-    /// Channel description from the kind-39000 `about` tag, if present.
+    /// Channel description from the canonical kind-39000 `about` tag.
     pub description: Option<String>,
+    /// Positive channel TTL in seconds, when declared by kind-39000 metadata.
+    pub ttl_seconds: Option<u64>,
+    /// Whether canonical metadata included a well-formed TTL deadline. Its
+    /// value is not retained because durable activity refreshes the database
+    /// deadline without replacing kind-39000 metadata.
+    pub has_ttl_deadline: bool,
+    /// Created-at timestamp of the canonical addressable metadata event.
+    pub metadata_created_at: Option<u64>,
+    /// Event ID of the canonical addressable metadata event.
+    pub metadata_event_id: Option<String>,
+}
+
+impl ChannelInfo {
+    /// Structural TTL eligibility from canonical metadata. The absolute
+    /// metadata deadline is intentionally excluded: Buzz refreshes the
+    /// authoritative database deadline on durable activity without emitting
+    /// a replacement kind-39000 event.
+    pub fn ephemeral_ttl_seconds(&self) -> Option<u64> {
+        if self.channel_type != "private" || !self.has_ttl_deadline {
+            return None;
+        }
+        self.ttl_seconds.filter(|ttl| *ttl > 0)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MetadataCandidate {
+    created_at: u64,
+    event_id: String,
+    name: String,
+    channel_type: String,
+    description: Option<String>,
+    archived: bool,
+    ttl_seconds: Option<u64>,
+    ttl_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    malformed: bool,
+}
+
+impl MetadataCandidate {
+    fn is_newer_than(&self, other: &Self) -> bool {
+        self.created_at > other.created_at
+            || (self.created_at == other.created_at && self.event_id < other.event_id)
+    }
 }
 
 pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
@@ -177,44 +220,129 @@ pub(crate) fn merge_discovered_channels(
     channel_uuids: Vec<Uuid>,
     meta_events: &serde_json::Value,
 ) -> HashMap<Uuid, ChannelInfo> {
-    let mut meta_map: HashMap<Uuid, (String, String, Option<String>)> = HashMap::new();
-    let mut archived: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut meta_map: HashMap<Uuid, MetadataCandidate> = HashMap::new();
+    let mut unorderable_channels = HashSet::new();
     if let Some(arr) = meta_events.as_array() {
         for ev in arr {
             let tags = match ev.get("tags").and_then(|t| t.as_array()) {
                 Some(t) => t,
                 None => continue,
             };
-            let mut d_val = None;
             let mut name = None;
-            let mut is_archived = false;
             let mut description = None;
+            let mut is_archived = false;
+            let mut ttl_seconds = None;
+            let mut ttl_deadline = None;
+            let mut seen_singletons = HashSet::new();
+            let mut referenced_channels = HashSet::new();
+            let mut malformed = false;
             for tag in tags {
-                if let Some(arr) = tag.as_array() {
-                    match arr.first().and_then(|v| v.as_str()) {
-                        Some("d") => d_val = arr.get(1).and_then(|v| v.as_str()),
-                        Some("name") => name = arr.get(1).and_then(|v| v.as_str()),
-                        Some("about") => description = arr.get(1).and_then(|v| v.as_str()),
-                        Some("archived") => {
-                            is_archived = arr.get(1).and_then(|v| v.as_str()) == Some("true")
+                let Some(arr) = tag.as_array() else {
+                    continue;
+                };
+                let Some(kind) = arr.first().and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if matches!(
+                    kind,
+                    "d" | "name"
+                        | "about"
+                        | "hidden"
+                        | "private"
+                        | "archived"
+                        | "ttl"
+                        | "ttl_deadline"
+                ) && !seen_singletons.insert(kind)
+                {
+                    malformed = true;
+                }
+                match kind {
+                    "d" => {
+                        let value = arr.get(1).and_then(|v| v.as_str());
+                        malformed |= arr.len() != 2 || value.is_none_or(str::is_empty);
+                        if let Some(value) = value {
+                            if let Ok(uuid) = value.parse::<Uuid>() {
+                                referenced_channels.insert(uuid);
+                            } else {
+                                malformed = true;
+                            }
                         }
-                        _ => {}
                     }
+                    "name" => {
+                        name = arr.get(1).and_then(|v| v.as_str());
+                        malformed |= arr.len() != 2 || name.is_none();
+                    }
+                    "about" => {
+                        description = arr.get(1).and_then(|v| v.as_str());
+                        malformed |= arr.len() != 2 || description.is_none();
+                    }
+                    "hidden" | "private" => {
+                        malformed |=
+                            arr.len() > 2 || arr.get(1).is_some_and(|v| v.as_str() != Some(""));
+                    }
+                    "archived" => {
+                        let value = arr.get(1).and_then(|v| v.as_str());
+                        malformed |= arr.len() != 2 || !matches!(value, Some("true" | "false"));
+                        is_archived = value == Some("true");
+                    }
+                    "ttl" => {
+                        ttl_seconds = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .filter(|ttl| *ttl > 0);
+                        malformed |= arr.len() != 2 || ttl_seconds.is_none();
+                    }
+                    "ttl_deadline" => {
+                        ttl_deadline = arr
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                            .map(|deadline| deadline.with_timezone(&chrono::Utc));
+                        malformed |= arr.len() != 2 || ttl_deadline.is_none();
+                    }
+                    _ => {}
                 }
             }
-            if let Some(d) = d_val {
-                if let Ok(uuid) = d.parse::<Uuid>() {
-                    if is_archived {
-                        archived.insert(uuid);
-                        continue;
-                    }
-                    let ch_name = name.unwrap_or("unknown").to_string();
-                    let ch_type = channel_type_from_tags(tags);
-                    let ch_desc = description
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
-                    meta_map.insert(uuid, (ch_name, ch_type, ch_desc));
+            if referenced_channels.is_empty() {
+                continue;
+            }
+            let Some(created_at) = ev.get("created_at").and_then(|value| value.as_u64()) else {
+                for uuid in referenced_channels {
+                    warn!(channel_id = %uuid, "channel metadata missing created_at — failing channel metadata closed");
+                    unorderable_channels.insert(uuid);
+                }
+                continue;
+            };
+            let Some(event_id) = ev.get("id").and_then(|value| value.as_str()).filter(|id| {
+                id.len() == 64 && id.chars().all(|character| character.is_ascii_hexdigit())
+            }) else {
+                for uuid in referenced_channels {
+                    warn!(channel_id = %uuid, "channel metadata missing valid event id — failing channel metadata closed");
+                    unorderable_channels.insert(uuid);
+                }
+                continue;
+            };
+            let candidate = MetadataCandidate {
+                created_at,
+                event_id: event_id.to_ascii_lowercase(),
+                name: name.unwrap_or("unknown").to_string(),
+                channel_type: channel_type_from_tags(tags),
+                description: description
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                archived: is_archived,
+                ttl_seconds,
+                ttl_deadline,
+                malformed,
+            };
+            for uuid in referenced_channels {
+                let replace = meta_map
+                    .get(&uuid)
+                    .is_none_or(|current| candidate.is_newer_than(current));
+                if replace {
+                    meta_map.insert(uuid, candidate.clone());
                 }
             }
         }
@@ -222,20 +350,43 @@ pub(crate) fn merge_discovered_channels(
 
     let mut map = HashMap::with_capacity(channel_uuids.len());
     for uuid in channel_uuids {
-        if archived.contains(&uuid) {
+        if unorderable_channels.contains(&uuid) {
             continue;
         }
-        let (name, channel_type, description) = meta_map
-            .remove(&uuid)
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string(), None));
-        map.insert(
-            uuid,
-            ChannelInfo {
-                name,
-                channel_type,
-                description,
-            },
-        );
+        match meta_map.remove(&uuid) {
+            Some(candidate) if candidate.malformed => {
+                warn!(channel_id = %uuid, "canonical channel metadata has ambiguous or malformed singleton tags — failing channel metadata closed");
+            }
+            Some(candidate) if candidate.archived => {}
+            Some(candidate) => {
+                map.insert(
+                    uuid,
+                    ChannelInfo {
+                        name: candidate.name,
+                        channel_type: candidate.channel_type,
+                        description: candidate.description,
+                        ttl_seconds: candidate.ttl_seconds,
+                        has_ttl_deadline: candidate.ttl_deadline.is_some(),
+                        metadata_created_at: Some(candidate.created_at),
+                        metadata_event_id: Some(candidate.event_id),
+                    },
+                );
+            }
+            None => {
+                map.insert(
+                    uuid,
+                    ChannelInfo {
+                        name: "unknown".to_string(),
+                        channel_type: "unknown".to_string(),
+                        description: None,
+                        ttl_seconds: None,
+                        has_ttl_deadline: false,
+                        metadata_created_at: None,
+                        metadata_event_id: None,
+                    },
+                );
+            }
+        }
     }
     map
 }
@@ -256,6 +407,13 @@ pub struct RestClient {
     pub auth_tag_json: Option<String>,
 }
 
+/// Durable reply evidence read back from the relay event log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredReply {
+    pub event_id: String,
+    pub reply_to: String,
+}
+
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
 fn is_retriable_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
@@ -268,6 +426,9 @@ const REST_RETRY_BASE_DELAYS: [Duration; 3] = [
     Duration::from_millis(1000),
     Duration::from_millis(2000),
 ];
+/// Authorization metadata checks run on the main dispatch loop, so they use
+/// one short attempt rather than the general four-attempt REST retry policy.
+const AUTHORIZATION_METADATA_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -277,6 +438,127 @@ fn unix_now_secs() -> u64 {
 }
 
 impl RestClient {
+    fn resolve_same_relay_media_url(&self, media_url: &str) -> Result<url::Url, RelayError> {
+        let relay = url::Url::parse(&self.base_url)
+            .map_err(|error| RelayError::Http(format!("invalid relay URL: {error}")))?;
+        let resolved = if media_url.starts_with('/') {
+            relay
+                .join(media_url)
+                .map_err(|error| RelayError::Http(format!("invalid media URL: {error}")))?
+        } else {
+            url::Url::parse(media_url)
+                .map_err(|error| RelayError::Http(format!("invalid media URL: {error}")))?
+        };
+        let same_origin = resolved.scheme() == relay.scheme()
+            && resolved.host_str() == relay.host_str()
+            && resolved.port_or_known_default() == relay.port_or_known_default();
+        let safe_path = resolved
+            .path()
+            .strip_prefix("/media/")
+            .is_some_and(|value| !value.is_empty() && !value.contains('/'));
+        if !same_origin
+            || !resolved.username().is_empty()
+            || resolved.password().is_some()
+            || resolved.query().is_some()
+            || resolved.fragment().is_some()
+            || !safe_path
+        {
+            return Err(RelayError::Http(
+                "refusing media GET outside the configured relay origin".into(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn blossom_get_header(&self, media_url: &url::Url) -> Result<String, RelayError> {
+        use base64::Engine;
+
+        let expiration = (nostr::Timestamp::now().as_secs() + 600).to_string();
+        let server = buzz_core::tenant::relay_url_authority(media_url.as_str());
+        if server.is_empty() {
+            return Err(RelayError::Http("media URL has no relay authority".into()));
+        }
+        let tags = [
+            Tag::parse(["t", "get"])
+                .map_err(|error| RelayError::Http(format!("Blossom tag error: {error}")))?,
+            Tag::parse(["expiration", expiration.as_str()])
+                .map_err(|error| RelayError::Http(format!("Blossom tag error: {error}")))?,
+            Tag::parse(["server", server.as_str()])
+                .map_err(|error| RelayError::Http(format!("Blossom tag error: {error}")))?,
+        ];
+        let event = EventBuilder::new(Kind::Custom(24242), "Get media")
+            .tags(tags)
+            .sign_with_keys(&self.keys)
+            .map_err(|error| RelayError::Http(format!("Blossom signing failed: {error}")))?;
+        let event_json = serde_json::to_string(&event)
+            .map_err(|error| RelayError::Http(format!("Blossom serialize failed: {error}")))?;
+        Ok(format!(
+            "Nostr {}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event_json.as_bytes())
+        ))
+    }
+
+    /// Fetch one same-relay Blossom blob with the harness signer and a bounded body.
+    pub(crate) async fn fetch_blossom_image(
+        &self,
+        media_url: &str,
+        expected_mime: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, RelayError> {
+        let url = self.resolve_same_relay_media_url(media_url)?;
+        let auth = self.blossom_get_header(&url)?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| RelayError::Http(format!("media client init failed: {error}")))?;
+        let mut request = client.get(url.clone()).header("Authorization", auth);
+        if let Some(auth_tag) = &self.auth_tag_json {
+            request = request.header("x-auth-tag", auth_tag);
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| RelayError::Http(format!("media GET failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(RelayError::Http(format!(
+                "media GET returned HTTP {}",
+                response.status()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err(RelayError::Http("media body exceeds declared size".into()));
+        }
+        let response_mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim);
+        if response_mime != Some(expected_mime) {
+            return Err(RelayError::Http(
+                "media response MIME does not match imeta".into(),
+            ));
+        }
+
+        let capacity = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let mut bytes = Vec::with_capacity(capacity.min(64 * 1024));
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| RelayError::Http(format!("media body read failed: {error}")))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > capacity {
+                return Err(RelayError::Http("media body exceeds declared size".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     /// Sign a NIP-98 HTTP Auth event (kind:27235) for the given method/URL/body.
     ///
     /// Returns the `Authorization: Nostr <base64>` header value (without the
@@ -410,6 +692,39 @@ impl RestClient {
         .await
     }
 
+    /// One bounded POST for authorization checks. A transient failure is
+    /// surfaced immediately so callers can deny dispatch without stalling
+    /// unrelated relay events behind the general REST retry budget.
+    async fn bridge_post_once(
+        &self,
+        path: &str,
+        body_bytes: &[u8],
+    ) -> Result<reqwest::Response, RelayError> {
+        let url = format!("{}{}", self.base_url, path);
+        let auth = self.nip98_header("POST", &url, Some(body_bytes))?;
+        let mut request = self
+            .http
+            .post(&url)
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .timeout(AUTHORIZATION_METADATA_TIMEOUT);
+        if let Some(tag) = &self.auth_tag_json {
+            request = request.header("x-auth-tag", tag);
+        }
+        let response = request
+            .body(body_bytes.to_vec())
+            .send()
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(RelayError::Http(format!(
+                "POST {path} returned HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(response)
+    }
+
     /// Query events via the HTTP bridge: `POST /query` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
@@ -437,9 +752,6 @@ impl RestClient {
     }
 
     /// Query every historical event matching one raw filter across bounded pages.
-    ///
-    /// Uses the bridge's composite `(until, before_id)` cursor so a full page
-    /// never becomes evidence that older project metadata is absent.
     pub async fn query_raw_all(&self, mut filter: Value) -> Result<Vec<Value>, RelayError> {
         const PAGE_SIZE: usize = 500;
         const EVENT_BOUND: usize = 10_000;
@@ -481,6 +793,19 @@ impl RestClient {
         }
     }
 
+    async fn query_authorization_metadata(
+        &self,
+        filters: &[nostr::Filter],
+    ) -> Result<Value, RelayError> {
+        let body_bytes = serde_json::to_vec(filters)
+            .map_err(|error| RelayError::Http(format!("filter serialize error: {error}")))?;
+        let response = self.bridge_post_once("/query", &body_bytes).await?;
+        response
+            .json()
+            .await
+            .map_err(|error| RelayError::Http(error.to_string()))
+    }
+
     /// Count events via the HTTP bridge: `POST /count` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
@@ -492,6 +817,26 @@ impl RestClient {
         resp.json()
             .await
             .map_err(|e| RelayError::Http(e.to_string()))
+    }
+
+    /// Query agent-authored kind-9 replies with an exact NIP-10 `reply` anchor.
+    pub async fn query_anchored_replies(
+        &self,
+        channel_id: Uuid,
+        author: nostr::PublicKey,
+        request_event_id: &str,
+    ) -> Result<Vec<AnchoredReply>, RelayError> {
+        use nostr::{Alphabet, SingleLetterTag};
+
+        let channel = channel_id.to_string();
+        let filter = nostr::Filter::new()
+            .kind(Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16))
+            .author(author)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()])
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::E), [request_event_id])
+            .limit(3);
+        let response = self.query(&[filter]).await?;
+        parse_anchored_replies(&response, channel_id, author, request_event_id)
     }
 
     /// Submit a signed event via the HTTP bridge: `POST /events` with NIP-98 auth.
@@ -512,6 +857,59 @@ impl RestClient {
     }
 }
 
+fn parse_anchored_replies(
+    response: &Value,
+    channel_id: Uuid,
+    author: nostr::PublicKey,
+    request_event_id: &str,
+) -> Result<Vec<AnchoredReply>, RelayError> {
+    let events = response
+        .as_array()
+        .ok_or_else(|| RelayError::Http("expected JSON array from /query (replies)".into()))?;
+    let expected_channel = channel_id.to_string();
+    let mut replies = Vec::new();
+    for value in events {
+        let Ok(event) = serde_json::from_value::<Event>(value.clone()) else {
+            continue;
+        };
+        if event.verify().is_err()
+            || event.kind.as_u16() as u32 != buzz_core::kind::KIND_STREAM_MESSAGE
+            || event.pubkey != author
+        {
+            continue;
+        }
+        let h_tags = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("h"))
+            .collect::<Vec<_>>();
+        let reply_tags = event
+            .tags
+            .iter()
+            .filter(|tag| {
+                let values = tag.as_slice();
+                values.first().map(String::as_str) == Some("e")
+                    && values.get(3).map(String::as_str) == Some("reply")
+            })
+            .collect::<Vec<_>>();
+        let exact_channel = h_tags.len() == 1
+            && h_tags[0].as_slice().get(1).map(String::as_str) == Some(expected_channel.as_str());
+        let exact_reply = reply_tags.len() == 1
+            && reply_tags[0].as_slice().len() == 4
+            && reply_tags[0].as_slice().get(1).map(String::as_str) == Some(request_event_id)
+            && reply_tags[0].as_slice().get(2).map(String::as_str) == Some("");
+        if exact_channel && exact_reply {
+            replies.push(AnchoredReply {
+                event_id: event.id.to_hex(),
+                reply_to: request_event_id.to_ascii_lowercase(),
+            });
+        }
+    }
+    replies.sort_by(|left, right| left.event_id.cmp(&right.event_id));
+    replies.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(replies)
+}
+
 /// Events the harness cares about.
 #[derive(Debug, Clone)]
 pub struct BuzzEvent {
@@ -519,6 +917,9 @@ pub struct BuzzEvent {
     pub channel_id: Uuid,
     /// The underlying Nostr event.
     pub event: Event,
+    /// Whether this channel event arrived before the subscription's EOSE.
+    /// This conservative catch-up phase is not proof of fresh activity.
+    pub is_subscription_catch_up: bool,
 }
 
 /// Errors from relay operations.
@@ -623,6 +1024,9 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 pub struct HarnessRelay {
     /// Receiver for events forwarded by the background task.
     event_rx: mpsc::Receiver<Option<BuzzEvent>>,
+    /// Events held for a bounded delay when a caller cannot yet authorize them.
+    /// Keeping them here avoids mutating relay dedup/replay state to retry locally.
+    deferred_events: VecDeque<(tokio::time::Instant, BuzzEvent)>,
     /// Receiver for encrypted observer control events addressed to this agent.
     observer_control_rx: Option<mpsc::Receiver<Event>>,
     /// Sender for commands to the background task.
@@ -723,6 +1127,7 @@ impl HarnessRelay {
 
         Ok(Self {
             event_rx,
+            deferred_events: VecDeque::new(),
             observer_control_rx: Some(observer_control_rx),
             cmd_tx,
             http: reqwest::Client::builder()
@@ -799,6 +1204,28 @@ impl HarnessRelay {
 
         debug!("discovered {} channel(s)", map.len());
         Ok(map)
+    }
+
+    /// Fetch canonical metadata for one newly invited channel. Missing,
+    /// malformed, archived, or unorderable metadata returns `None` so dynamic
+    /// admission fails closed.
+    pub async fn fetch_channel_info(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Option<ChannelInfo>, RelayError> {
+        use nostr::{Alphabet, SingleLetterTag};
+
+        let channel = channel_id.to_string();
+        let filter = nostr::Filter::new()
+            .kind(Kind::Custom(
+                buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16,
+            ))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::D), [channel.as_str()]);
+        let events = self
+            .rest_client()
+            .query_authorization_metadata(&[filter])
+            .await?;
+        Ok(merge_discovered_channels(vec![channel_id], &events).remove(&channel_id))
     }
 
     /// Build a [`RestClient`] that shares this relay's HTTP credentials.
@@ -898,8 +1325,37 @@ impl HarnessRelay {
     /// Reads from the background task's event channel. Returns `None` on
     /// connection loss — the caller should call [`reconnect`](Self::reconnect).
     pub async fn next_event(&mut self) -> Option<BuzzEvent> {
-        // The background task sends `None` to signal connection loss.
-        self.event_rx.recv().await.flatten()
+        let Some((ready_at, _)) = self.deferred_events.front() else {
+            // The background task sends `None` to signal connection loss.
+            return self.event_rx.recv().await.flatten();
+        };
+        tokio::select! {
+            event = self.event_rx.recv() => event.flatten(),
+            _ = tokio::time::sleep_until(*ready_at) => {
+                self.deferred_events.pop_front().map(|(_, event)| event)
+            }
+        }
+    }
+
+    /// Retry an already-delivered event locally after a transient authorization
+    /// dependency failure. The existing event-channel capacity is the bound.
+    pub(crate) fn defer_event(&mut self, event: BuzzEvent, delay: Duration) {
+        if self.deferred_events.len() >= event_channel_capacity() {
+            if let Some((_, dropped)) = self.deferred_events.pop_front() {
+                warn!(
+                    event_id = %dropped.event.id,
+                    channel_id = %dropped.channel_id,
+                    "deferred event queue full — dropping oldest authorization retry"
+                );
+            }
+        }
+        self.deferred_events
+            .push_back((tokio::time::Instant::now() + delay, event));
+    }
+
+    pub(crate) fn drop_deferred_events(&mut self, channel_id: Uuid) {
+        self.deferred_events
+            .retain(|(_, event)| event.channel_id != channel_id);
     }
 
     /// Publish a signed event to the relay via the background WebSocket task.
@@ -1071,6 +1527,13 @@ struct BgState {
     seen_ids: TwoGenDedup,
     /// Per-channel filter used on subscribe (for resubscribe after reconnect).
     active_filters: HashMap<Uuid, ChannelFilter>,
+    /// Channel REQs that have not reached EOSE/CLOSED. The relay may mix
+    /// catch-up and live fanout before EOSE, so this phase is conservatively
+    /// freshness-ineligible rather than exact replay provenance.
+    catch_up_subscriptions: HashSet<String>,
+    /// Monotonic generation used to make every channel REQ ID unique.
+    /// Delayed terminal frames from replaced REQs must not retire the current one.
+    next_subscription_generation: u64,
     /// Oldest timestamp of a membership notification that was dropped due to
     /// backpressure. If set, reconnect replay must start from this timestamp
     /// (minus skew) to re-deliver the lost event. Reset on successful reconnect.
@@ -1155,6 +1618,8 @@ impl BgState {
             last_seen: HashMap::new(),
             seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
             active_filters: HashMap::new(),
+            catch_up_subscriptions: HashSet::new(),
+            next_subscription_generation: 0,
             membership_dropped_since: None,
             membership_last_seen: None,
             membership_sub_active: false,
@@ -1185,14 +1650,46 @@ impl BgState {
             return false;
         }
 
-        // Update last_seen timestamp.
-        let ts = event.created_at.as_secs();
+        // A relay-admitted event can still carry a sender-controlled future
+        // timestamp. Clamp it to the local receive wall clock so reconnect's
+        // five-second skew never becomes `future - 5s` and skips legitimate
+        // events published in the meantime.
+        let ts =
+            crate::replay_state::safe_replay_timestamp(event.created_at.as_secs(), unix_now_secs());
         self.last_seen
             .entry(channel_id)
             .and_modify(|t| *t = (*t).max(ts))
             .or_insert(ts);
 
         true
+    }
+
+    fn next_channel_subscription_id(&mut self, channel_id: Uuid) -> String {
+        self.next_subscription_generation = self.next_subscription_generation.wrapping_add(1);
+        format!(
+            "{}-g{}",
+            channel_sub_id(channel_id),
+            self.next_subscription_generation
+        )
+    }
+
+    fn begin_subscription_catch_up(&mut self, subscription_id: &str) {
+        self.catch_up_subscriptions
+            .insert(subscription_id.to_string());
+    }
+
+    fn subscription_is_catch_up(&self, subscription_id: &str) -> bool {
+        self.catch_up_subscriptions.contains(subscription_id)
+    }
+
+    fn finish_subscription_catch_up(&mut self, subscription_id: &str) {
+        self.catch_up_subscriptions.remove(subscription_id);
+    }
+
+    fn subscription_is_current(&self, channel_id: Uuid, subscription_id: &str) -> bool {
+        self.active_subscriptions
+            .get(&channel_id)
+            .is_some_and(|current| current == subscription_id)
     }
 
     /// Compute the `since` timestamp for a channel (re)subscribe.
@@ -1224,6 +1721,8 @@ impl BgState {
         self.subscribe_since.remove(channel_id);
         self.channel_dropped_since.remove(channel_id);
         self.active_filters.remove(channel_id);
+        self.catch_up_subscriptions
+            .retain(|subscription_id| channel_id_from_sub_id(subscription_id) != Some(*channel_id));
         self.rate_limited_pending.remove(channel_id);
         self.resubscribe_retry.remove(channel_id);
     }
@@ -1478,9 +1977,6 @@ async fn execute_connected_command(
             let sent =
                 send_subscribe(ws, state, channel_id, agent_pubkey_hex, since, &filter).await;
             if sent {
-                state
-                    .active_subscriptions
-                    .insert(channel_id, channel_sub_id(channel_id));
                 state.active_filters.insert(channel_id, filter);
                 // Evict stale drain entries so the drain loop can't send a
                 // duplicate REQ for this now-live subscription.
@@ -1503,6 +1999,7 @@ async fn execute_connected_command(
         }
         RelayCommand::Unsubscribe { channel_id } => {
             if let Some(sub_id) = state.active_subscriptions.remove(&channel_id) {
+                state.finish_subscription_catch_up(&sub_id);
                 let msg = json!(["CLOSE", sub_id]);
                 if let Ok(text) = serde_json::to_string(&msg) {
                     // Best-effort CLOSE — don't fail the command if send fails,
@@ -2187,10 +2684,14 @@ async fn handle_ws_message(
                             );
                             return true;
                         }
-                        let ts = event.created_at.as_secs();
+                        let ts = crate::replay_state::safe_replay_timestamp(
+                            event.created_at.as_secs(),
+                            unix_now_secs(),
+                        );
                         let buzz_event = BuzzEvent {
                             channel_id: channel_uuid,
                             event: *event,
+                            is_subscription_catch_up: false,
                         };
                         let cap = event_tx.max_capacity();
                         let used = cap - event_tx.capacity();
@@ -2226,12 +2727,26 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
-                        let ts = event.created_at.as_secs();
+                        // Replaced REQs can still emit buffered history. The newest
+                        // generation covers the same replay floor, so dropping stale
+                        // frames prevents an old handler from affecting current state.
+                        if !state.subscription_is_current(channel_id, &subscription_id) {
+                            debug!(
+                                "dropping EVENT for stale channel subscription {subscription_id}"
+                            );
+                            return true;
+                        }
+                        let ts = crate::replay_state::safe_replay_timestamp(
+                            event.created_at.as_secs(),
+                            unix_now_secs(),
+                        );
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
                             let buzz_event = BuzzEvent {
                                 channel_id,
                                 event: *event,
+                                is_subscription_catch_up: state
+                                    .subscription_is_catch_up(&subscription_id),
                             };
                             // Warn at 80% capacity.
                             let cap = event_tx.max_capacity();
@@ -2277,6 +2792,7 @@ async fn handle_ws_message(
                     }
                 }
                 RelayMessage::Eose { subscription_id } => {
+                    state.finish_subscription_catch_up(&subscription_id);
                     debug!("EOSE for subscription {subscription_id}");
                 }
                 RelayMessage::Notice { message } => {
@@ -2300,6 +2816,15 @@ async fn handle_ws_message(
                     subscription_id,
                     message,
                 } => {
+                    state.finish_subscription_catch_up(&subscription_id);
+                    if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
+                        if !state.subscription_is_current(channel_id, &subscription_id) {
+                            debug!(
+                                "ignoring CLOSED for stale channel subscription {subscription_id}"
+                            );
+                            return true;
+                        }
+                    }
                     // A per-channel membership denial means THIS channel is
                     // forbidden, not the whole connection. Drop just this
                     // channel's subscription and keep the socket — otherwise the
@@ -2414,10 +2939,6 @@ async fn handle_ws_message(
                             )
                             .await;
                             if sent {
-                                // Success — update subscription ID (relay may assign new one).
-                                state
-                                    .active_subscriptions
-                                    .insert(channel_id, channel_sub_id(channel_id));
                                 state.channel_dropped_since.remove(&channel_id);
                             } else {
                                 // Resubscribe failed — likely half-dead socket.
@@ -2588,6 +3109,14 @@ async fn resubscribe_after_reconnect(
         // shared admission counter survives socket replacement.
         state.rate_limited_pending.clear();
         state.resubscribe_retry.clear();
+        // EOSE/CLOSED frames from the dead socket can never arrive. Rebuild
+        // catch-up accounting from the REQs sent on this fresh connection.
+        state.catch_up_subscriptions.clear();
+        // Generated IDs name REQs on the dead socket. Reset them to intent-only
+        // placeholders so replacement logic does not send pointless CLOSE frames.
+        for (channel_id, subscription_id) in &mut state.active_subscriptions {
+            *subscription_id = channel_sub_id(*channel_id);
+        }
     }
 
     let mut deferred_commands = VecDeque::new();
@@ -3248,13 +3777,32 @@ async fn wait_for_reconnect(
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
     ws: &mut WsStream,
-    _state: &BgState,
+    state: &mut BgState,
     channel_id: Uuid,
     agent_pubkey_hex: &str,
     since: Option<u64>,
     filter: &ChannelFilter,
 ) -> bool {
-    let sub_id = channel_sub_id(channel_id);
+    let base_sub_id = channel_sub_id(channel_id);
+    let previous_sub_id = state
+        .active_subscriptions
+        .get(&channel_id)
+        .filter(|subscription_id| *subscription_id != &base_sub_id)
+        .cloned();
+    if let Some(previous_sub_id) = previous_sub_id {
+        let close = json!(["CLOSE", &previous_sub_id]);
+        let Ok(text) = serde_json::to_string(&close) else {
+            return false;
+        };
+        if let Err(error) =
+            ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await
+        {
+            warn!("failed to replace prior channel REQ for {channel_id}: {error}");
+            return false;
+        }
+        state.finish_subscription_catch_up(&previous_sub_id);
+    }
+    let sub_id = state.next_channel_subscription_id(channel_id);
 
     let mut req_filter = serde_json::Map::new();
 
@@ -3288,6 +3836,8 @@ async fn send_subscribe(
         Ok(text) => {
             match ws_send_timeout(ws, Message::Text(text.into()), WS_SEND_TIMEOUT_SECS).await {
                 Ok(()) => {
+                    state.begin_subscription_catch_up(&sub_id);
+                    state.active_subscriptions.insert(channel_id, sub_id);
                     debug!(
                         "subscribed to channel {channel_id}{}",
                         if since.is_some() {
@@ -3568,12 +4118,22 @@ pub(crate) fn channel_sub_id(channel_id: Uuid) -> String {
     format!("ch-{channel_id}")
 }
 
-/// Extract a channel UUID from a subscription ID of the form `ch-<uuid>`.
-/// Returns `None` if the format doesn't match or the UUID is invalid.
+/// Extract a channel UUID from `ch-<uuid>` or `ch-<uuid>-g<generation>`.
+/// Returns `None` if the suffix is malformed or the UUID is invalid.
 fn channel_id_from_sub_id(sub_id: &str) -> Option<Uuid> {
-    sub_id
-        .strip_prefix("ch-")
-        .and_then(|s| s.parse::<Uuid>().ok())
+    let suffix = sub_id.strip_prefix("ch-")?;
+    let (uuid, generation) = match suffix.split_once("-g") {
+        Some((uuid, generation)) if !generation.is_empty() => {
+            generation.parse::<u64>().ok()?;
+            (uuid, Some(generation))
+        }
+        Some(_) => return None,
+        None => (suffix, None),
+    };
+    if generation.is_none() && uuid.len() != 36 {
+        return None;
+    }
+    uuid.parse::<Uuid>().ok()
 }
 
 /// Per-channel CLOSED denials: the channel is forbidden but the connection is
@@ -4084,6 +4644,31 @@ async fn wait_for_any_ok(
 mod tests {
     use super::*;
 
+    fn test_rest_client(base_url: &str) -> RestClient {
+        RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.to_owned(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn blossom_image_fetch_rejects_cross_origin_before_request() {
+        let client = test_rest_client("https://relay.example");
+        let error = client
+            .fetch_blossom_image(
+                "https://media.example/media/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+                "image/png",
+                10,
+            )
+            .await
+            .expect_err("cross-origin fetch must be rejected");
+        assert!(error
+            .to_string()
+            .contains("outside the configured relay origin"));
+    }
+
     #[test]
     fn relay_ws_to_http_plain() {
         assert_eq!(
@@ -4142,6 +4727,23 @@ mod tests {
     }
 
     #[test]
+    fn channel_id_from_generated_sub_id_roundtrip() {
+        let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            channel_id_from_sub_id(&format!("{}-g42", channel_sub_id(uuid))),
+            Some(uuid)
+        );
+    }
+
+    #[test]
+    fn channel_id_from_sub_id_rejects_malformed_generation() {
+        let base = "ch-550e8400-e29b-41d4-a716-446655440000";
+        assert!(channel_id_from_sub_id(&format!("{base}-g")).is_none());
+        assert!(channel_id_from_sub_id(&format!("{base}-gnope")).is_none());
+        assert!(channel_id_from_sub_id(&format!("{base}-g1-g2")).is_none());
+    }
+
+    #[test]
     fn channel_id_from_sub_id_invalid_prefix() {
         assert!(channel_id_from_sub_id("sub-550e8400-e29b-41d4-a716-446655440000").is_none());
     }
@@ -4157,6 +4759,16 @@ mod tests {
     }
 
     fn meta_event(uuid: Uuid, name: &str, extra: &[&str]) -> serde_json::Value {
+        meta_event_at(uuid, name, extra, 100, 'a')
+    }
+
+    fn meta_event_at(
+        uuid: Uuid,
+        name: &str,
+        extra: &[&str],
+        created_at: u64,
+        id_character: char,
+    ) -> serde_json::Value {
         let mut tags = vec![
             serde_json::json!(["d", uuid.to_string()]),
             serde_json::json!(["name", name]),
@@ -4169,7 +4781,11 @@ mod tests {
                 _ => {}
             }
         }
-        serde_json::json!({ "tags": tags })
+        serde_json::json!({
+            "id": id_character.to_string().repeat(64),
+            "created_at": created_at,
+            "tags": tags
+        })
     }
 
     #[test]
@@ -4223,6 +4839,107 @@ mod tests {
             map.is_empty(),
             "a still-member but archived channel is not re-subscribed"
         );
+    }
+
+    #[test]
+    fn canonical_private_future_ttl_is_ephemeral() {
+        let huddle = Uuid::new_v4();
+        let ordinary = Uuid::new_v4();
+        let meta = serde_json::json!([
+            meta_event(
+                huddle,
+                "huddle",
+                &[
+                    "private",
+                    "",
+                    "ttl",
+                    "3600",
+                    "ttl_deadline",
+                    "2999-01-01T00:00:00Z"
+                ]
+            ),
+            meta_event(ordinary, "ordinary", &["private", ""]),
+        ]);
+        let map = merge_discovered_channels(vec![huddle, ordinary], &meta);
+        assert_eq!(map[&huddle].ephemeral_ttl_seconds(), Some(3600));
+        assert_eq!(map[&huddle].ttl_seconds, Some(3600));
+        assert_eq!(map[&ordinary].ephemeral_ttl_seconds(), None);
+    }
+
+    #[test]
+    fn canonical_latest_metadata_controls_ephemeral_admission() {
+        let channel = Uuid::new_v4();
+        let stale = meta_event_at(
+            channel,
+            "stale",
+            &[
+                "private",
+                "",
+                "ttl",
+                "3600",
+                "ttl_deadline",
+                "2000-01-01T00:00:00Z",
+            ],
+            100,
+            'a',
+        );
+        let latest = meta_event_at(
+            channel,
+            "latest",
+            &[
+                "private",
+                "",
+                "ttl",
+                "3600",
+                "ttl_deadline",
+                "2999-01-01T00:00:00Z",
+            ],
+            200,
+            'b',
+        );
+        let forward = merge_discovered_channels(
+            vec![channel],
+            &serde_json::json!([stale.clone(), latest.clone()]),
+        );
+        let reverse = merge_discovered_channels(vec![channel], &serde_json::json!([latest, stale]));
+        assert_eq!(forward[&channel].name, "latest");
+        assert_eq!(reverse[&channel].name, "latest");
+        assert_eq!(forward[&channel].ephemeral_ttl_seconds(), Some(3600));
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_ephemeral_metadata_fails_closed() {
+        let invalid_deadline = Uuid::new_v4();
+        let duplicate_ttl = Uuid::new_v4();
+        let mut duplicate = meta_event(
+            duplicate_ttl,
+            "duplicate",
+            &[
+                "private",
+                "",
+                "ttl",
+                "3600",
+                "ttl_deadline",
+                "2999-01-01T00:00:00Z",
+            ],
+        );
+        duplicate["tags"]
+            .as_array_mut()
+            .expect("tags")
+            .push(serde_json::json!(["ttl", "7200"]));
+        let map = merge_discovered_channels(
+            vec![invalid_deadline, duplicate_ttl],
+            &serde_json::json!([
+                meta_event(
+                    invalid_deadline,
+                    "invalid",
+                    &["private", "", "ttl", "3600", "ttl_deadline", "tomorrow"]
+                ),
+                duplicate,
+            ]),
+        );
+        assert!(!map.contains_key(&invalid_deadline));
+        assert!(!map.contains_key(&duplicate_ttl));
     }
 
     #[test]
@@ -4466,6 +5183,48 @@ mod tests {
             .expect("signing should succeed")
     }
 
+    fn test_harness_relay() -> (HarnessRelay, mpsc::Sender<Option<BuzzEvent>>) {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        (
+            HarnessRelay {
+                event_rx,
+                deferred_events: VecDeque::new(),
+                observer_control_rx: None,
+                cmd_tx,
+                http: reqwest::Client::new(),
+                relay_url: "ws://127.0.0.1".into(),
+                keys: nostr::Keys::generate(),
+                auth_tag: None,
+                bg_handle: None,
+            },
+            event_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn deferred_event_retries_locally_and_revocation_purges_channel() {
+        let (mut relay, _event_tx) = test_harness_relay();
+        let channel_id = Uuid::new_v4();
+        let event = BuzzEvent {
+            channel_id,
+            event: make_test_event(&nostr::Keys::generate(), 1_000),
+            is_subscription_catch_up: false,
+        };
+        let event_id = event.event.id;
+
+        relay.defer_event(event.clone(), Duration::from_millis(1));
+        let retried = timeout(Duration::from_secs(1), relay.next_event())
+            .await
+            .expect("deferred event becomes ready")
+            .expect("deferred event returned");
+        assert_eq!(retried.event.id, event_id);
+
+        relay.defer_event(event, Duration::from_secs(1));
+        relay.drop_deferred_events(channel_id);
+        assert!(relay.deferred_events.is_empty());
+    }
+
     async fn test_ws_pair() -> (WsStream, WebSocketStream<tokio::net::TcpStream>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4520,6 +5279,7 @@ mod tests {
         let mut state = BgState::new();
         let channel_id = Uuid::new_v4();
         seed_test_subscription(&mut state, channel_id);
+        state.begin_subscription_catch_up(&format!("{}-g99", channel_sub_id(channel_id)));
         state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_millis(150));
 
         let result =
@@ -4529,6 +5289,10 @@ mod tests {
         assert!(matches!(result, ResubscribeResult::Ok));
         assert!(state.rate_limit_gate.is_some());
         assert!(state.rate_limited_pending.contains_key(&channel_id));
+        assert!(
+            state.catch_up_subscriptions.is_empty(),
+            "a fresh socket must discard terminal frames stranded on the dead socket"
+        );
         assert!(
             timeout(Duration::from_millis(50), server.next())
                 .await
@@ -4543,7 +5307,9 @@ mod tests {
         );
         let frame = next_test_frame(&mut server).await;
         assert_eq!(frame[0], "REQ");
-        assert_eq!(frame[1], channel_sub_id(channel_id));
+        let subscription_id = frame[1].as_str().expect("REQ subscription id");
+        assert_eq!(channel_id_from_sub_id(subscription_id), Some(channel_id));
+        assert!(state.subscription_is_catch_up(subscription_id));
     }
 
     #[tokio::test]
@@ -4569,7 +5335,10 @@ mod tests {
         });
 
         let replay = next_test_frame(&mut server).await;
-        assert_eq!(replay[1], channel_sub_id(replayed_channel));
+        assert_eq!(
+            replay[1].as_str().and_then(channel_id_from_sub_id),
+            Some(replayed_channel)
+        );
         cmd_tx
             .send(RelayCommand::Subscribe {
                 channel_id: deferred_channel,
@@ -4581,7 +5350,10 @@ mod tests {
 
         let deferred = next_test_frame(&mut server).await;
         assert_eq!(deferred[0], "REQ");
-        assert_eq!(deferred[1], channel_sub_id(deferred_channel));
+        assert_eq!(
+            deferred[1].as_str().and_then(channel_id_from_sub_id),
+            Some(deferred_channel)
+        );
         let (result, state) = task.await.expect("join resubscribe task");
         assert!(matches!(result, ResubscribeResult::Ok));
         assert!(state.active_subscriptions.contains_key(&deferred_channel));
@@ -4609,14 +5381,18 @@ mod tests {
         });
 
         let replay = next_test_frame(&mut server).await;
-        assert_eq!(replay[1], channel_sub_id(channel_id));
+        let replay_sub_id = replay[1].clone();
+        assert_eq!(
+            replay_sub_id.as_str().and_then(channel_id_from_sub_id),
+            Some(channel_id)
+        );
         cmd_tx
             .send(RelayCommand::Unsubscribe { channel_id })
             .await
             .expect("queue unsubscribe during pacing");
 
         let close = next_test_frame(&mut server).await;
-        assert_eq!(close, json!(["CLOSE", channel_sub_id(channel_id)]));
+        assert_eq!(close, json!(["CLOSE", replay_sub_id]));
         let (result, state) = task.await.expect("join resubscribe task");
         assert!(matches!(result, ResubscribeResult::Ok));
         assert!(!state.active_subscriptions.contains_key(&channel_id));
@@ -4646,7 +5422,10 @@ mod tests {
         });
 
         let replay = next_test_frame(&mut server).await;
-        assert_eq!(replay[1], channel_sub_id(channel_id));
+        assert_eq!(
+            replay[1].as_str().and_then(channel_id_from_sub_id),
+            Some(channel_id)
+        );
         cmd_tx
             .send(RelayCommand::PublishEvent {
                 event: Box::new(event),
@@ -4740,6 +5519,23 @@ mod tests {
         let event = make_test_event(&keys, 1_700_000);
         state.record_event(channel_id, &event);
         assert_eq!(state.last_seen.get(&channel_id).copied(), Some(1_700_000));
+    }
+
+    #[test]
+    fn bg_state_future_timestamp_cannot_poison_reconnect_cursor() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let keys = nostr::Keys::generate();
+        let received_at = unix_now_secs();
+        let event = make_test_event(&keys, received_at + 3_600);
+
+        state.record_event(channel_id, &event);
+        let stored = state.last_seen.get(&channel_id).copied().unwrap();
+        assert!(stored <= unix_now_secs());
+        assert!(
+            stored.saturating_sub(SINCE_SKEW_SECS) <= received_at,
+            "future-5s subscription must not skip legitimate events"
+        );
     }
 
     #[test]
@@ -5064,6 +5860,70 @@ mod tests {
                 replay_since: Some(1_000),
             },
         );
+    }
+
+    #[tokio::test]
+    async fn channel_events_are_replay_until_matching_eose() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+
+        assert!(
+            send_subscribe(
+                &mut client,
+                &mut state,
+                channel_id,
+                "agent-pubkey",
+                None,
+                &test_channel_filter(),
+            )
+            .await
+        );
+        let frame = next_test_frame(&mut server).await;
+        let subscription_id = frame[1].as_str().expect("REQ subscription id");
+        assert!(state.subscription_is_current(channel_id, subscription_id));
+        assert!(state.subscription_is_catch_up(subscription_id));
+
+        state.finish_subscription_catch_up(subscription_id);
+        assert!(!state.subscription_is_catch_up(subscription_id));
+    }
+
+    #[tokio::test]
+    async fn replaced_channel_req_ignores_old_terminal_frame() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+
+        for _ in 0..2 {
+            assert!(
+                send_subscribe(
+                    &mut client,
+                    &mut state,
+                    channel_id,
+                    "agent-pubkey",
+                    None,
+                    &test_channel_filter(),
+                )
+                .await
+            );
+        }
+        let old_frame = next_test_frame(&mut server).await;
+        let close_frame = next_test_frame(&mut server).await;
+        let new_frame = next_test_frame(&mut server).await;
+        let old_subscription_id = old_frame[1].as_str().expect("old REQ id");
+        let new_subscription_id = new_frame[1].as_str().expect("new REQ id");
+        assert_ne!(old_subscription_id, new_subscription_id);
+        assert_eq!(close_frame, json!(["CLOSE", old_subscription_id]));
+        assert!(state.subscription_is_current(channel_id, new_subscription_id));
+        assert!(!state.subscription_is_catch_up(old_subscription_id));
+        assert!(state.subscription_is_catch_up(new_subscription_id));
+
+        state.finish_subscription_catch_up(old_subscription_id);
+        assert!(state.subscription_is_catch_up(new_subscription_id));
+        assert!(state.subscription_is_current(channel_id, new_subscription_id));
+
+        state.finish_subscription_catch_up(new_subscription_id);
+        assert!(!state.subscription_is_catch_up(new_subscription_id));
     }
 
     #[test]

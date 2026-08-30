@@ -22,6 +22,11 @@
 //! [`extract_at_mentions_with_known`] replaces the first step to correctly
 //! handle multi-word display names.
 //!
+//! Mention boundaries reject ASCII identifiers before `@` (so emails and
+//! identifier-like text stay inert) but allow Markdown wrappers, punctuation,
+//! and non-ASCII script characters. This lets `**@Scout**` and
+//! `交给@Scout处理` resolve without weakening the email guard.
+//!
 //! [`extract_nostr_uris`] handles NIP-27 inline `nostr:npub1…` references,
 //! skipping those inside code blocks/spans via [`strip_code_regions`].
 //!
@@ -50,14 +55,50 @@ pub struct MentionProfile<'a> {
     pub content_json: &'a str,
 }
 
+/// ASCII characters that can continue an email local-part or identifier-like
+/// token around a mention.
+fn is_ascii_mention_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')
+}
+
+/// Whether `@` at byte offset `at_index` may begin a mention.
+///
+/// Non-ASCII scripts commonly omit spaces, so their characters are valid lead
+/// boundaries. ASCII identifier characters remain closed to avoid turning
+/// email addresses and identifiers into mentions. An underscore run is only a
+/// Markdown lead when it does not continue an ASCII identifier, admitting
+/// `_@name_`/`__@name__` without admitting `value_@name`.
+fn is_mention_at_boundary(content: &str, at_index: usize) -> bool {
+    if at_index == 0 {
+        return true;
+    }
+
+    let before = &content[..at_index];
+    let Some(previous) = before.chars().next_back() else {
+        return true;
+    };
+    if !previous.is_ascii() || previous.is_ascii_whitespace() {
+        return true;
+    }
+    if previous != '_' {
+        return !is_ascii_mention_identifier_char(previous);
+    }
+
+    let before_underscore_run = before.trim_end_matches('_');
+    before_underscore_run
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_ascii_mention_identifier_char(ch))
+}
+
 /// Extract single-word `@mention` names from message content.
 ///
 /// Prefer [`extract_at_mentions_with_known`] when known member names are
 /// available — it correctly handles multi-word display names.
 ///
-/// Returns lowercased names found after `@` tokens. An `@name` only matches
-/// when the `@` is at start-of-string or preceded by an ASCII whitespace
-/// character — this excludes things like email addresses (`user@host`).
+/// Returns lowercased names found after `@` tokens. An `@name` only matches at
+/// a mention boundary (see [`is_mention_at_boundary`]), excluding email and
+/// identifier-like text while allowing Markdown and CJK-adjacent mentions.
 ///
 /// Allowed name characters: ASCII alphanumerics, `.`, `-`, `_`.
 /// Duplicates are removed; first-seen order is preserved.
@@ -67,43 +108,44 @@ pub fn extract_at_names(content: &str) -> Vec<String> {
     }
     let mut names: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
-    let chars: Vec<char> = content.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    while i < len {
-        if chars[i] == '@' {
-            let preceded_by_ws = i == 0 || chars[i - 1].is_ascii_whitespace();
-            if preceded_by_ws && i + 1 < len {
-                let start = i + 1;
-                let mut end = start;
-                while end < len {
-                    let c = chars[end];
-                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                        end += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if end > start {
-                    let name: String = chars[start..end].iter().collect();
-                    let lower = name.to_ascii_lowercase();
-                    if seen.insert(lower.clone()) {
-                        names.push(lower);
-                    }
-                }
-            }
+    for (at_index, _) in content.match_indices('@') {
+        if !is_mention_at_boundary(content, at_index) {
+            continue;
         }
-        i += 1;
+        let rest = &content[at_index + 1..];
+        let end = rest
+            .find(|ch: char| !is_ascii_mention_identifier_char(ch))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            continue;
+        }
+
+        let mut name = &rest[..end];
+        // A leading Markdown underscore run makes a trailing underscore run a
+        // delimiter rather than part of the display name. Internal underscores
+        // remain valid (`@mary_jane`). Known-name extraction below resolves this
+        // distinction from the roster and does not need this fallback rule.
+        if content[..at_index].ends_with('_') {
+            name = name.trim_end_matches('_');
+        }
+        if name.is_empty() {
+            continue;
+        }
+
+        let lower = name.to_ascii_lowercase();
+        if seen.insert(lower.clone()) {
+            names.push(lower);
+        }
     }
     names
 }
 
 /// Extract `@mention` names from message content using known member names.
 ///
-/// At each `@` preceded by whitespace or start-of-string, tries known names
-/// longest-first (case-insensitive, word-boundary-checked), then falls back
-/// to single-word tokenization. Returns lowercased names in first-seen order,
-/// deduplicated. Empty/whitespace-only entries in `known_names` are ignored.
+/// At each `@` on a mention boundary, tries known names longest-first
+/// (case-insensitive, word-boundary-checked), then falls back to single-word
+/// tokenization. Returns lowercased names in first-seen order, deduplicated.
+/// Empty/whitespace-only entries in `known_names` are ignored.
 pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Vec<String> {
     if content.is_empty() || !content.contains('@') {
         return vec![];
@@ -120,8 +162,7 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
     let mut seen = HashSet::new();
 
     for (i, _) in content.match_indices('@') {
-        let preceded = i == 0 || content.as_bytes()[i - 1].is_ascii_whitespace();
-        if !preceded {
+        if !is_mention_at_boundary(content, i) {
             continue;
         }
         let rest = &content[i + 1..];
@@ -152,9 +193,22 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
 }
 
 fn is_word_boundary(s: &str) -> bool {
-    s.chars().next().is_none_or(|c| {
-        c.is_ascii_whitespace() || matches!(c, ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}')
-    })
+    let Some(first) = s.chars().next() else {
+        return true;
+    };
+    if first != '_' {
+        // Preserve the existing sentence-punctuation contract (notably `.`),
+        // while `-` can continue an allowed display-name token. All non-ASCII
+        // characters terminate an ASCII known name, enabling CJK adjacency.
+        return !first.is_ascii_alphanumeric() && first != '-';
+    }
+
+    // `_` continues an identifier in `@name_suffix`, but closes Markdown in
+    // `_@name_`, `__@name__`, or `_@name_ next`.
+    s.trim_start_matches('_')
+        .chars()
+        .next()
+        .is_none_or(|ch| !is_ascii_mention_identifier_char(ch))
 }
 
 /// Match extracted `@names` against channel-member profiles.
@@ -427,6 +481,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_at_names_accepts_markdown_wrappers_and_parentheses() {
+        assert_eq!(extract_at_names("**@Atlas**"), vec!["atlas"]);
+        assert_eq!(extract_at_names("*@Atlas*"), vec!["atlas"]);
+        assert_eq!(extract_at_names("_@Atlas_"), vec!["atlas"]);
+        assert_eq!(extract_at_names("__@Atlas__"), vec!["atlas"]);
+        assert_eq!(extract_at_names("||@Atlas||"), vec!["atlas"]);
+        assert_eq!(extract_at_names("(@Atlas)"), vec!["atlas"]);
+    }
+
+    #[test]
+    fn extract_at_names_accepts_cjk_adjacent_mentions() {
+        assert_eq!(extract_at_names("交给@Scout处理"), vec!["scout"]);
+        assert_eq!(extract_at_names("你好@Scout"), vec!["scout"]);
+        assert_eq!(extract_at_names("@Scout处理"), vec!["scout"]);
+    }
+
+    #[test]
+    fn extract_at_names_rejects_ascii_email_and_identifier_false_positives() {
+        for content in [
+            "user@Scout.com",
+            "build2@Scout",
+            "snake_case@Scout",
+            "value_@Scout",
+            "object.@Scout",
+            "release-@Scout",
+        ] {
+            assert!(
+                extract_at_names(content).is_empty(),
+                "must not extract from {content:?}"
+            );
+        }
+    }
+
+    #[test]
     fn known_multiword_name_matches_fully() {
         // "Will Pfleger" should match @Will Pfleger, not just @Will.
         let result = extract_at_mentions_with_known("hello @Will Pfleger!", &["Will Pfleger"]);
@@ -496,6 +584,72 @@ mod tests {
         let result =
             extract_at_mentions_with_known("thanks @Will Pfleger, great work", &["Will Pfleger"]);
         assert_eq!(result, vec!["will pfleger"]);
+    }
+
+    #[test]
+    fn known_names_accept_markdown_wrappers_and_parentheses() {
+        let known = &["Atlas", "Will Pfleger"];
+        for content in [
+            "**@Atlas**",
+            "*@Atlas*",
+            "_@Atlas_",
+            "__@Atlas__",
+            "||@Atlas||",
+            "(@Atlas)",
+        ] {
+            assert_eq!(
+                extract_at_mentions_with_known(content, known),
+                vec!["atlas"],
+                "must extract from {content:?}"
+            );
+        }
+        assert_eq!(
+            extract_at_mentions_with_known("**@Will Pfleger**", known),
+            vec!["will pfleger"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("Thanks @Atlas.", known),
+            vec!["atlas"]
+        );
+    }
+
+    #[test]
+    fn known_names_accept_cjk_prefix_and_suffix_boundaries() {
+        assert_eq!(
+            extract_at_mentions_with_known("交给@Scout处理", &["Scout"]),
+            vec!["scout"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("你好@Scout", &["Scout"]),
+            vec!["scout"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("@Scout处理", &["Scout"]),
+            vec!["scout"]
+        );
+    }
+
+    #[test]
+    fn known_names_reject_ascii_email_and_identifier_false_positives() {
+        for content in [
+            "user@Scout.com",
+            "build2@Scout",
+            "snake_case@Scout",
+            "value_@Scout",
+            "object.@Scout",
+            "release-@Scout",
+        ] {
+            assert!(
+                extract_at_mentions_with_known(content, &["Scout"]).is_empty(),
+                "must not extract from {content:?}"
+            );
+        }
+        // The fallback preserves the complete identifier token. It must not
+        // truncate to the known `Scout` profile and create a false p-tag.
+        assert_eq!(
+            extract_at_mentions_with_known("@Scout_dev", &["Scout"]),
+            vec!["scout_dev"]
+        );
     }
 
     #[test]
@@ -684,6 +838,16 @@ mod tests {
             "hello nostr:npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg world";
         let stripped = strip_code_regions(input);
         assert!(stripped.contains("nostr:npub1"));
+    }
+
+    #[test]
+    fn mention_extraction_after_code_masking_excludes_code_regions() {
+        let content = "`**@Scout**` then **@Scout**\n```text\n交给@Scout处理\n```";
+        let stripped = strip_code_regions(content);
+        assert_eq!(
+            extract_at_mentions_with_known(&stripped, &["Scout"]),
+            vec!["scout"]
+        );
     }
 
     #[test]

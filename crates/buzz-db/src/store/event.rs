@@ -274,22 +274,28 @@ pub async fn insert_event(
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    let mut connection = pool.acquire().await?;
-    insert_event_on(&mut connection, community_id, event, channel_id).await
+    let mut tx = pool.begin().await?;
+    let result = insert_event_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    tx.commit().await?;
+    Ok(result)
 }
 
 /// Insert a Nostr event in a caller-owned PostgreSQL transaction.
 ///
 /// This is the transaction-composition seam for callers that must keep the
-/// event insert open while performing related work. The caller owns commit or
-/// rollback.
+/// event and mention-index inserts open while performing related work. The
+/// caller owns commit or rollback.
 pub async fn insert_event_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    insert_event_on(tx.as_mut(), community_id, event, channel_id).await
+    let result = insert_event_on(tx.as_mut(), community_id, event, channel_id).await?;
+    if result.1 {
+        crate::insert_mentions_in_transaction(tx, community_id, event, channel_id).await?;
+    }
+    Ok(result)
 }
 
 async fn insert_event_on(
@@ -1318,6 +1324,8 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
                 }
             }
         }
+
+        crate::insert_mentions_in_transaction(tx, community_id, event, channel_id).await?;
     }
 
     Ok((
@@ -1357,16 +1365,7 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
-        let result =
-            crate::event::insert_event(&self.pool, community_id, event, channel_id).await?;
-        if result.1 {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
-        Ok(result)
+        crate::event::insert_event(&self.pool, community_id, event, channel_id).await
     }
 
     /// Queries events matching the given filter parameters.
@@ -1679,22 +1678,14 @@ impl Db {
         channel_id: Option<Uuid>,
         thread_meta: Option<crate::event::ThreadMetadataParams<'_>>,
     ) -> Result<(StoredEvent, bool)> {
-        let result = crate::event::insert_event_with_thread_metadata(
+        crate::event::insert_event_with_thread_metadata(
             &self.pool,
             community_id,
             event,
             channel_id,
             thread_meta,
         )
-        .await?;
-        if result.1 {
-            if let Err(e) =
-                crate::insert_mentions(&self.pool, community_id, event, channel_id).await
-            {
-                tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-            }
-        }
-        Ok(result)
+        .await
     }
 
     /// Backfill `d_tag` for existing NIP-33 events (kind 30000–39999) that have `d_tag IS NULL`.
@@ -1815,6 +1806,100 @@ mod tests {
                 .await
                 .expect("count rolled-back event");
         assert_eq!(persisted, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn mention_index_failure_rolls_back_event_and_thread_metadata() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let channel_id = make_test_channel(&pool, community_uuid, None).await;
+        let mentioned = Keys::generate().public_key().to_hex();
+        let event = EventBuilder::new(Kind::Custom(9), "atomic mention")
+            .tags(vec![
+                Tag::parse(["p", mentioned.as_str()]).expect("mention tag")
+            ])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign mentioned event");
+        let event_created_at = DateTime::from_timestamp(event.created_at.as_secs() as i64, 0)
+            .expect("event timestamp");
+
+        // Scope the fault injection to this event so concurrently running database
+        // tests are unaffected. The trigger fires after the event and thread rows
+        // have been written but before their shared transaction can commit.
+        let suffix = Uuid::new_v4().simple().to_string();
+        let function_name = format!("reject_event_mention_{suffix}");
+        let trigger_name = format!("reject_event_mention_{suffix}");
+        let event_id_hex = event.id.to_hex();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.event_id = decode('{event_id_hex}', 'hex') THEN \
+                 RAISE EXCEPTION 'forced event_mentions failure'; \
+               END IF; \
+               RETURN NEW; \
+             END $$"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create mention rejection function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {trigger_name} BEFORE INSERT ON event_mentions \
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create mention rejection trigger");
+
+        let result = insert_event_with_thread_metadata(
+            &pool,
+            community,
+            &event,
+            Some(channel_id),
+            Some(ThreadMetadataParams {
+                event_id: event.id.as_bytes(),
+                event_created_at,
+                channel_id,
+                parent_event_id: None,
+                parent_event_created_at: None,
+                root_event_id: None,
+                root_event_created_at: None,
+                depth: 0,
+                broadcast: false,
+            }),
+        )
+        .await;
+
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER {trigger_name} ON event_mentions"
+        )))
+        .execute(&pool)
+        .await
+        .expect("drop mention rejection trigger");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP FUNCTION {function_name}()"
+        )))
+        .execute(&pool)
+        .await
+        .expect("drop mention rejection function");
+
+        result.expect_err("mention indexing failure must reject the whole event insert");
+
+        let (event_rows, mention_rows, thread_rows): (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM events WHERE community_id=$1 AND id=$2), \
+               (SELECT count(*) FROM event_mentions WHERE community_id=$1 AND event_id=$2), \
+               (SELECT count(*) FROM thread_metadata WHERE community_id=$1 AND event_id=$2)",
+        )
+        .bind(community_uuid)
+        .bind(event.id.as_bytes().as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("count all atomic event surfaces");
+        assert_eq!(event_rows, 0, "event row must roll back");
+        assert_eq!(mention_rows, 0, "mention index row must roll back");
+        assert_eq!(thread_rows, 0, "thread metadata row must roll back");
     }
 
     #[tokio::test]
