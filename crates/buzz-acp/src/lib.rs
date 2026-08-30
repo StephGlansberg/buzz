@@ -5736,6 +5736,23 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_requires_disposition_for_actionable_direct_mentions() {
+        let prompt = DEFAULT_BASE_PROMPT;
+        assert!(prompt.contains(
+            "A direct signed mention with an assignment or operational directive requires one compact disposition reply"
+        ));
+        assert!(prompt.contains("This is operational status, not a bare acknowledgement"));
+        assert!(prompt
+            .contains("Mention the sender back only for `completed` or `blocked` delegated work"));
+        assert!(
+            prompt.contains("acceptance and no-action replies stay in-thread without a mention")
+        );
+        assert!(
+            prompt.contains("If the sender explicitly says no reply is required, remain silent")
+        );
+    }
+
+    #[test]
     fn shared_base_prompt_yields_publication_to_runtime_capability() {
         let prompt = DEFAULT_BASE_PROMPT;
         assert!(prompt.contains("runtime withholds `BUZZ_PRIVATE_KEY`"));

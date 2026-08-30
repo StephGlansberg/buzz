@@ -127,11 +127,12 @@ remain source-only:
 - Release `buzz`, `buzz-acp`, and `buzz-relay` builds pass. Desktop frontend,
   Tauri checks, and Tauri tests pass; the pre-push Rust suite and 3,005 Desktop
   Rust tests are green.
-- The fork-main message deletion, signed event readback, actionable mention
-  disposition, and channel-scoped lifecycle-reaction capabilities are already
-  present in the integrated branch through newer equivalent implementations.
-  Merging the older duplicate commits would introduce ACP conflicts and is not
-  required to preserve those capabilities.
+- Fork `main` is reconciled into the candidate ancestry. Signed event readback,
+  actionable mention disposition, and channel-scoped lifecycle reactions were
+  already present through newer equivalent implementations; conflict resolution
+  retained those newer ACP paths. The reconciliation additionally preserves the
+  fork's explicit `messages delete --nip09` CLI surface and optional canonical
+  NIP-09 public reason.
 
 The read-only generated-versus-live comparison found one hard deployment hold:
 the checked-in six private-office TOMLs are deliberately minimal, while live

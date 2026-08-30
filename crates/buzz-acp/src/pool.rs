@@ -5524,8 +5524,9 @@ fn pct_encode(s: &str) -> String {
 
 /// Best-effort: add a reaction via a signed Nostr kind-7 event (NIP-25).
 ///
-/// Builds a reaction event with `buzz_sdk::build_reaction`, signs it with
-/// the keys already stored in `RestClient`, and submits via `POST /events`.
+/// Builds a channel-scoped reaction event, signs it with the keys already
+/// stored in `RestClient`, and submits via `POST /events`. The `h` tag keeps
+/// the existing Desktop channel subscription live for lifecycle transitions.
 /// Returns immediately on timeout or any error — reactions are cosmetic.
 pub(crate) async fn reaction_add(
     rest: &crate::relay::RestClient,
@@ -5725,7 +5726,7 @@ fn contains_verified_event(json: &serde_json::Value, expected_id: nostr::EventId
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
 ///
 /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
-/// emoji, then submits a signed kind:5 deletion via `POST /events`.
+/// emoji, then submits a channel-scoped signed kind:5 deletion via `POST /events`.
 /// Returns immediately on timeout or any error — reactions are cosmetic.
 pub(crate) async fn reaction_remove(
     rest: &crate::relay::RestClient,

@@ -823,6 +823,7 @@ pub async fn cmd_delete_message(
     action_id: Option<Uuid>,
     reason_code: Option<&str>,
     public_reason: Option<&str>,
+    nip09: bool,
 ) -> Result<(), CliError> {
     validate_hex64(event_id)?;
 
@@ -830,15 +831,28 @@ pub async fn cmd_delete_message(
     let channel_uuid = resolve_channel_id(client, event_id).await?;
     let target_eid = parse_event_id(event_id)?;
 
-    let builder = buzz_sdk::build_delete_message_with_options(
-        channel_uuid,
-        target_eid,
-        DeleteMessageOptions {
-            action_id,
-            reason_code,
-            public_reason,
-        },
-    )
+    if nip09 && (action_id.is_some() || reason_code.is_some()) {
+        return Err(CliError::Usage(
+            "--nip09 cannot be combined with --action-id or --reason-code".into(),
+        ));
+    }
+    let builder = if nip09 {
+        buzz_sdk::build_delete_compat_with_reason(
+            channel_uuid,
+            target_eid,
+            public_reason.unwrap_or_default(),
+        )
+    } else {
+        buzz_sdk::build_delete_message_with_options(
+            channel_uuid,
+            target_eid,
+            DeleteMessageOptions {
+                action_id,
+                reason_code,
+                public_reason,
+            },
+        )
+    }
     .map_err(|e| CliError::Other(format!("build_delete_message failed: {e}")))?;
 
     let event = client.sign_event(builder)?;
@@ -971,6 +985,7 @@ pub async fn dispatch(
             action_id,
             reason_code,
             public_reason,
+            nip09,
         } => {
             cmd_delete_message(
                 client,
@@ -978,6 +993,7 @@ pub async fn dispatch(
                 action_id,
                 reason_code.as_deref(),
                 public_reason.as_deref(),
+                nip09,
             )
             .await
         }
