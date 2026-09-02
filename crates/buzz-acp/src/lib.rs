@@ -4999,6 +4999,15 @@ fn handle_prompt_result_with_replay(
     // match arm in the death_message construction reads it.
     let mut hard_timeout_fate_suffix: Option<&'static str> = None;
 
+    // An Incomplete turn ran to completion and simply never published the origin
+    // reply, so every replay reproduces it. Spending the transient budget on a
+    // deterministic outcome head-of-line blocks the channel for the whole backoff
+    // ladder while newer events wait behind it.
+    let retry_budget = match &result.outcome {
+        PromptOutcome::Incomplete { .. } => queue::DETERMINISTIC_MAX_RETRIES,
+        _ => queue::MAX_RETRIES,
+    };
+
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
     // retry_counts. If mark_complete runs first, retry_counts is cleared and
@@ -5087,7 +5096,7 @@ fn handle_prompt_result_with_replay(
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
                 terminalize_replay_batch(replay_state, &batch, "authentication dead letter");
-            } else if let Some(dead) = queue.requeue(batch) {
+            } else if let Some(dead) = queue.requeue_with_budget(batch, retry_budget) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
                     PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {

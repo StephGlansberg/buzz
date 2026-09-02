@@ -31,6 +31,12 @@ const MAX_BATCH_EVENTS: usize = 50;
 /// Maximum retry attempts before a batch is dead-lettered.
 pub(crate) const MAX_RETRIES: u32 = 10;
 
+/// Retry budget for deterministic outcomes that reproduce on replay, such as a
+/// turn that finished without publishing the required origin reply. One retry
+/// still absorbs a genuine one-off, but the batch dead-letters in seconds
+/// instead of head-of-line blocking the channel for the full backoff ladder.
+pub(crate) const DETERMINISTIC_MAX_RETRIES: u32 = 1;
+
 /// Base retry delay in seconds (doubled each attempt).
 const BASE_RETRY_DELAY_SECS: u64 = 5;
 
@@ -687,6 +693,20 @@ impl EventQueue {
     /// Note: does NOT remove from `in_flight_channels` — caller must call
     /// `mark_complete` separately.
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
+        self.requeue_with_budget(batch, MAX_RETRIES)
+    }
+
+    /// [`requeue`](Self::requeue) with an explicit retry budget.
+    ///
+    /// The default [`MAX_RETRIES`] budget assumes the failure is transient, so
+    /// replaying the batch can succeed. A deterministic outcome — a turn that
+    /// completed but never published the required origin reply — reproduces on
+    /// every attempt, and spending the full budget head-of-line blocks the
+    /// channel for ~25 minutes (10 attempts of exponential backoff capped at
+    /// [`MAX_RETRY_DELAY_SECS`]) while newer events queue behind it. Callers
+    /// pass a short budget for those outcomes so the batch dead-letters
+    /// promptly and the channel advances.
+    pub fn requeue_with_budget(&mut self, batch: FlushBatch, budget: u32) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
         let attempt = {
             let count = self.retry_counts.entry(channel_id).or_insert(0);
@@ -694,13 +714,14 @@ impl EventQueue {
             *count
         };
 
-        if attempt > MAX_RETRIES {
+        if attempt > budget {
             tracing::error!(
                 channel_id = %channel_id,
                 attempt,
+                budget,
                 events = batch.events.len(),
                 "dead-lettering batch after {} retries — discarding {} events",
-                MAX_RETRIES,
+                budget,
                 batch.events.len(),
             );
             self.retry_counts.remove(&channel_id);
@@ -3925,6 +3946,46 @@ mod tests {
         // Retry state is cleared so fresh traffic isn't throttled.
         assert!(!q.retry_counts.contains_key(&ch));
         assert!(!q.retry_after.contains_key(&ch));
+    }
+
+    /// A deterministic outcome must dead-letter on the short budget rather than
+    /// burn the full transient ladder, so a later event on the same channel is
+    /// still served promptly instead of waiting behind the poison batch.
+    #[test]
+    fn test_requeue_with_short_budget_dead_letters_and_advances() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+
+        q.push(make_queued(ch, "poison"));
+        for attempt in 1..=DETERMINISTIC_MAX_RETRIES {
+            q.retry_after
+                .insert(ch, Instant::now() - Duration::from_secs(1));
+            let batch = q.flush_next().expect("flush");
+            assert!(
+                q.requeue_with_budget(batch, DETERMINISTIC_MAX_RETRIES)
+                    .is_none(),
+                "attempt {attempt} should requeue within the short budget"
+            );
+            q.mark_complete(ch);
+        }
+
+        q.retry_after
+            .insert(ch, Instant::now() - Duration::from_secs(1));
+        let batch = q.flush_next().expect("flush");
+        let dead = q
+            .requeue_with_budget(batch, DETERMINISTIC_MAX_RETRIES)
+            .expect("should dead-letter once the short budget is spent");
+        assert_eq!(dead.events.len(), 1);
+        q.mark_complete(ch);
+        assert!(!q.retry_counts.contains_key(&ch));
+        assert!(!q.retry_after.contains_key(&ch));
+
+        // The channel advances: a newly arrived event flushes immediately.
+        q.push(make_queued(ch, "next"));
+        let next = q
+            .flush_next()
+            .expect("next event must flush after dead-letter");
+        assert_eq!(next.events.len(), 1);
     }
 
     #[test]
